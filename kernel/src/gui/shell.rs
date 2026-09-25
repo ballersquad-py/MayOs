@@ -52,6 +52,7 @@ const HELP: &[(&str, &str)] = &[
     ("dhcp", "request a new IP address"),
     ("play <file>", "play music or a video (MP4, MOV, MKV, AVI, MP3, AAC, WAV)"),
     ("wallpaper <picture|N>", "set the desktop wallpaper"),
+    ("dock [left|right|bottom] [autohide|show]", "move or hide the dock"),
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
     ("resolution [WxH]", "list or change the screen resolution"),
@@ -629,6 +630,27 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         },
         "settings" => ctx.open(super::settings_app::boxed()),
+        "dock" => {
+            let mut ok = true;
+            for a in args.iter() {
+                match *a {
+                    "bottom" => crate::settings::update(|s| s.dock_position = 0),
+                    "left" => crate::settings::update(|s| s.dock_position = 1),
+                    "right" => crate::settings::update(|s| s.dock_position = 2),
+                    "small" => crate::settings::update(|s| s.dock_size = 0),
+                    "medium" => crate::settings::update(|s| s.dock_size = 1),
+                    "large" => crate::settings::update(|s| s.dock_size = 2),
+                    "autohide" | "hide" => crate::settings::update(|s| s.dock_autohide = true),
+                    "show" | "noautohide" => crate::settings::update(|s| s.dock_autohide = false),
+                    _ => ok = false,
+                }
+            }
+            if !ok || args.is_empty() {
+                let s = crate::settings::get();
+                let _ = writeln!(out, "dock: {}, {}, {}", ["bottom", "left", "right"][s.dock_position.min(2) as usize], ["small", "medium", "large"][s.dock_size.min(2) as usize], if s.dock_autohide { "hides automatically" } else { "always shown" });
+                let _ = writeln!(out, "usage: dock [bottom|left|right] [small|medium|large] [autohide|show]");
+            }
+        }
         "wallpaper" => match joined(args).as_deref() {
             Some(n) if n.parse::<usize>().is_ok() => {
                 let i = n.parse::<usize>().unwrap().min(super::wallpaper::WALLPAPERS.len() - 1);
