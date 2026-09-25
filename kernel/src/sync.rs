@@ -26,6 +26,11 @@ impl<T> Spin<T> {
 }
 
 impl<T: ?Sized> Spin<T> {
+    /// Raw access without locking; only for the panic path.
+    pub fn data_ptr(&self) -> *const T {
+        self.data.get()
+    }
+
     pub fn lock(&self) -> SpinGuard<'_, T> {
         let irq = cpu::interrupts_enabled();
         cpu::cli();

@@ -36,6 +36,9 @@ static DISPLAY_DESC: Spin<Option<String>> = Spin::new(None);
 static DISPLAY_MODES: Spin<(Vec<(u32, u32)>, (u32, u32))> = Spin::new((Vec::new(), (0, 0)));
 /// Frames composited so far (used by the self-test).
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Frames per second and average frame time (µs) over the last second.
+pub static FPS: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_US: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_display(d: Display) {
     update_display_description(&d);
@@ -126,6 +129,7 @@ pub extern "C" fn desktop_main(_: usize) {
     wm.open_kind(AppKind::Explorer);
     wm.open_kind(AppKind::Terminal);
 
+    let (mut stat_frames, mut stat_us, mut stat_since) = (0u64, 0u64, 0u64);
     loop {
         for dev in INPUTS.lock().iter_mut() {
             dev.poll();
@@ -139,14 +143,22 @@ pub extern "C" fn desktop_main(_: usize) {
             }
         }
         let start = crate::time::uptime_ms();
+        let t0 = crate::time::uptime_us();
         wm.frame();
         FRAMES.fetch_add(1, Ordering::Relaxed);
-        // About 60 frames a second while animating, otherwise idle politely.
-        if wm.is_animating() {
-            let spent = crate::time::uptime_ms() - start;
-            crate::proc::sched::sleep_ms(16u64.saturating_sub(spent).max(1));
-        } else {
-            crate::proc::sched::sleep_ms(10);
+        stat_frames += 1;
+        stat_us += crate::time::uptime_us() - t0;
+        if start - stat_since >= 1000 {
+            FPS.store(stat_frames, Ordering::Relaxed);
+            FRAME_US.store(stat_us / stat_frames.max(1), Ordering::Relaxed);
+            stat_frames = 0;
+            stat_us = 0;
+            stat_since = start;
         }
+        // Up to ~120 frames a second while anything moves (animations,
+        // drags, pointer); a short idle nap otherwise keeps input snappy.
+        let spent = crate::time::uptime_ms() - start;
+        let budget: u64 = if wm.is_animating() || handled > 0 { 8 } else { 4 };
+        crate::proc::sched::sleep_ms(budget.saturating_sub(spent).max(1));
     }
 }

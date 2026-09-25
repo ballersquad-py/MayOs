@@ -50,13 +50,13 @@ pub const DANGER: Color = rgb(0xe5, 0x48, 0x4d);
 pub const TITLEBAR: Color = rgb(0xf4, 0xf5, 0xf7);
 pub const TITLEBAR_INACTIVE: Color = rgb(0xea, 0xeb, 0xee);
 pub const BORDER: Color = rgba(0, 0, 0, 38);
-pub const SHADOW: Color = rgba(8, 14, 30, 110);
-pub const SHADOW_INACTIVE: Color = rgba(8, 14, 30, 60);
+pub const SHADOW: Color = rgba(6, 10, 24, 105);
+pub const SHADOW_INACTIVE: Color = rgba(6, 10, 24, 58);
 
 pub const TITLEBAR_H: i32 = 36;
 pub const WINDOW_RADIUS: i32 = 12;
-pub const SHADOW_BLUR: i32 = 26;
-pub const SHADOW_OFFSET: i32 = 8;
+pub const SHADOW_BLUR: i32 = 30;
+pub const SHADOW_OFFSET: i32 = 6;
 pub const TOPBAR_H: i32 = 28;
 pub const DOCK_ICON: i32 = 48;
 pub const DOCK_PAD: i32 = 10;

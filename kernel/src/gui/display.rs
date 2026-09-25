@@ -43,7 +43,12 @@ const COMMON_MODES: &[(u32, u32)] = &[
     (2560, 1440),
 ];
 
-fn copy_rect(back: &[u32], width: u32, fb: *mut u8, pitch: usize, r: Rect) {
+/// Copy a rectangle of the back buffer to video memory, never writing past
+/// `fb_len` bytes.
+fn copy_rect(back: &[u32], width: u32, fb: *mut u8, pitch: usize, fb_len: usize, r: Rect) {
+    if (r.bottom() as usize - 1) * pitch + r.right() as usize * 4 > fb_len {
+        return;
+    }
     for y in r.y..r.bottom() {
         let src = &back[(y as u32 * width + r.x as u32) as usize..][..r.w as usize];
         unsafe {
@@ -127,15 +132,18 @@ impl Display {
         match self {
             Display::Virtio(g) => g.flush(r.x as u32, r.y as u32, r.w as u32, r.h as u32),
             Display::Svga { dev, back } => {
-                let (fb, pitch) = dev.framebuffer();
-                copy_rect(back, dev.width, fb, pitch, r);
+                let (fb, pitch, len) = dev.framebuffer();
+                copy_rect(back, dev.width, fb, pitch, len, r);
                 dev.update(r.x as u32, r.y as u32, r.w as u32, r.h as u32);
             }
             Display::Bochs { dev, back } => {
-                let (fb, pitch) = dev.framebuffer();
-                copy_rect(back, dev.width, fb, pitch, r);
+                let (fb, pitch, len) = dev.framebuffer();
+                copy_rect(back, dev.width, fb, pitch, len, r);
             }
-            Display::Framebuffer { back, fb, pitch, width, .. } => copy_rect(back, *width, *fb, *pitch, r),
+            Display::Framebuffer { back, fb, pitch, width, height } => {
+                let len = *pitch * *height as usize;
+                copy_rect(back, *width, *fb, *pitch, len, r)
+            }
         }
     }
 
@@ -174,6 +182,13 @@ impl Display {
                 true
             }
             Display::Framebuffer { width, height, .. } => (*width, *height) == (w, h),
+        }
+    }
+
+    /// Called once per composited frame, after all `present`s.
+    pub fn end_frame(&mut self) {
+        if let Display::Svga { dev, .. } = self {
+            dev.kick();
         }
     }
 

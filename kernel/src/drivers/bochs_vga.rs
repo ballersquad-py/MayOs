@@ -24,9 +24,8 @@ const ENABLED: u16 = 0x01;
 const LFB_ENABLED: u16 = 0x40;
 
 pub struct BochsVga {
-    fb_phys: u64,
     fb_virt: u64,
-    pub vram: usize,
+    fb_len: usize,
     pub width: u32,
     pub height: u32,
 }
@@ -60,11 +59,16 @@ impl BochsVga {
         }
         let vram_64k = read(REG_VIDEO_MEMORY_64K) as usize;
         let vram = if vram_64k != 0 { vram_64k * 64 * 1024 } else { 16 * 1024 * 1024 };
-        Some(BochsVga { fb_phys, fb_virt: 0, vram, width: 0, height: 0 })
+        // Map all of VRAM once, so every mode we accept is already mapped.
+        let fb_len = vram.min(256 * 1024 * 1024);
+        let fb_virt = paging::map_framebuffer(fb_phys, fb_len)?;
+        crate::kprintln!("bochs-vga: vram {} MiB at {:#x}", vram / (1024 * 1024), fb_phys);
+        Some(BochsVga { fb_virt, fb_len, width: 0, height: 0 })
     }
 
     pub fn supports(&self, w: u32, h: u32) -> bool {
-        w >= 640 && h >= 480 && w <= 4096 && h <= 4096 && (w * h * 4) as usize <= self.vram
+        // The DISPI interface needs the width to be a multiple of 8.
+        w >= 640 && h >= 480 && w % 8 == 0 && w <= 4096 && h <= 4096 && (w * h * 4) as usize <= self.fb_len
     }
 
     pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
@@ -81,16 +85,22 @@ impl BochsVga {
         write(REG_Y_OFFSET, 0);
         write(REG_ENABLE, ENABLED | LFB_ENABLED);
         if read(REG_XRES) != w as u16 || read(REG_YRES) != h as u16 {
+            // Restore the previous mode.
+            if self.width != 0 {
+                let (ow, oh) = (self.width, self.height);
+                self.width = 0;
+                self.set_mode(ow, oh);
+            }
             return false;
         }
-        self.fb_virt = paging::map_framebuffer(self.fb_phys, (w * h * 4) as usize);
+        crate::kprintln!("bochs-vga: mode {}x{}", w, h);
         self.width = w;
         self.height = h;
         true
     }
 
-    /// Framebuffer pointer and pitch in bytes.
-    pub fn framebuffer(&self) -> (*mut u8, usize) {
-        (self.fb_virt as *mut u8, self.width as usize * 4)
+    /// Framebuffer pointer, pitch and the number of bytes safe to write.
+    pub fn framebuffer(&self) -> (*mut u8, usize, usize) {
+        (self.fb_virt as *mut u8, self.width as usize * 4, self.fb_len)
     }
 }

@@ -59,3 +59,40 @@ macro_rules! kprintln {
     () => { $crate::kprint!("\n") };
     ($($arg:tt)*) => { $crate::log::log_fmt(format_args!("{}\n", format_args!($($arg)*))) };
 }
+
+/// The last `n` lines of the log, without allocating (safe in a panic).
+pub fn tail(n: usize) -> TailBuf {
+    let mut out = TailBuf { buf: [0; 1024], len: 0 };
+    // The panic path must not block: skip the log if it is locked.
+    let r = unsafe { &*RING.data_ptr() };
+    let mut lines = 0;
+    let mut start = r.len;
+    while start > 0 {
+        let b = r.buf[(r.start + start - 1) % CAP];
+        if b == b'\n' && start != r.len {
+            lines += 1;
+            if lines == n {
+                break;
+            }
+        }
+        start -= 1;
+    }
+    for i in start..r.len {
+        if out.len < out.buf.len() {
+            out.buf[out.len] = r.buf[(r.start + i) % CAP];
+            out.len += 1;
+        }
+    }
+    out
+}
+
+pub struct TailBuf {
+    buf: [u8; 1024],
+    len: usize,
+}
+
+impl TailBuf {
+    pub fn lines(&self) -> core::str::Lines<'_> {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("").lines()
+    }
+}

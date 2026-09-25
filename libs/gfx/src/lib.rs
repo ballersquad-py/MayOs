@@ -206,9 +206,82 @@ fn rrect_distance16(px: i32, py: i32, r: &Rect, radius: i32) -> i32 {
     let qy = (py2 - cy2).abs() - hy;
     let ox = qx.max(0) as i64;
     let oy = qy.max(0) as i64;
-    let outside = isqrt((ox * ox + oy * oy) as u64) as i32;
+    // Along the straight edges the distance is just the offset; only the
+    // corners need a square root.
+    let outside = if ox == 0 {
+        oy as i32
+    } else if oy == 0 {
+        ox as i32
+    } else {
+        isqrt((ox * ox + oy * oy) as u64) as i32
+    };
     let inside = qx.max(qy).min(0);
     outside + inside - radius * 16
+}
+
+/// A pre-computed drop shadow for a rounded rectangle of a given size.
+///
+/// Two layers are combined: a wide, soft "ambient" shadow offset slightly
+/// downwards and a tight "contact" shadow hugging the edge. Opacity falls
+/// off with a smoothstep curve, which reads as a Gaussian blur. Computing
+/// the mask once per window size keeps compositing cheap.
+pub struct ShadowMask {
+    /// Size of the shape the shadow belongs to.
+    pub w: i32,
+    pub h: i32,
+    /// Extra pixels around the shape on each side (top/left/right; the
+    /// bottom has `pad + offset`).
+    pub pad: i32,
+    pub offset: i32,
+    /// Area inside the mask fully covered by the shape (never drawn).
+    pub hidden: Rect,
+    mw: i32,
+    mh: i32,
+    alpha: Vec<u8>,
+}
+
+fn smooth_falloff(d16: i32, blur: i32) -> u32 {
+    // d16: distance outside the shape in 1/16 px (negative = inside).
+    if d16 <= 0 {
+        return 255;
+    }
+    let span = blur * 16;
+    if d16 >= span {
+        return 0;
+    }
+    // 1 - smoothstep(t), t in 0..=1024
+    let t = (d16 as i64 * 1024 / span as i64) as i64;
+    let s = t * t / 1024 * (3072 - 2 * t) / 1024;
+    ((1024 - s) * 255 / 1024) as u32
+}
+
+impl ShadowMask {
+    pub fn new(w: i32, h: i32, radius: i32, blur: i32, offset: i32, ambient: u32, contact: u32) -> ShadowMask {
+        let pad = blur;
+        let mw = w + 2 * pad;
+        let mh = h + 2 * pad + offset;
+        let mut alpha = vec![0u8; (mw.max(0) * mh.max(0)) as usize];
+        let shape = Rect::new(pad, pad, w, h);
+        let ambient_rect = shape.offset(0, offset);
+        let contact_rect = shape.offset(0, 1);
+        let hidden = shape.inset(radius.max(2));
+        for y in 0..mh {
+            for x in 0..mw {
+                if hidden.contains(x, y) {
+                    continue;
+                }
+                let a = smooth_falloff(rrect_distance16(x, y, &ambient_rect, radius), blur) * ambient / 255
+                    + smooth_falloff(rrect_distance16(x, y, &contact_rect, radius), 3) * contact / 255;
+                alpha[(y * mw + x) as usize] = a.min(255) as u8;
+            }
+        }
+        ShadowMask { w, h, pad, offset, hidden, mw, mh, alpha }
+    }
+
+    /// Screen area covered when the shape is at `r`.
+    pub fn bounds(&self, r: Rect) -> Rect {
+        Rect::new(r.x - self.pad, r.y - self.pad, self.mw, self.mh)
+    }
 }
 
 /// A mutable view onto pixels with a clip rectangle and a drawing origin.
@@ -425,6 +498,71 @@ impl<'a> Canvas<'a> {
                 let s = t * t / span * 255 / span;
                 let i = self.idx(x, y);
                 self.data[i] = blend(self.data[i], color, a * s / 255);
+            }
+        }
+    }
+
+    /// Draw a cached shadow for a shape placed at `r` (which must have the
+    /// mask's size), in `color` with its alpha scaled by `opacity`.
+    pub fn draw_shadow_mask(&mut self, m: &ShadowMask, r: Rect, color: Color, opacity: u32) {
+        let area = m.bounds(r).offset(self.ox, self.oy);
+        let c = area.intersect(&self.clip);
+        if c.is_empty() {
+            return;
+        }
+        let a = alpha(color) * opacity / 255;
+        let hidden = m.hidden.offset(area.x, area.y);
+        for y in c.y..c.bottom() {
+            let row = ((y - area.y) * m.mw) as usize;
+            // Skip the part of the row the shape itself covers.
+            let (skip_from, skip_to) =
+                if y >= hidden.y && y < hidden.bottom() { (hidden.x, hidden.right()) } else { (i32::MAX, i32::MAX) };
+            let mut x = c.x;
+            while x < c.right() {
+                if x == skip_from {
+                    x = skip_to.max(x + 1);
+                    continue;
+                }
+                let m_a = m.alpha[row + (x - area.x) as usize] as u32;
+                if m_a != 0 {
+                    let i = self.idx(x, y);
+                    self.data[i] = blend(self.data[i], color, a * m_a / 255);
+                }
+                x += 1;
+            }
+        }
+    }
+
+    /// Like `draw_shadow_mask` but stretched to a shape placed at `r` of
+    /// any size (used while windows animate).
+    pub fn draw_shadow_mask_scaled(&mut self, m: &ShadowMask, r: Rect, color: Color, opacity: u32) {
+        if r.w <= 0 || r.h <= 0 {
+            return;
+        }
+        let sx = r.w as i64 * 1024 / m.w.max(1) as i64;
+        let sy = r.h as i64 * 1024 / m.h.max(1) as i64;
+        let pad_x = (m.pad as i64 * sx / 1024) as i32;
+        let pad_y = (m.pad as i64 * sy / 1024) as i32;
+        let area = Rect::new(r.x - pad_x, r.y - pad_y, (m.mw as i64 * sx / 1024) as i32, (m.mh as i64 * sy / 1024) as i32);
+        let abs = area.offset(self.ox, self.oy);
+        let c = abs.intersect(&self.clip);
+        if c.is_empty() || abs.w <= 0 || abs.h <= 0 {
+            return;
+        }
+        let a = alpha(color) * opacity / 255;
+        let inner = r.offset(self.ox, self.oy).inset(4);
+        for y in c.y..c.bottom() {
+            let my = (((y - abs.y) as i64 * m.mh as i64) / abs.h as i64).min(m.mh as i64 - 1) as i32;
+            for x in c.x..c.right() {
+                if inner.contains(x, y) {
+                    continue;
+                }
+                let mx = (((x - abs.x) as i64 * m.mw as i64) / abs.w as i64).min(m.mw as i64 - 1) as i32;
+                let m_a = m.alpha[(my * m.mw + mx) as usize] as u32;
+                if m_a != 0 {
+                    let i = self.idx(x, y);
+                    self.data[i] = blend(self.data[i], color, a * m_a / 255);
+                }
             }
         }
     }
@@ -648,6 +786,25 @@ mod tests {
         let mut half = Surface::new(4, 4, rgb(0, 0, 0));
         half.canvas().blit_scaled(&src, Rect::new(0, 0, 4, 4), 128, 0);
         assert!((half.pixel(1, 1) >> 16 & 0xff) > 90 && (half.pixel(1, 1) >> 16 & 0xff) < 110);
+    }
+
+    #[test]
+    fn shadow_mask_is_soft_and_continuous() {
+        let m = ShadowMask::new(100, 60, 12, 24, 6, 255, 120);
+        let r = Rect::new(40, 40, 100, 60);
+        let mut s = Surface::new(200, 200, rgb(255, 255, 255));
+        s.canvas().draw_shadow_mask(&m, r, rgba(0, 0, 0, 255), 255);
+        // Directly below the shape: darkest; fading smoothly further down.
+        let below: Vec<u32> = (100..130).map(|y| s.pixel(90, y) & 0xff).collect();
+        assert!(below[0] < 90, "no shadow right under the edge: {:?}", below);
+        assert!(below.windows(2).all(|w| w[1] >= w[0]), "shadow must lighten monotonically: {:?}", below);
+        // No hard jumps between neighbouring pixels.
+        assert!(below.windows(2).all(|w| w[1] - w[0] < 40), "{:?}", below);
+        // The shadow spreads to the sides and top too, but less.
+        assert!(s.pixel(35, 70) & 0xff < 255 && s.pixel(90, 35) & 0xff < 255);
+        assert!(s.pixel(90, 35) & 0xff > s.pixel(90, 104) & 0xff);
+        // Far away: untouched.
+        assert_eq!(s.pixel(5, 5), 0xffffffff);
     }
 
     #[test]

@@ -48,7 +48,7 @@ extern "C" fn kmain() -> ! {
     let acpi = acpi::store(acpi::parse(rsdp));
     kprintln!("acpi: {} cpu(s), {} io-apic(s)", acpi.cpu_count, acpi.ioapics.len());
     apic::init(acpi);
-    let tsc_per_ms = apic::start_timer(100);
+    let tsc_per_ms = apic::start_timer(1000);
     time::init(tsc_per_ms);
     idt::init_syscall();
 
@@ -204,7 +204,7 @@ fn panic_screen(info: &core::panic::PanicInfo) {
     let stride = fb.pitch as usize / 4;
     let buf = unsafe { core::slice::from_raw_parts_mut(fb.address as *mut u32, stride * h as usize) };
     let mut c = gfx::Canvas::new(buf, w, h, stride);
-    let box_r = gfx::Rect::new(w / 2 - 360, h / 2 - 150, 720, 300);
+    let box_r = gfx::Rect::new(w / 2 - 380, h / 2 - 230, 760, 460);
     c.fill_rounded_rect(box_r, 14, gfx::rgb(0xb3, 0x26, 0x2d));
     c.draw_text(&fonts.large, box_r.x + 24, box_r.y + 44, "MayOS has stopped", gfx::rgb(255, 255, 255));
     struct Buf([u8; 1024], usize);
@@ -231,6 +231,19 @@ fn panic_screen(info: &core::panic::PanicInfo) {
             rest = &rest[n..];
             y += 18;
         }
+    }
+    // The last kernel log lines usually explain what led up to the crash.
+    let log = log::tail(8);
+    let mut ly = y.max(box_r.y + 190);
+    c.draw_text(&fonts.bold, box_r.x + 24, ly, "Recent kernel log:", gfx::rgb(255, 220, 220));
+    ly += 20;
+    for line in log.lines() {
+        if ly > box_r.bottom() - 40 {
+            break;
+        }
+        let n = line.char_indices().nth(95).map(|(i, _)| i).unwrap_or(line.len());
+        c.draw_text(&fonts.mono, box_r.x + 24, ly, &line[..n], gfx::rgb(255, 210, 210));
+        ly += 17;
     }
     c.draw_text(&fonts.ui, box_r.x + 24, box_r.bottom() - 20, "Please restart the computer.", gfx::rgb(255, 220, 220));
 }

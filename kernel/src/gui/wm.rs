@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use gfx::icons::{self, Icon};
-use gfx::{fade, rgb, rgba, with_alpha, Canvas, Rect, Surface};
+use gfx::{fade, rgb, rgba, with_alpha, Canvas, Rect, ShadowMask, Surface};
 
 use super::app::{App, AppEvent, AppKind, Command, Ctx, Msg, WindowId};
 use super::display::{Display, CURSOR_DIM};
@@ -100,6 +100,8 @@ struct Window {
     anim: Option<Anim>,
     /// Screen area painted last frame (for damage while animating).
     last_paint: Rect,
+    /// Drop shadow for the current size (rebuilt when the size changes).
+    shadow: Option<ShadowMask>,
 }
 
 fn shadow_bounds(r: Rect) -> Rect {
@@ -240,6 +242,8 @@ pub struct Wm {
     cfg_gen: u64,
     /// Remaining sub-pixel motion for pointer-speed scaling.
     motion_rem: (i32, i32),
+    dock_shadow: Option<ShadowMask>,
+    last_clock_check: u64,
     pub launcher: fn(AppKind) -> Option<Box<dyn App>>,
 }
 
@@ -310,6 +314,8 @@ impl Wm {
             cfg_gen: settings::generation(),
             cfg,
             motion_rem: (0, 0),
+            dock_shadow: None,
+            last_clock_check: 0,
             launcher,
         };
         if !wm.cfg.animations {
@@ -391,6 +397,7 @@ impl Wm {
             hover_button: None,
             anim,
             last_paint: shadow_bounds(rect),
+            shadow: None,
         });
         self.focus(Some(id));
         self.damage(shadow_bounds(rect));
@@ -1086,11 +1093,15 @@ impl Wm {
             self.windows[i].app.tick(&mut ctx);
             self.apply(ctx);
         }
-        if self.update_clock() {
-            self.damage(Rect::new(self.width - 300, 0, 300, theme::TOPBAR_H));
+        let now = uptime_ms();
+        // Reading the CMOS clock is slow I/O; a few times a second is plenty.
+        if now - self.last_clock_check >= 250 || self.clock.is_empty() {
+            self.last_clock_check = now;
+            if self.update_clock() {
+                self.damage(Rect::new(self.width - 300, 0, 300, theme::TOPBAR_H));
+            }
         }
 
-        let now = uptime_ms();
         // Advance animations.
         let mut finished_close = Vec::new();
         for i in 0..self.windows.len() {
@@ -1139,6 +1150,28 @@ impl Wm {
                 let b = self.windows[i].visual_bounds(now).union(&self.windows[i].paint_bounds());
                 self.damage(b);
             }
+        }
+
+        // While a window is being resized its old shadow is stretched; the
+        // exact one is rebuilt once the drag ends.
+        let resizing = matches!(self.drag, Some(Drag::Resize { .. }));
+        for w in self.windows.iter_mut() {
+            let stale = w.shadow.as_ref().map(|m| (m.w, m.h) != (w.rect.w, w.rect.h)).unwrap_or(true);
+            if stale && !w.maximized() && !(resizing && w.shadow.is_some()) {
+                w.shadow = Some(ShadowMask::new(
+                    w.rect.w,
+                    w.rect.h,
+                    theme::WINDOW_RADIUS,
+                    theme::SHADOW_BLUR,
+                    theme::SHADOW_OFFSET,
+                    255,
+                    120,
+                ));
+            }
+        }
+        let dock = self.dock_rect();
+        if self.dock_shadow.as_ref().map(|m| (m.w, m.h) != (dock.w, dock.h)).unwrap_or(true) {
+            self.dock_shadow = Some(ShadowMask::new(dock.w, dock.h, 20, 18, 4, 255, 90));
         }
 
         if self.cursor_dirty {
@@ -1207,8 +1240,14 @@ impl Wm {
                     let (dest, alpha) = win.visual(now);
                     if dest == win.rect && alpha >= 255 {
                         let radius = win.radius();
-                        if !win.maximized() {
-                            c.draw_shadow(win.rect.offset(0, theme::SHADOW_OFFSET), radius, theme::SHADOW_BLUR, shadow);
+                        if !win.maximized()
+                            && let Some(m) = &win.shadow
+                        {
+                            if (m.w, m.h) == (win.rect.w, win.rect.h) {
+                                c.draw_shadow_mask(m, win.rect, shadow, 255);
+                            } else {
+                                c.draw_shadow_mask_scaled(m, win.rect, shadow, 255);
+                            }
                         }
                         c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
                         if !win.maximized() {
@@ -1216,7 +1255,9 @@ impl Wm {
                         }
                     } else {
                         let radius = (theme::WINDOW_RADIUS * dest.w / win.rect.w.max(1)).max(2);
-                        c.draw_shadow(dest.offset(0, theme::SHADOW_OFFSET), radius, theme::SHADOW_BLUR, fade(shadow, alpha));
+                        if let Some(m) = &win.shadow {
+                            c.draw_shadow_mask_scaled(m, dest, shadow, alpha);
+                        }
                         c.blit_scaled(&win.surface, dest, alpha, radius);
                         c.stroke_rounded_rect(dest, radius, 1, fade(theme::BORDER, alpha));
                     }
@@ -1225,6 +1266,7 @@ impl Wm {
             self.paint_shell(r, now);
             self.display.present(r);
         }
+        self.display.end_frame();
     }
 
     fn bounce_offset(&self, kind: AppKind, now: u64) -> i32 {
@@ -1267,7 +1309,7 @@ impl Wm {
         let dock_area = self.dock_damage_rect();
         let f = fonts();
         let accent = theme::accent();
-        let Wm { display, clock, dock_hover, menu_open, menu_hover, pointer, cursor, cursor_hot, .. } = self;
+        let Wm { display, clock, dock_hover, menu_open, menu_hover, pointer, cursor, cursor_hot, dock_shadow, .. } = self;
         let hw_cursor = display.has_hw_cursor();
         let buf = display.buffer();
         let mut c = Canvas::new(buf, w, h, w as usize);
@@ -1320,7 +1362,9 @@ impl Wm {
 
         // Dock.
         if dock_area.intersects(&r) {
-            c.draw_shadow(dock, 20, 18, rgba(0, 0, 0, 60));
+            if let Some(m) = dock_shadow.as_ref() {
+                c.draw_shadow_mask(m, dock, rgba(0, 0, 0, 70), 255);
+            }
             c.fill_rounded_rect(dock, 20, rgba(255, 255, 255, 165));
             c.stroke_rounded_rect(dock, 20, 1, rgba(255, 255, 255, 200));
             for (i, (kind, icon, name)) in DOCK.iter().enumerate() {

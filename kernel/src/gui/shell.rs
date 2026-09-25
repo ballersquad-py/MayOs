@@ -54,6 +54,7 @@ const HELP: &[(&str, &str)] = &[
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
     ("resolution [WxH]", "list or change the screen resolution"),
+    ("fps", "desktop frame rate and frame time"),
     ("dmesg", "kernel log"),
     ("uname", "system name"),
     ("history", "previous commands"),
@@ -619,6 +620,18 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         },
         "settings" => ctx.open(super::settings_app::boxed()),
+        "fps" => {
+            let fps = super::FPS.load(core::sync::atomic::Ordering::Relaxed);
+            let us = super::FRAME_US.load(core::sync::atomic::Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{} frames/s, {}.{} ms per frame (rendering + compositing) on {}",
+                fps,
+                us / 1000,
+                (us % 1000) / 100,
+                super::display_description()
+            );
+        }
         "resolution" | "res" => {
             let (cw, ch) = super::display_mode();
             match args.first().and_then(|a| a.split_once('x')).and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {

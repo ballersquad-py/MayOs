@@ -162,7 +162,8 @@ fn wc_flags() -> u64 {
 
 /// Map a framebuffer write-combining (fast sequential writes) into the
 /// direct map. Pages that are already mapped keep their attributes.
-pub fn map_framebuffer(phys: u64, len: usize) -> u64 {
+/// Returns `None` unless every page of the range ends up mapped.
+pub fn map_framebuffer(phys: u64, len: usize) -> Option<u64> {
     let flags = wc_flags();
     let start = phys & !(PAGE_SIZE - 1);
     let end = (phys + len as u64).div_ceil(PAGE_SIZE) * PAGE_SIZE;
@@ -171,11 +172,29 @@ pub fn map_framebuffer(phys: u64, len: usize) -> u64 {
     while p < end {
         let v = phys_to_virt(p);
         if translate(pml4, v).is_none() {
-            map(pml4, v, p, WRITABLE | NO_EXECUTE | flags).expect("map_framebuffer failed");
+            match map(pml4, v, p, WRITABLE | NO_EXECUTE | flags) {
+                Ok(()) => {}
+                Err(e) => {
+                    crate::kprintln!("paging: cannot map framebuffer page {:#x}: {:?}", p, e);
+                    return None;
+                }
+            }
         }
         p += PAGE_SIZE;
     }
-    phys_to_virt(phys)
+    // Verify: a missing page here would be a page fault in the compositor.
+    let mut p = start;
+    while p < end {
+        match translate(pml4, phys_to_virt(p)) {
+            Some((mapped, _)) if mapped & !(PAGE_SIZE - 1) == p => {}
+            other => {
+                crate::kprintln!("paging: framebuffer page {:#x} maps to {:?}", p, other.map(|o| o.0));
+                return None;
+            }
+        }
+        p += PAGE_SIZE;
+    }
+    Some(phys_to_virt(phys))
 }
 
 /// A fresh address space sharing the kernel half.
