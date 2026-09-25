@@ -17,6 +17,7 @@ if [ ! -f "$IMG" ]; then
     mcopy -i "$IMG" "$ROOT/docs/ROADMAP.md" ::/docs/Roadmap.md
     mcopy -i "$IMG" "$ROOT"/assets/disk/pictures/* ::/pictures/
     mcopy -i "$IMG" "$ROOT"/assets/disk/videos/* ::/videos/
+    mcopy -i "$IMG" "$ROOT"/assets/disk/music/* ::/music/
     if command -v python3 >/dev/null; then
         TMPWAV=$(mktemp)
         python3 "$ROOT/tools/mkwav.py" "$TMPWAV" && mcopy -i "$IMG" "$TMPWAV" "::/music/Welcome Tune.wav"

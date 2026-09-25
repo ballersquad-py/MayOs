@@ -50,7 +50,7 @@ const HELP: &[(&str, &str)] = &[
     ("ping <host> [count]", "send ICMP echo requests"),
     ("nslookup <name>", "resolve a host name with DNS"),
     ("dhcp", "request a new IP address"),
-    ("play <file>", "play a WAV sound or an AVI video"),
+    ("play <file>", "play music or a video (MP4, MOV, MKV, AVI, MP3, AAC, WAV)"),
     ("wallpaper <picture|N>", "set the desktop wallpaper"),
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
@@ -97,6 +97,11 @@ pub fn tokenize(line: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// All arguments as one path (so `open My File.txt` works without quotes).
+fn joined(args: &[&str]) -> Option<String> {
+    if args.is_empty() { None } else { Some(args.join(" ")) }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -538,7 +543,7 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             Some(p) => ctx.open(Box::new(Editor::open(&abs(p)))),
             None => ctx.open(Box::new(Editor::new_empty())),
         },
-        "open" => match args.first() {
+        "open" => match joined(args).as_deref() {
             Some(p) => {
                 let path = abs(p);
                 if let Err(e) = super::open_path(&path, ctx) {
@@ -575,8 +580,8 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             Some(name) => term.start_job("nslookup", String::from(*name), job_nslookup),
             None => err(out, "usage: nslookup <name>"),
         },
-        "play" => match args.first() {
-            Some(p) if super::video::is_video_name(p) => ctx.open(Box::new(super::video::VideoPlayer::open(&abs(p)))),
+        "play" => match joined(args).as_deref() {
+            Some(p) if super::player::is_media_name(p) && !p.ends_with(".wav") => ctx.open(Box::new(super::player::Player::open(&abs(p)))),
             Some(p) => match fs::read_file(&abs(p)) {
                 Ok(data) => match crate::audio::wav::decode(&data) {
                     Ok((info, samples)) => {
@@ -624,7 +629,7 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         },
         "settings" => ctx.open(super::settings_app::boxed()),
-        "wallpaper" => match args.first() {
+        "wallpaper" => match joined(args).as_deref() {
             Some(n) if n.parse::<usize>().is_ok() => {
                 let i = n.parse::<usize>().unwrap().min(super::wallpaper::WALLPAPERS.len() - 1);
                 crate::settings::update(|s| {

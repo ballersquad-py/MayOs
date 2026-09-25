@@ -238,5 +238,9 @@ for i in range(7):
         isr += [q(t / (1 + t), Q30), q(1 / (1 + t), Q30)]
 emit("MP3_IS_RATIO", "i32", isr)
 
+# ---- Visualiser ----------------------------------------------------------
+emit("SIN512_Q14", "i16", [q(math.sin(2 * math.pi * i / 512), 14) for i in range(512)])
+emit("HANN512_Q14", "i16", [q(0.5 - 0.5 * math.cos(2 * math.pi * i / 511), 14) for i in range(512)])
+
 open(OUT, "w").write("\n".join(out))
 print("wrote", OUT)

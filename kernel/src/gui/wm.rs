@@ -35,6 +35,7 @@ const MORPH_MS: u64 = 220;
 const MENU_FADE_MS: u64 = 130;
 const BOOT_FADE_MS: u64 = 700;
 const BOUNCE_MS: u64 = 900;
+const DOCK_SLIDE_MS: u64 = 220;
 
 /// Ease-out cubic on a 0..=1024 scale.
 fn ease_out(p: i64) -> i64 {
@@ -103,6 +104,8 @@ struct Window {
     last_paint: Rect,
     /// Drop shadow for the current size (rebuilt when the size changes).
     shadow: Option<ShadowMask>,
+    /// Covering the whole screen without decorations (rect to restore).
+    fullscreen: Option<Rect>,
 }
 
 fn shadow_bounds(r: Rect) -> Rect {
@@ -115,13 +118,23 @@ impl Window {
         self.restore.is_some()
     }
 
+    /// Maximised or fullscreen: square corners, no shadow.
+    fn flat(&self) -> bool {
+        self.restore.is_some() || self.fullscreen.is_some()
+    }
+
+    /// Height of the title bar (none in fullscreen).
+    fn title_h(&self) -> i32 {
+        if self.fullscreen.is_some() { 0 } else { theme::TITLEBAR_H }
+    }
+
     fn radius(&self) -> i32 {
-        if self.maximized() { 0 } else { theme::WINDOW_RADIUS }
+        if self.flat() { 0 } else { theme::WINDOW_RADIUS }
     }
 
     /// Everything this window paints at rest, including its shadow.
     fn paint_bounds(&self) -> Rect {
-        if self.maximized() { self.rect } else { shadow_bounds(self.rect) }
+        if self.flat() { self.rect } else { shadow_bounds(self.rect) }
     }
 
     /// Hidden from hit-testing (minimised, or animating out).
@@ -164,11 +177,11 @@ impl Window {
             return Rect::default();
         }
         let (r, _) = self.visual(now);
-        if self.maximized() && self.anim.is_none() { r } else { shadow_bounds(r) }
+        if self.flat() && self.anim.is_none() { r } else { shadow_bounds(r) }
     }
 
     fn client_size(&self) -> (i32, i32) {
-        (self.rect.w, self.rect.h - theme::TITLEBAR_H)
+        (self.rect.w, self.rect.h - self.title_h())
     }
 
     fn button_center(i: u8) -> (i32, i32) {
@@ -247,6 +260,9 @@ pub struct Wm {
     /// Remaining sub-pixel motion for pointer-speed scaling.
     motion_rem: (i32, i32),
     dock_shadow: Option<ShadowMask>,
+    /// Dock slide animation for auto-hide: (from, to, start) offsets in px.
+    dock_slide: (i32, i32, u64),
+    dock_leave_at: u64,
     last_clock_check: u64,
     pub launcher: fn(AppKind) -> Option<Box<dyn App>>,
 }
@@ -321,11 +337,17 @@ impl Wm {
             cfg,
             motion_rem: (0, 0),
             dock_shadow: None,
+            dock_slide: (0, 0, 0),
+            dock_leave_at: 0,
             last_clock_check: 0,
             launcher,
         };
         if !wm.cfg.animations {
             wm.boot_at = 0;
+        }
+        if wm.cfg.dock_autohide {
+            let h = wm.dock_hide_distance();
+            wm.dock_slide = (h, h, 0);
         }
         wm.update_clock();
         if !wm.cfg.wallpaper_image.is_empty() {
@@ -362,6 +384,7 @@ impl Wm {
             || self.dock_bounce.is_some()
             || (self.menu_open && now - self.menu_opened_at < MENU_FADE_MS + 20)
             || (self.boot_at != 0 && now - self.boot_at < BOOT_FADE_MS + 20)
+            || now.saturating_sub(self.dock_slide.2) < DOCK_SLIDE_MS + 20
     }
 
     // -----------------------------------------------------------------
@@ -374,8 +397,9 @@ impl Wm {
 
     fn open_from(&mut self, app: Box<dyn App>, over: Option<WindowId>, origin: Option<Rect>) -> WindowId {
         let (mut w, mut h) = app.initial_size();
-        w = w.min(self.width - 40);
-        h = h.min(self.height - theme::TOPBAR_H - 90);
+        let area = self.work_area();
+        w = w.min(area.w - 40);
+        h = h.min(area.h - theme::TITLEBAR_H - 40);
         let h_total = h + theme::TITLEBAR_H;
         let (x, y) = match over.and_then(|o| self.index_of(o)) {
             Some(i) => {
@@ -385,11 +409,11 @@ impl Wm {
             None => {
                 let step = self.cascade % 8;
                 self.cascade += 1;
-                ((self.width - w) / 2 - 120 + step * 32, theme::TOPBAR_H + 40 + step * 28)
+                (area.x + (area.w - w) / 2 - 120 + step * 32, area.y + 30 + step * 28)
             }
         };
-        let x = x.clamp(8, (self.width - w - 8).max(8));
-        let y = y.clamp(theme::TOPBAR_H + 8, (self.height - h_total - 8).max(theme::TOPBAR_H + 8));
+        let x = x.clamp(area.x + 8, (area.right() - w - 8).max(area.x + 8));
+        let y = y.clamp(area.y + 8, (area.bottom() - h_total - 8).max(area.y + 8));
         let id = self.next_id;
         self.next_id += 1;
         let rect = Rect::new(x, y, w, h_total);
@@ -407,6 +431,7 @@ impl Wm {
             anim,
             last_paint: shadow_bounds(rect),
             shadow: None,
+            fullscreen: None,
         });
         self.focus(Some(id));
         self.damage(shadow_bounds(rect));
@@ -548,9 +573,37 @@ impl Wm {
         self.damage(b);
     }
 
+    fn set_fullscreen(&mut self, id: WindowId, on: bool) {
+        let Some(i) = self.index_of(id) else { return };
+        if on == self.windows[i].fullscreen.is_some() {
+            return;
+        }
+        let old = self.windows[i].paint_bounds();
+        if on {
+            self.windows[i].fullscreen = Some(self.windows[i].rect);
+            self.set_rect(i, Rect::new(0, 0, self.width, self.height));
+        } else {
+            let r = self.windows[i].fullscreen.take().unwrap();
+            self.set_rect(i, r);
+            // The client area moved down under the title bar.
+            let (cw, ch) = self.windows[i].client_size();
+            self.deliver(i, AppEvent::Resized { w: cw, h: ch });
+        }
+        self.windows[i].needs_render = true;
+        self.focus(Some(id));
+        self.damage(old);
+        self.damage_all();
+    }
+
+    /// The topmost window if it is fullscreen (the shell is then hidden).
+    fn fullscreen_top(&self) -> Option<usize> {
+        let i = self.windows.iter().rposition(|w| !w.gone())?;
+        if self.windows[i].fullscreen.is_some() && self.windows[i].anim.is_none() { Some(i) } else { None }
+    }
+
     fn toggle_maximize(&mut self, id: WindowId) {
         let Some(i) = self.index_of(id) else { return };
-        if !self.windows[i].app.resizable() {
+        if !self.windows[i].app.resizable() || self.windows[i].fullscreen.is_some() {
             return;
         }
         let old_rect = self.windows[i].rect;
@@ -559,7 +612,7 @@ impl Wm {
             Some(r) => r,
             None => {
                 self.windows[i].restore = Some(self.windows[i].rect);
-                Rect::new(0, theme::TOPBAR_H, self.width, self.height - theme::TOPBAR_H)
+                self.work_area()
             }
         };
         self.set_rect(i, new);
@@ -622,6 +675,7 @@ impl Wm {
                 Command::RevertResolution(w, h) => {
                     self.set_resolution(w, h);
                 }
+                Command::SetFullscreen(on) => self.set_fullscreen(id, on),
                 Command::Shutdown => crate::power::shutdown(),
                 Command::Reboot => crate::power::reboot(),
             }
@@ -647,15 +701,17 @@ impl Wm {
         self.height = height;
         super::update_display_description(&self.display);
         self.refresh_background();
-        let full = Rect::new(0, theme::TOPBAR_H, width, height - theme::TOPBAR_H);
+        let area = self.work_area();
         for i in 0..self.windows.len() {
             let r = self.windows[i].rect;
-            let new = if self.windows[i].maximized() {
-                full
+            let new = if self.windows[i].fullscreen.is_some() {
+                Rect::new(0, 0, width, height)
+            } else if self.windows[i].maximized() {
+                area
             } else {
-                let rw = r.w.min(width - 16);
-                let rh = r.h.min(height - theme::TOPBAR_H - 16);
-                Rect::new(r.x.clamp(8, (width - rw - 8).max(8)), r.y.clamp(theme::TOPBAR_H, (height - rh).max(theme::TOPBAR_H)), rw, rh)
+                let rw = r.w.min(area.w - 16);
+                let rh = r.h.min(area.h - 16);
+                Rect::new(r.x.clamp(area.x + 8, (area.right() - rw - 8).max(area.x + 8)), r.y.clamp(area.y, (area.bottom() - rh).max(area.y)), rw, rh)
             };
             self.set_rect(i, new);
             self.windows[i].last_paint = self.windows[i].paint_bounds();
@@ -673,26 +729,132 @@ impl Wm {
     // Geometry of shell elements
     // -----------------------------------------------------------------
 
-    fn dock_rect(&self) -> Rect {
+    fn dock_icon(&self) -> i32 {
+        [40, theme::DOCK_ICON, 60][self.cfg.dock_size.min(2) as usize]
+    }
+
+    fn dock_pad(&self) -> i32 {
+        self.dock_icon() * theme::DOCK_PAD / theme::DOCK_ICON
+    }
+
+    fn dock_side(&self) -> u8 {
+        self.cfg.dock_position.min(2)
+    }
+
+    /// The dock when fully shown.
+    fn dock_base(&self) -> Rect {
         let n = DOCK.len() as i32;
-        let w = n * theme::DOCK_ICON + (n + 1) * theme::DOCK_PAD + 8;
-        let h = theme::DOCK_ICON + theme::DOCK_PAD * 2;
-        Rect::new((self.width - w) / 2, self.height - h - 10, w, h)
+        let (ic, pad) = (self.dock_icon(), self.dock_pad());
+        let long = n * ic + (n + 1) * pad + 8;
+        let short = ic + pad * 2;
+        let top = theme::TOPBAR_H;
+        match self.dock_side() {
+            0 => Rect::new((self.width - long) / 2, self.height - short - 10, long, short),
+            1 => Rect::new(10, top + (self.height - top - long) / 2, short, long),
+            _ => Rect::new(self.width - short - 10, top + (self.height - top - long) / 2, short, long),
+        }
+    }
+
+    /// How far the dock slides to be out of sight.
+    fn dock_hide_distance(&self) -> i32 {
+        let b = self.dock_base();
+        (if self.dock_side() == 0 { b.h } else { b.w }) + 10 + 24
+    }
+
+    fn dock_offset(&self, now: u64) -> i32 {
+        let (from, to, start) = self.dock_slide;
+        if now >= start + DOCK_SLIDE_MS || !self.cfg.animations {
+            return to;
+        }
+        let p = ((now - start) as i64 * 1024 / DOCK_SLIDE_MS as i64).clamp(0, 1024);
+        lerp(from, to, ease_out(p))
+    }
+
+    fn dock_visible(&self) -> bool {
+        self.dock_slide.1 == 0 || self.dock_offset(uptime_ms()) < self.dock_hide_distance()
+    }
+
+    fn dock_rect(&self) -> Rect {
+        let b = self.dock_base();
+        let o = self.dock_offset(uptime_ms());
+        match self.dock_side() {
+            0 => b.offset(0, o),
+            1 => b.offset(-o, 0),
+            _ => b.offset(o, 0),
+        }
     }
 
     fn dock_icon_rect(&self, i: usize) -> Rect {
         let d = self.dock_rect();
-        Rect::new(
-            d.x + 4 + theme::DOCK_PAD + i as i32 * (theme::DOCK_ICON + theme::DOCK_PAD),
-            d.y + theme::DOCK_PAD,
-            theme::DOCK_ICON,
-            theme::DOCK_ICON,
-        )
+        let (ic, pad) = (self.dock_icon(), self.dock_pad());
+        let along = 4 + pad + i as i32 * (ic + pad);
+        if self.dock_side() == 0 {
+            Rect::new(d.x + along, d.y + pad, ic, ic)
+        } else {
+            Rect::new(d.x + pad, d.y + along, ic, ic)
+        }
     }
 
     fn dock_damage_rect(&self) -> Rect {
-        let d = self.dock_rect();
-        Rect::new(d.x - 60, d.y - 60, d.w + 120, d.h + 70)
+        let b = self.dock_base();
+        let r = match self.dock_side() {
+            0 => Rect::new(b.x - 60, b.y - 60, b.w + 120, self.height - b.y + 60),
+            1 => Rect::new(0, b.y - 40, b.right() + 220, b.h + 80),
+            _ => Rect::new(b.x - 220, b.y - 40, self.width - b.x + 220, b.h + 80),
+        };
+        r.intersect(&Rect::new(0, 0, self.width, self.height))
+    }
+
+    /// Screen area for windows: below the top bar and clear of the dock
+    /// (unless it hides itself).
+    pub fn work_area(&self) -> Rect {
+        let full = Rect::new(0, theme::TOPBAR_H, self.width, self.height - theme::TOPBAR_H);
+        if self.cfg.dock_autohide {
+            return full;
+        }
+        let b = self.dock_base();
+        match self.dock_side() {
+            0 => Rect::new(full.x, full.y, full.w, b.y - 6 - full.y),
+            1 => Rect::new(b.right() + 6, full.y, full.w - (b.right() + 6), full.h),
+            _ => Rect::new(0, full.y, b.x - 6, full.h),
+        }
+    }
+
+    /// Show or hide an auto-hiding dock depending on the pointer.
+    fn update_dock_visibility(&mut self, now: u64) {
+        let hidden = self.dock_hide_distance();
+        let want_shown = if !self.cfg.dock_autohide {
+            true
+        } else {
+            let (x, y) = self.pointer;
+            let b = self.dock_base();
+            let at_edge = match self.dock_side() {
+                0 => y >= self.height - 3 && x >= b.x - 40 && x <= b.right() + 40,
+                1 => x <= 2 && y >= b.y - 40 && y <= b.bottom() + 40,
+                _ => x >= self.width - 3 && y >= b.y - 40 && y <= b.bottom() + 40,
+            };
+            let over = self.dock_slide.1 == 0 && b.inset(-12).contains(x, y);
+            if at_edge || over || self.drag.is_none() && self.dock_bounce.is_some() {
+                self.dock_leave_at = 0;
+                true
+            } else if self.dock_slide.1 == 0 {
+                if self.dock_leave_at == 0 {
+                    self.dock_leave_at = now;
+                }
+                now - self.dock_leave_at < 600
+            } else {
+                false
+            }
+        };
+        let target = if want_shown { 0 } else { hidden };
+        if target != self.dock_slide.1 {
+            let cur = self.dock_offset(now);
+            self.dock_slide = (cur, target, now);
+            self.damage(self.dock_damage_rect());
+        }
+        if now < self.dock_slide.2 + DOCK_SLIDE_MS + 20 {
+            self.damage(self.dock_damage_rect());
+        }
     }
 
     fn menu_rect(&self) -> Rect {
@@ -786,7 +948,8 @@ impl Wm {
             && let Some(i) = self.index_of(id)
         {
             let r = self.windows[i].rect;
-            let ev = AppEvent::MouseMove { x: x - r.x, y: y - r.y - theme::TITLEBAR_H, buttons: self.buttons };
+            let th = self.windows[i].title_h();
+            let ev = AppEvent::MouseMove { x: x - r.x, y: y - r.y - th, buttons: self.buttons };
             self.deliver(i, ev);
             return;
         }
@@ -797,7 +960,11 @@ impl Wm {
                 self.damage(self.menu_rect());
             }
         }
-        let dh = (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y));
+        let dh = if self.fullscreen_top().is_some() || !self.dock_visible() {
+            None
+        } else {
+            (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y))
+        };
         if dh != self.dock_hover {
             self.dock_hover = dh;
             self.damage(self.dock_damage_rect());
@@ -817,22 +984,26 @@ impl Wm {
         if let Some(i) = under.and_then(|id| self.index_of(id)) {
             let r = self.windows[i].rect;
             let (lx, ly) = (x - r.x, y - r.y);
-            let hb = (0..3u8).find(|&b| {
+            let hb = if self.windows[i].fullscreen.is_some() { None } else { (0..3u8).find(|&b| {
                 let (cx, cy) = Window::button_center(b);
                 (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 64
-            });
+            }) };
             if hb != self.windows[i].hover_button {
                 self.windows[i].hover_button = hb;
                 self.windows[i].needs_render = true;
             }
-            if ly >= theme::TITLEBAR_H {
-                self.deliver(i, AppEvent::MouseMove { x: lx, y: ly - theme::TITLEBAR_H, buttons: self.buttons });
+            let th = self.windows[i].title_h();
+            if ly >= th {
+                self.deliver(i, AppEvent::MouseMove { x: lx, y: ly - th, buttons: self.buttons });
             }
         }
     }
 
     fn window_at(&self, x: i32, y: i32) -> Option<WindowId> {
-        if y < theme::TOPBAR_H || self.dock_rect().contains(x, y) {
+        if let Some(i) = self.fullscreen_top() {
+            return Some(self.windows[i].id);
+        }
+        if y < theme::TOPBAR_H || (self.dock_visible() && self.dock_rect().contains(x, y)) {
             return None;
         }
         self.windows
@@ -899,6 +1070,15 @@ impl Wm {
 
     fn mouse_down(&mut self, button: u8) {
         let (x, y) = self.pointer;
+        if let Some(i) = self.fullscreen_top() {
+            let id = self.windows[i].id;
+            let now = uptime_ms();
+            let clicks = if self.is_double_click(now, x, y) { self.last_click.3.saturating_add(1) } else { 1 };
+            self.last_click = (now, x, y, clicks);
+            self.capture = Some(id);
+            self.deliver(i, AppEvent::MouseDown { x, y, button, clicks });
+            return;
+        }
 
         if self.menu_open {
             if let Some(i) = self.menu_item_at(x, y) {
@@ -924,12 +1104,14 @@ impl Wm {
             return;
         }
 
-        if let Some(i) = (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y)) {
-            self.dock_click(DOCK[i].0, button == 1);
-            return;
-        }
-        if self.dock_rect().contains(x, y) {
-            return;
+        if self.dock_visible() {
+            if let Some(i) = (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y)) {
+                self.dock_click(DOCK[i].0, button == 1);
+                return;
+            }
+            if self.dock_rect().contains(x, y) {
+                return;
+            }
         }
 
         let Some(id) = self.window_at(x, y) else { return };
@@ -981,7 +1163,8 @@ impl Wm {
         let clicks = if self.is_double_click(now, x, y) { self.last_click.3.saturating_add(1) } else { 1 };
         self.last_click = (now, x, y, clicks);
         self.capture = Some(id);
-        self.deliver(i, AppEvent::MouseDown { x: lx, y: ly - theme::TITLEBAR_H, button, clicks });
+        let th = self.windows[i].title_h();
+        self.deliver(i, AppEvent::MouseDown { x: lx, y: ly - th, button, clicks });
     }
 
     fn mouse_up(&mut self, button: u8) {
@@ -993,7 +1176,8 @@ impl Wm {
             && let Some(i) = self.index_of(id)
         {
             let r = self.windows[i].rect;
-            self.deliver(i, AppEvent::MouseUp { x: x - r.x, y: y - r.y - theme::TITLEBAR_H, button });
+            let th = self.windows[i].title_h();
+            self.deliver(i, AppEvent::MouseUp { x: x - r.x, y: y - r.y - th, button });
         }
     }
 
@@ -1003,7 +1187,8 @@ impl Wm {
             && let Some(i) = self.index_of(id)
         {
             let r = self.windows[i].rect;
-            self.deliver(i, AppEvent::Wheel { x: x - r.x, y: y - r.y - theme::TITLEBAR_H, delta });
+            let th = self.windows[i].title_h();
+            self.deliver(i, AppEvent::Wheel { x: x - r.x, y: y - r.y - th, delta });
         }
     }
 
@@ -1097,9 +1282,26 @@ impl Wm {
             }
             self.damage_all();
         }
+        let dock_changed = (new.dock_position, new.dock_autohide, new.dock_size) != (self.cfg.dock_position, self.cfg.dock_autohide, self.cfg.dock_size);
+        let old_dock = self.dock_damage_rect();
         self.cfg = new;
         if wall_changed {
             self.refresh_background();
+        }
+        if dock_changed {
+            let target = if self.cfg.dock_autohide { self.dock_hide_distance() } else { 0 };
+            self.dock_slide = (target, target, 0);
+            self.dock_shadow = None;
+            self.damage(old_dock);
+            // Re-fit maximised windows to the new work area.
+            let area = self.work_area();
+            for i in 0..self.windows.len() {
+                if self.windows[i].maximized() && self.windows[i].fullscreen.is_none() {
+                    self.set_rect(i, area);
+                    self.windows[i].last_paint = self.windows[i].paint_bounds();
+                }
+            }
+            self.damage_all();
         }
         self.clock.clear();
     }
@@ -1164,6 +1366,7 @@ impl Wm {
             self.apply(ctx);
         }
         let now = uptime_ms();
+        self.update_dock_visibility(now);
         // Reading the CMOS clock is slow I/O; a few times a second is plenty.
         if now - self.last_clock_check >= 250 || self.clock.is_empty() {
             self.last_clock_check = now;
@@ -1227,7 +1430,7 @@ impl Wm {
         let resizing = matches!(self.drag, Some(Drag::Resize { .. }));
         for w in self.windows.iter_mut() {
             let stale = w.shadow.as_ref().map(|m| (m.w, m.h) != (w.rect.w, w.rect.h)).unwrap_or(true);
-            if stale && !w.maximized() && !(resizing && w.shadow.is_some()) {
+            if stale && !w.flat() && !(resizing && w.shadow.is_some()) {
                 w.shadow = Some(ShadowMask::new(
                     w.rect.w,
                     w.rect.h,
@@ -1310,7 +1513,7 @@ impl Wm {
                     let (dest, alpha) = win.visual(now);
                     if dest == win.rect && alpha >= 255 {
                         let radius = win.radius();
-                        if !win.maximized()
+                        if !win.flat()
                             && let Some(m) = &win.shadow
                         {
                             if (m.w, m.h) == (win.rect.w, win.rect.h) {
@@ -1320,7 +1523,7 @@ impl Wm {
                             }
                         }
                         c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
-                        if !win.maximized() {
+                        if !win.flat() {
                             c.stroke_rounded_rect(win.rect, radius, 1, theme::BORDER);
                         }
                     } else {
@@ -1354,6 +1557,9 @@ impl Wm {
     /// Top bar, dock, menu, boot fade and (if needed) the software cursor.
     fn paint_shell(&mut self, r: Rect, now: u64) {
         let (w, h) = (self.width, self.height);
+        let covered = self.fullscreen_top().is_some();
+        let dock_side = self.dock_side();
+        let dock_on = self.dock_visible() && !covered;
         let focused_title = self
             .focused
             .and_then(|id| self.windows.iter().find(|x| x.id == id))
@@ -1387,7 +1593,7 @@ impl Wm {
 
         // Top bar.
         let bar = Rect::new(0, 0, w, theme::TOPBAR_H);
-        if bar.intersects(&r) {
+        if bar.intersects(&r) && !covered {
             c.fill_rect(bar, rgba(255, 255, 255, 190));
             c.hline(0, theme::TOPBAR_H - 1, w, rgba(0, 0, 0, 30));
             if *menu_open {
@@ -1431,22 +1637,37 @@ impl Wm {
         }
 
         // Dock.
-        if dock_area.intersects(&r) {
+        if dock_area.intersects(&r) && dock_on {
+            let radius = (dock.w.min(dock.h) * 20 / 68).max(10);
             if let Some(m) = dock_shadow.as_ref() {
                 c.draw_shadow_mask(m, dock, rgba(0, 0, 0, 70), 255);
             }
-            c.fill_rounded_rect(dock, 20, rgba(255, 255, 255, 165));
-            c.stroke_rounded_rect(dock, 20, 1, rgba(255, 255, 255, 200));
+            c.fill_rounded_rect(dock, radius, rgba(255, 255, 255, 165));
+            c.stroke_rounded_rect(dock, radius, 1, rgba(255, 255, 255, 200));
             for (i, (kind, icon, name)) in DOCK.iter().enumerate() {
                 let ir = icon_rects[i];
                 let lift = if *dock_hover == Some(i) { 4 } else { 0 } + bounces[i];
-                icons::draw(&mut c, *icon, ir.x, ir.y - lift, ir.w);
+                let (dx, dy) = match dock_side {
+                    0 => (0, -lift),
+                    1 => (lift, 0),
+                    _ => (-lift, 0),
+                };
+                icons::draw(&mut c, *icon, ir.x + dx, ir.y + dy, ir.w);
                 if running.contains(kind) {
-                    c.fill_circle(ir.x + ir.w / 2, dock.bottom() - 5, 2, rgba(30, 30, 40, 200));
+                    let (px, py) = match dock_side {
+                        0 => (ir.x + ir.w / 2, dock.bottom() - 5),
+                        1 => (dock.x + 5, ir.y + ir.h / 2),
+                        _ => (dock.right() - 5, ir.y + ir.h / 2),
+                    };
+                    c.fill_circle(px, py, 2, rgba(30, 30, 40, 200));
                 }
                 if *dock_hover == Some(i) {
                     let tw = f.ui.measure(name) + 20;
-                    let tip = Rect::new(ir.x + ir.w / 2 - tw / 2, dock.y - 34, tw, 26);
+                    let tip = match dock_side {
+                        0 => Rect::new(ir.x + ir.w / 2 - tw / 2, dock.y - 34, tw, 26),
+                        1 => Rect::new(dock.right() + 10, ir.y + ir.h / 2 - 13, tw, 26),
+                        _ => Rect::new(dock.x - 10 - tw, ir.y + ir.h / 2 - 13, tw, 26),
+                    };
                     c.fill_rounded_rect(tip, 8, rgba(30, 32, 40, 225));
                     c.draw_text_centered(&f.ui, tip, name, rgb(255, 255, 255));
                 }
@@ -1454,7 +1675,7 @@ impl Wm {
         }
 
         // Menu (fades and drops in when opened).
-        if *menu_open && menu_rect.inset(-20).intersects(&r) {
+        if *menu_open && !covered && menu_rect.inset(-20).intersects(&r) {
             let a = menu_alpha;
             let m = menu_rect.offset(0, -((255 - a as i32) * 8 / 255));
             c.draw_shadow(m, 10, 16, fade(rgba(0, 0, 0, 80), a));
@@ -1505,6 +1726,14 @@ impl Wm {
 
 fn render_window(w: &mut Window, focused: bool) {
     w.needs_render = false;
+    if w.fullscreen.is_some() {
+        let (cw, ch) = w.client_size();
+        let mut c = w.surface.canvas();
+        let old = c.push_clip(Rect::new(0, 0, cw, ch));
+        w.app.render(&mut c, (cw, ch), focused);
+        c.restore_clip(old);
+        return;
+    }
     let f = fonts();
     let title = w.app.title();
     let hover = w.hover_button;

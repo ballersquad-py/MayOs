@@ -17,7 +17,7 @@ pub mod shell;
 pub mod terminal;
 pub mod theme;
 pub mod widgets;
-pub mod video;
+pub mod player;
 pub mod wallpaper;
 pub mod wm;
 
@@ -100,18 +100,8 @@ pub fn open_path(path: &str, ctx: &mut Ctx) -> Result<(), crate::fs::FsError> {
         ctx.open(Box::new(imageview::ImageViewer::open(path)));
         return Ok(());
     }
-    if video::is_video_name(name) {
-        ctx.open(Box::new(video::VideoPlayer::open(path)));
-        return Ok(());
-    }
-    if &head == b"RIFF" && crate::fs::extension(path).as_deref() == Some("wav") {
-        let data = crate::fs::read_file(path)?;
-        match crate::audio::wav::decode(&data) {
-            Ok((_, samples)) if crate::audio::is_present() => {
-                crate::audio::play(alloc::sync::Arc::new(samples));
-            }
-            _ => ctx.open(Box::new(editor::Editor::open(path))),
-        }
+    if player::is_media_name(name) {
+        ctx.open(Box::new(player::Player::open(path)));
         return Ok(());
     }
     if &head == b"\x7fELF" {

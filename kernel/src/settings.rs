@@ -32,6 +32,13 @@ pub struct Settings {
     pub static_gateway: String,
     pub static_dns: String,
     pub hostname: String,
+    /// 0 = bottom, 1 = left, 2 = right.
+    pub dock_position: u8,
+    pub dock_autohide: bool,
+    /// 0 = small, 1 = medium, 2 = large.
+    pub dock_size: u8,
+    /// Media player volume, 0..=100.
+    pub player_volume: u8,
 }
 
 impl Default for Settings {
@@ -58,6 +65,10 @@ impl Default for Settings {
             static_gateway: String::from("10.0.2.2"),
             static_dns: String::from("10.0.2.3"),
             hostname: String::from("mayos"),
+            dock_position: 0,
+            dock_autohide: false,
+            dock_size: 1,
+            player_volume: 90,
         }
     }
 }
@@ -116,6 +127,10 @@ pub fn parse(text: &str) -> Settings {
             "static_gateway" => s.static_gateway = v.to_string(),
             "static_dns" => s.static_dns = v.to_string(),
             "hostname" => s.hostname = v.to_string(),
+            "dock_position" => s.dock_position = num(0).min(2) as u8,
+            "dock_autohide" => s.dock_autohide = parse_bool(v).unwrap_or(false),
+            "dock_size" => s.dock_size = num(1).min(2) as u8,
+            "player_volume" => s.player_volume = num(90).min(100) as u8,
             _ => {}
         }
     }
@@ -133,7 +148,8 @@ pub fn serialize(s: &Settings) -> String {
          volume = {}\nmuted = {}\nsystem_sounds = {}\n\
          pointer_speed = {}\ndouble_click_ms = {}\nnatural_scroll = {}\nkey_repeat = {}\n\
          clock_24h = {}\nshow_seconds = {}\ntz_offset_min = {}\n\
-         dhcp = {}\nstatic_ip = {}\nstatic_mask = {}\nstatic_gateway = {}\nstatic_dns = {}\nhostname = {}\n",
+         dhcp = {}\nstatic_ip = {}\nstatic_mask = {}\nstatic_gateway = {}\nstatic_dns = {}\nhostname = {}\n\
+         dock_position = {}\ndock_autohide = {}\ndock_size = {}\nplayer_volume = {}\n",
         res,
         s.wallpaper,
         s.wallpaper_image,
@@ -154,7 +170,11 @@ pub fn serialize(s: &Settings) -> String {
         s.static_mask,
         s.static_gateway,
         s.static_dns,
-        s.hostname
+        s.hostname,
+        s.dock_position,
+        s.dock_autohide,
+        s.dock_size,
+        s.player_volume
     )
 }
 

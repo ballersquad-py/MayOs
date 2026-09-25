@@ -63,6 +63,7 @@ enum Toggle {
     Clock24h,
     ShowSeconds,
     Dhcp,
+    DockAutohide,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +82,8 @@ enum Action {
     Resolution(u32, u32),
     Wallpaper(usize),
     Picture(usize),
+    DockPosition(u8),
+    DockSize(u8),
     Accent(usize),
     TzMinus,
     TzPlus,
@@ -104,6 +107,7 @@ fn toggle_value(s: &Settings, t: Toggle) -> bool {
         Toggle::Clock24h => s.clock_24h,
         Toggle::ShowSeconds => s.show_seconds,
         Toggle::Dhcp => s.dhcp,
+        Toggle::DockAutohide => s.dock_autohide,
     }
 }
 
@@ -116,6 +120,7 @@ fn set_toggle(s: &mut Settings, t: Toggle, v: bool) {
         Toggle::Clock24h => s.clock_24h = v,
         Toggle::ShowSeconds => s.show_seconds = v,
         Toggle::Dhcp => s.dhcp = v,
+        Toggle::DockAutohide => s.dock_autohide = v,
     }
 }
 
@@ -546,6 +551,42 @@ impl SettingsApp {
         self.card(c, card);
         let r = self.row(c, card, 0, "Animations", Some("Window, dock and menu motion"), true);
         self.toggle(c, r, Toggle::Animations);
+        y = card.bottom() + 18;
+        let f = fonts();
+        c.draw_text(&f.bold, x + 4, y, "Dock", theme::TEXT);
+        y += 14;
+        let card = Rect::new(x, y, w, ROW_H * 3);
+        self.card(c, card);
+        let r = self.row(c, card, 0, "Position on screen", Some("Move it to a side if the bottom is cut off"), false);
+        let pos = self.cfg.dock_position;
+        self.segmented(c, r, &["Bottom", "Left", "Right"], pos, Action::DockPosition);
+        let r = self.row(c, card, 1, "Size", None, false);
+        let size = self.cfg.dock_size;
+        self.segmented(c, r, &["Small", "Medium", "Large"], size, Action::DockSize);
+        let r = self.row(c, card, 2, "Hide automatically", Some("Slides away; point at the screen edge to show it"), true);
+        self.toggle(c, r, Toggle::DockAutohide);
+    }
+
+    /// A row of mutually exclusive buttons at the right end of a row.
+    fn segmented(&mut self, c: &mut Canvas, row: Rect, labels: &[&str], selected: u8, action: fn(u8) -> Action) {
+        let f = fonts();
+        let seg_w = labels.iter().map(|l| f.ui.measure(l)).max().unwrap_or(40) + 24;
+        let total = seg_w * labels.len() as i32 + 4;
+        let outer = Rect::new(row.right() - 18 - total, row.y + (ROW_H - 32) / 2, total, 32);
+        c.fill_rounded_rect(outer, 9, rgb(0xe9, 0xeb, 0xef));
+        for (i, label) in labels.iter().enumerate() {
+            let r = Rect::new(outer.x + 2 + i as i32 * seg_w, outer.y + 2, seg_w, 28);
+            let a = action(i as u8);
+            if selected == i as u8 {
+                c.draw_shadow(r, 7, 4, with_alpha(0x000000, 40));
+                c.fill_rounded_rect(r, 7, rgb(0xff, 0xff, 0xff));
+            } else if self.hovered(a) {
+                c.fill_rounded_rect(r, 7, with_alpha(0x000000, 12));
+            }
+            let col = if selected == i as u8 { theme::TEXT } else { theme::TEXT_DIM };
+            c.draw_text_centered(&f.ui, r, label, col);
+            self.hits.push((r, a));
+        }
     }
 
     /// "Your pictures": every PNG/JPEG/BMP in /pictures, /home and the top
@@ -892,6 +933,8 @@ impl SettingsApp {
                 }
             }
             Action::Accent(i) => settings::update(|s| s.accent = i),
+            Action::DockPosition(p) => settings::update(|s| s.dock_position = p),
+            Action::DockSize(z) => settings::update(|s| s.dock_size = z),
             Action::TzMinus => settings::update(|s| s.tz_offset_min = (s.tz_offset_min - 30).max(-12 * 60)),
             Action::TzPlus => settings::update(|s| s.tz_offset_min = (s.tz_offset_min + 30).min(14 * 60)),
             Action::TestSound => audio::play_system(SystemSound::Test),

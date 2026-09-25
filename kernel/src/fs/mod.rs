@@ -191,6 +191,89 @@ fn with<R>(path: &str, f: impl FnOnce(&mut Volume, &str) -> Result<R>) -> Result
     f(&mut g[i].vol, &inner)
 }
 
+/// Mount point that holds `path`, and the path inside it.
+fn resolve(path: &str) -> Result<(String, String)> {
+    let path = normalize("/", path);
+    let g = MOUNTS.lock();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, m) in g.iter().enumerate() {
+        let p = m.point.as_str();
+        let matches = p == "/" || path == p || path.starts_with(&format!("{}/", p));
+        if matches && best.map(|(_, len)| p.len() > len).unwrap_or(true) {
+            best = Some((i, p.len()));
+        }
+    }
+    let Some((i, len)) = best else { return Err(FsError::Io) };
+    let inner = if len <= 1 { path.clone() } else { String::from(&path[len..]) };
+    let inner = if inner.is_empty() { String::from("/") } else { inner };
+    Ok((g[i].point.clone(), inner))
+}
+
+fn with_point<R>(point: &str, f: impl FnOnce(&mut Volume) -> Result<R>) -> Result<R> {
+    let mut g = MOUNTS.lock();
+    let m = g.iter_mut().find(|m| m.point == point).ok_or(FsError::Io)?;
+    f(&mut m.vol)
+}
+
+/// An open file for random-access reading (used for large media files).
+pub struct File {
+    point: String,
+    handle: fat32::FileHandle,
+    pub size: u64,
+}
+
+pub fn open(path: &str) -> Result<File> {
+    let (point, inner) = resolve(path)?;
+    let handle = with_point(&point, |v| v.open_file(&inner))?;
+    let size = handle.size;
+    Ok(File { point, handle, size })
+}
+
+impl File {
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize> {
+        with_point(&self.point, |v| v.read_at(&self.handle, off, buf))
+    }
+}
+
+/// A file being written in pieces (e.g. an upload).
+pub struct Writer {
+    point: String,
+    handle: fat32::FileHandle,
+}
+
+pub fn create_writer(path: &str) -> Result<Writer> {
+    let (point, inner) = resolve(path)?;
+    let handle = with_point(&point, |v| v.create_writer(&inner))?;
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    Ok(Writer { point, handle })
+}
+
+impl Writer {
+    pub fn write(&mut self, data: &[u8]) -> Result<()> {
+        let point = self.point.clone();
+        with_point(&point, |v| v.append(&mut self.handle, data))
+    }
+
+    pub fn size(&self) -> u64 {
+        self.handle.size
+    }
+
+    pub fn finish(self) -> Result<()> {
+        let r = with_point(&self.point, |v| v.finish_writer(&self.handle));
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+        r
+    }
+}
+
+impl media::demux::Source for File {
+    fn len(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> core::result::Result<usize, ()> {
+        File::read_at(self, off, buf).map_err(|_| ())
+    }
+}
+
 fn modify<R>(path: &str, f: impl FnOnce(&mut Volume, &str) -> Result<R>) -> Result<R> {
     let r = with(path, f);
     GENERATION.fetch_add(1, Ordering::Relaxed);

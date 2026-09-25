@@ -126,9 +126,8 @@ fn kind_of(e: &DirEntry, dir: &str) -> (Icon, String) {
         Some("txt" | "md" | "log" | "cfg" | "ini" | "conf" | "rs" | "c" | "h" | "json" | "toml" | "sh" | "html"
         | "css" | "js") => (Icon::TextFile, String::from("Text Document")),
         Some("png" | "jpg" | "jpeg" | "jfif" | "bmp" | "gif" | "webp") => (Icon::Image, String::from("Image")),
-        Some("avi" | "mjpg" | "mjpeg") => (Icon::Video, String::from("Video")),
-        Some("mp4" | "mkv" | "webm" | "mov") => (Icon::Video, String::from("Video (convert to AVI)")),
-        Some("wav") => (Icon::Music, String::from("Sound")),
+        Some("avi" | "mjpg" | "mjpeg" | "mp4" | "m4v" | "mkv" | "webm" | "mov" | "3gp") => (Icon::Video, String::from("Video")),
+        Some("mp3" | "m4a" | "aac" | "wav" | "mka") => (Icon::Music, String::from("Music")),
         Some("elf") => (Icon::Program, String::from("Program")),
         _ if dir == "/bin" => (Icon::Program, String::from("Program")),
         Some(x) => (Icon::File, format!("{} File", x.to_ascii_uppercase())),

@@ -45,6 +45,8 @@ pub enum Command {
     RevertResolution(u32, u32),
     Shutdown,
     Reboot,
+    /// Cover the whole screen without decorations (or go back).
+    SetFullscreen(bool),
 }
 
 /// Per-call context handed to apps.
@@ -73,6 +75,10 @@ impl Ctx {
 
     pub fn close(&mut self) {
         self.commands.push(Command::Close);
+    }
+
+    pub fn set_fullscreen(&mut self, on: bool) {
+        self.commands.push(Command::SetFullscreen(on));
     }
 
     pub fn send(&mut self, to: WindowId, msg: Msg) {

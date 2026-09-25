@@ -21,7 +21,15 @@ dependencies = [
  "fat32",
  "gfx",
  "image",
+ "media",
  "net",
+]
+
+[[package]]
+name = "media"
+version = "0.1.0"
+dependencies = [
+ "image",
 ]
 
 [[package]]

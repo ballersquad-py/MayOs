@@ -336,6 +336,19 @@ impl<'a> Canvas<'a> {
         y as usize * self.stride + x as usize
     }
 
+    /// Direct access to the pixels of `r` (in current coordinates) when it
+    /// lies entirely inside the clip region: (buffer starting at r's
+    /// top-left corner, row stride).
+    pub fn raw_region(&mut self, r: Rect) -> Option<(&mut [u32], usize)> {
+        let abs = r.offset(self.ox, self.oy);
+        if r.is_empty() || abs.intersect(&self.clip) != abs {
+            return None;
+        }
+        let start = self.idx(abs.x, abs.y);
+        let end = self.idx(abs.x, abs.bottom() - 1) + abs.w as usize;
+        Some((&mut self.data[start..end], self.stride))
+    }
+
     /// Absolute rectangle clipped to the clip region.
     fn abs_clip(&self, r: Rect) -> Rect {
         r.offset(self.ox, self.oy).intersect(&self.clip)

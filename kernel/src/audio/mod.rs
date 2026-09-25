@@ -8,6 +8,7 @@ pub mod ac97;
 pub mod sounds;
 pub mod wav;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -30,6 +31,70 @@ struct Mixer {
 }
 
 static MIXER: Spin<Option<Mixer>> = Spin::new(None);
+static STREAMS: Spin<Vec<Arc<AudioStream>>> = Spin::new(Vec::new());
+
+/// A continuous sound fed piece by piece (music and video players).
+/// Samples are 48 kHz stereo.
+pub struct AudioStream {
+    queue: Spin<VecDeque<i16>>,
+    /// Frames the mixer has taken from the queue.
+    played: AtomicU64,
+    paused: AtomicBool,
+    closed: AtomicBool,
+    /// 0..=256
+    volume: AtomicU32,
+}
+
+impl AudioStream {
+    pub fn push(&self, samples: &[i16]) {
+        self.queue.lock().extend(samples.iter().copied());
+    }
+
+    /// Frames waiting to be played.
+    pub fn queued(&self) -> usize {
+        self.queue.lock().len() / 2
+    }
+
+    /// Frames handed to the sound card so far.
+    pub fn played(&self) -> u64 {
+        self.played.load(Ordering::Relaxed)
+    }
+
+    /// Drop everything queued (after a seek); `played` restarts at `frames`.
+    pub fn reset(&self, frames: u64) {
+        self.queue.lock().clear();
+        self.played.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn set_paused(&self, p: bool) {
+        self.paused.store(p, Ordering::Relaxed);
+    }
+
+    pub fn set_volume(&self, v: u32) {
+        self.volume.store(v.min(256), Ordering::Relaxed);
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn open_stream() -> Arc<AudioStream> {
+    let s = Arc::new(AudioStream {
+        queue: Spin::new(VecDeque::new()),
+        played: AtomicU64::new(0),
+        paused: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+        volume: AtomicU32::new(256),
+    });
+    STREAMS.lock().push(s.clone());
+    s
+}
+
+/// Frames between being mixed and being heard (the DMA queue depth).
+pub fn latency_frames() -> u64 {
+    (AHEAD as u64) * ac97::FRAMES as u64
+}
 static DEVICE_NAME: Once<String> = Once::new();
 static VOLUME: AtomicU32 = AtomicU32::new(80);
 static MUTED: AtomicBool = AtomicBool::new(false);
@@ -135,6 +200,22 @@ fn fill(m: &mut Mixer, buf: usize) {
         v.pos += n;
     }
     m.voices.retain(|v| v.pos < v.samples.len());
+    {
+        let mut streams = STREAMS.lock();
+        streams.retain(|s| !s.closed.load(Ordering::Relaxed));
+        for s in streams.iter() {
+            if s.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+            let vol = s.volume.load(Ordering::Relaxed) as i32;
+            let mut q = s.queue.lock();
+            let n = q.len().min(frames * 2) & !1;
+            for (a, v) in acc[..n].iter_mut().zip(q.drain(..n)) {
+                *a += (v as i32 * vol) >> 8;
+            }
+            s.played.fetch_add((n / 2) as u64, Ordering::Relaxed);
+        }
+    }
     let out = m.dev.buffer(buf);
     for (o, a) in out.iter_mut().zip(acc.iter()) {
         *o = (*a).clamp(-32768, 32767) as i16;
@@ -148,14 +229,15 @@ extern "C" fn audio_thread(_: usize) {
             let mut g = MIXER.lock();
             if let Some(m) = g.as_mut() {
                 let now = crate::time::uptime_ms();
-                if m.voices.is_empty() && m.dev.is_running() {
+                let streaming = STREAMS.lock().iter().any(|s| !s.paused.load(Ordering::Relaxed) && s.queued() > 0);
+                if m.voices.is_empty() && !streaming && m.dev.is_running() {
                     // Stop the DMA engine after a quiet second.
                     if m.idle_since == 0 {
                         m.idle_since = now;
                     } else if now - m.idle_since > 1000 {
                         m.dev.stop();
                     }
-                } else if !m.voices.is_empty() {
+                } else if !m.voices.is_empty() || streaming {
                     m.idle_since = 0;
                     if !m.dev.is_running() {
                         // Restart: queue from the buffer the engine points at.
@@ -163,7 +245,7 @@ extern "C" fn audio_thread(_: usize) {
                         m.dev.set_last_valid(civ.wrapping_sub(1) & 31);
                     }
                 }
-                if !m.voices.is_empty() || m.dev.is_running() {
+                if !m.voices.is_empty() || streaming || m.dev.is_running() {
                     let civ = m.dev.current();
                     let mut lvi = m.dev.last_valid();
                     let mut filled = false;

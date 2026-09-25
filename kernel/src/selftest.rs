@@ -217,14 +217,36 @@ fn media_decodes() -> TestResult {
         }
     }
     ensure!(pictures > 0, "no sample pictures in /pictures");
-    let data = fs::read_file("/videos/Sample.avi").map_err(|e| e.to_string())?;
-    let avi = image::avi::parse(&data).map_err(|_| "Sample.avi does not parse")?;
-    ensure!(!avi.frames.is_empty() && avi.audio.is_some(), "Sample.avi has no frames or sound");
+    // The sample video: demux and decode the first second with the media
+    // pipeline (as the player does), from a file handle.
+    let file = fs::open("/videos/Welcome to MayOS.mp4").map_err(|e| e.to_string())?;
+    let mut dm = media::demux::open(alloc::boxed::Box::new(file)).map_err(|e| alloc::format!("{:?}", e))?;
+    let info = dm.info().clone();
+    let (vi, ai) = media::pipeline::choose_tracks(&info.tracks);
+    let mut vd = media::pipeline::VideoDecoder::new(&info.tracks[vi.ok_or("no video track")?])?;
+    let mut ad = media::pipeline::AudioDecoder::new(&info.tracks[ai.ok_or("no audio track")?])?;
     let t = crate::time::uptime_ms();
-    for f in avi.frames.iter().take(10) {
-        image::decode(f).map_err(|e| alloc::format!("video frame: {}", e))?;
+    let (mut frames, mut samples) = (0, 0);
+    while let Some(p) = dm.next_packet() {
+        let p = p.map_err(|e| alloc::format!("{:?}", e))?;
+        if p.pts > 1_000_000 {
+            break;
+        }
+        if Some(p.track) == vi {
+            vd.decode(&p);
+            while vd.next_frame().is_some() {
+                frames += 1;
+            }
+        } else {
+            samples += ad.decode(&p).len();
+        }
     }
-    crate::kprintln!("selftest: video {}x{}, {} frames, 10 decoded in {} ms", avi.width, avi.height, avi.frames.len(), crate::time::uptime_ms() - t);
+    crate::kprintln!("selftest: video {}x{}, first second: {} frames, {} samples in {} ms", info.tracks[vi.unwrap()].width, info.tracks[vi.unwrap()].height, frames, samples, crate::time::uptime_ms() - t);
+    ensure!(frames >= 20 && samples > 40_000, "sample video did not decode");
+    let song = fs::open("/music/Northern Lights.mp3").map_err(|e| e.to_string())?;
+    let mut src: alloc::boxed::Box<dyn media::demux::Source + Send> = alloc::boxed::Box::new(song);
+    let tags = media::tags::read(&mut *src);
+    ensure!(tags.title == "Northern Lights" && tags.cover.is_some(), "song tags not read");
     Ok(())
 }
 

@@ -45,3 +45,32 @@ fn pow43_is_accurate() {
         assert!((t[q] as f64 - want).abs() <= 1.0, "{} {} {}", q, t[q], want);
     }
 }
+
+#[test]
+fn resampler_keeps_a_sine_clean() {
+    let rate = 44100;
+    let input: Vec<i16> = (0..rate).map(|i| ((i as f64 * 2.0 * std::f64::consts::PI * 1000.0 / rate as f64).sin() * 20000.0) as i16).collect();
+    let mut r = media::resample::Resampler::new(rate, 48000);
+    let mut out = Vec::new();
+    for chunk in input.chunks(1000) {
+        r.process(chunk, 1, &mut out);
+    }
+    let frames = out.len() / 2;
+    assert!((frames as i64 - 48000).abs() < 10, "{} frames", frames);
+    // Compare with an ideal 1 kHz sine, allowing for the filter delay.
+    let mut best = 0.0f64;
+    for delay in 0..32 {
+        let off = delay as f64 * 0.125;
+        let (mut sig, mut err) = (0.0, 0.0);
+        for i in 100..frames - 100 {
+            let t_in = i as f64 * 44100.0 / 48000.0 + off;
+            let want = (t_in * 2.0 * std::f64::consts::PI * 1000.0 / 44100.0).sin() * 20000.0;
+            let got = out[i * 2] as f64;
+            sig += want * want;
+            err += (want - got) * (want - got);
+        }
+        best = f64::max(best, 10.0 * (sig / err).log10());
+    }
+    println!("resampler SNR {:.1} dB", best);
+    assert!(best > 40.0);
+}
