@@ -11,8 +11,11 @@
 
 extern crate alloc;
 
+pub mod aac;
 pub mod bits;
+pub mod dsp;
 pub mod h264;
+pub mod mp3;
 pub mod tables;
 pub mod vlc;
 pub mod yuv;

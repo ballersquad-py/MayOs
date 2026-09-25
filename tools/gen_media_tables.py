@@ -151,9 +151,92 @@ emit("MP3_QUAD_CODES", "u8", array("mpegaudiodec_common.c", "mpa_quad_codes"))
 emit("MP3_QUAD_BITS", "u8", array("mpegaudiodec_common.c", "mpa_quad_bits"))
 emit("MP3_BAND_SIZE_LONG", "u8", array("mpegaudiodec_common.c", "ff_band_size_long"))
 emit("MP3_BAND_SIZE_SHORT", "u8", array("mpegaudiodec_common.c", "ff_band_size_short"))
-emit("MP3_PRETAB", "u8", array("mpegaudiodec_common.c", "ff_mpa_pretab")[:22])
+emit("MP3_PRETAB", "u8", array("mpegaudiodec_common.c", "ff_mpa_pretab")[22:44])
 emit("MP3_SLEN", "u8", array("mpegaudiodec_common.c", "ff_slen_table"))
 emit("MP3_LSF_NSF", "u8", array("mpegaudiodec_common.c", "ff_lsf_nsf_table"))
+
+# ---- Fixed-point DSP tables (computed) ----------------------------------
+import math
+
+
+def q(v, bits):
+    return int(round(v * (1 << bits)))
+
+
+def floats(file, name):
+    s = src(file)
+    m = re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"\s*\[[^\]]*\]\s*=\s*\{(.*?)\}", s, re.S)
+    assert m, name
+    return [float(x) for x in re.findall(r"-?\d+\.\d*(?:[eE][-+]?\d+)?|-?\d+(?:[eE][-+]?\d+)?", m.group(1))]
+
+
+def bessel_i0(x):
+    s, t, k = 1.0, 1.0, 1
+    while t > 1e-30:
+        t *= (x / 2 / k) ** 2
+        s += t
+        k += 1
+    return s
+
+
+def kbd(n, alpha):
+    # Rising half (n values) of a KBD window of length 2n.
+    w = [bessel_i0(math.pi * alpha * math.sqrt(1 - (2 * k / n - 1) ** 2)) for k in range(n + 1)]
+    total = sum(w)
+    acc, out = 0.0, []
+    for k in range(n):
+        acc += w[k]
+        out.append(math.sqrt(acc / total))
+    return out
+
+
+Q30 = 30
+emit("AAC_SINE_LONG", "i32", [q(math.sin(math.pi / 2048 * (i + 0.5)), Q30) for i in range(1024)])
+emit("AAC_SINE_SHORT", "i32", [q(math.sin(math.pi / 256 * (i + 0.5)), Q30) for i in range(128)])
+emit("AAC_KBD_LONG", "i32", [q(v, Q30) for v in kbd(1024, 4)])
+emit("AAC_KBD_SHORT", "i32", [q(v, Q30) for v in kbd(128, 6)])
+for n in (2048, 256):
+    n4 = n // 4
+    emit(f"IMDCT{n}_COS", "i32", [q(-math.cos(2 * math.pi * (i + 0.125) / n), Q30) for i in range(n4)])
+    emit(f"IMDCT{n}_SIN", "i32", [q(-math.sin(2 * math.pi * (i + 0.125) / n), Q30) for i in range(n4)])
+# FFT twiddles for up to 512 points: exp(+2 pi i k / 512).
+emit("FFT512_COS", "i32", [q(math.cos(2 * math.pi * k / 512), Q30) for k in range(256)])
+emit("FFT512_SIN", "i32", [q(math.sin(2 * math.pi * k / 512), Q30) for k in range(256)])
+# TNS coefficient maps [compress][res] (Q30).
+for name in ["tns_tmp2_map_0_3", "tns_tmp2_map_0_4", "tns_tmp2_map_1_3", "tns_tmp2_map_1_4"]:
+    emit(name.upper(), "i32", [q(v, Q30) for v in floats("aactab.c", name)])
+# 2^(i/4) for i in 0..4 (Q30).
+emit("POW2_QUARTER", "i32", [q(2 ** (i / 4), Q30) for i in range(4)])
+
+# ---- MP3 hybrid filterbank (Q30) ------------------------------------
+emit("MP3_IMDCT36", "i32", [q(math.cos(math.pi / 72 * (2 * i + 1 + 18) * (2 * k + 1)), Q30) for i in range(36) for k in range(18)])
+emit("MP3_IMDCT12", "i32", [q(math.cos(math.pi / 24 * (2 * i + 1 + 6) * (2 * k + 1)), Q30) for i in range(12) for k in range(6)])
+win = []
+for bt in range(4):
+    for i in range(36):
+        if bt == 0:
+            v = math.sin(math.pi / 36 * (i + 0.5))
+        elif bt == 1:
+            v = math.sin(math.pi / 36 * (i + 0.5)) if i < 18 else 1.0 if i < 24 else math.sin(math.pi / 12 * (i - 18 + 0.5)) if i < 30 else 0.0
+        elif bt == 3:
+            v = 0.0 if i < 6 else math.sin(math.pi / 12 * (i - 6 + 0.5)) if i < 12 else 1.0 if i < 18 else math.sin(math.pi / 36 * (i + 0.5))
+        else:
+            v = math.sin(math.pi / 12 * (i + 0.5)) if i < 12 else 0.0
+        win.append(q(v, Q30))
+emit("MP3_WINDOWS", "i32", win)
+ci = [-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037]
+emit("MP3_AA_CS", "i32", [q(1 / math.sqrt(1 + c * c), Q30) for c in ci])
+emit("MP3_AA_CA", "i32", [q(c / math.sqrt(1 + c * c), Q30) for c in ci])
+emit("MP3_SYNTH_COS", "i32", [q(math.cos((16 + i) * (2 * k + 1) * math.pi / 64), Q30) for i in range(64) for k in range(32)])
+emit("MP3_ENWINDOW", "i32", array("mpegaudiodsp_data.c", "ff_mpa_enwindow"))
+isr = []
+for i in range(7):
+    if i == 6:
+        isr += [q(1.0, Q30), 0]
+    else:
+        t = math.tan(i * math.pi / 12)
+        isr += [q(t / (1 + t), Q30), q(1 / (1 + t), Q30)]
+emit("MP3_IS_RATIO", "i32", isr)
 
 open(OUT, "w").write("\n".join(out))
 print("wrote", OUT)
