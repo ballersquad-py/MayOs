@@ -291,6 +291,10 @@ impl Stack {
         }
     }
 
+    pub fn local_port(&self, h: Handle) -> Option<u16> {
+        self.socks.get(&h).map(|s| s.local_port)
+    }
+
     pub fn remote(&self, h: Handle) -> Option<(Ipv4, u16)> {
         self.socks.get(&h).map(|s| (s.remote_ip, s.remote_port))
     }
@@ -307,6 +311,24 @@ impl Stack {
         let n = data.len().min(SEND_CAP.saturating_sub(s.send_buf.len()));
         s.send_buf.extend(&data[..n]);
         Ok(n)
+    }
+
+    /// Whether `recv` would return right away (data, end of stream, error).
+    pub fn readable(&self, h: Handle) -> bool {
+        match self.socks.get(&h) {
+            Some(s) => !s.recv_buf.is_empty() || s.peer_fin || s.error.is_some() || s.state == State::Closed,
+            None => true,
+        }
+    }
+
+    /// Whether `send` would accept data right away.
+    pub fn writable(&self, h: Handle) -> bool {
+        self.socks.get(&h).map(|s| s.send_buf.len() < SEND_CAP).unwrap_or(true)
+    }
+
+    /// Whether a connection is waiting to be accepted on `port`.
+    pub fn pending(&self, port: u16) -> bool {
+        self.listeners.get(&port).map(|q| q.iter().any(|h| self.socks.get(h).map(|s| s.state != State::SynReceived).unwrap_or(false))).unwrap_or(false)
     }
 
     /// Bytes queued but not yet acknowledged by the peer.

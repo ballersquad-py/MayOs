@@ -30,6 +30,14 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn pending(&self) -> bool {
+        with(|t, _| t.pending(self.port)).unwrap_or(false)
+    }
+
     pub fn bind(port: u16) -> Result<TcpListener, NetError> {
         with(|t, _| t.listen(port))?.map_err(map_err)?;
         Ok(TcpListener { port })
@@ -85,6 +93,19 @@ impl TcpStream {
             }
             sched::sleep_ms(2);
         }
+    }
+
+    pub fn readable(&self) -> bool {
+        with(|t, _| t.readable(self.h)).unwrap_or(true)
+    }
+
+    pub fn writable(&self) -> bool {
+        with(|t, _| t.writable(self.h)).unwrap_or(true)
+    }
+
+    /// Local address (our IP, our port).
+    pub fn local(&self) -> Option<(Ipv4, u16)> {
+        with(|t, ip| t.local_port(self.h).map(|p| (ip, p))).ok().flatten()
     }
 
     pub fn peer(&self) -> Option<(Ipv4, u16)> {

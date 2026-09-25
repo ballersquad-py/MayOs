@@ -35,6 +35,11 @@ pub struct Thread {
     pub process: Option<Arc<Process>>,
     pml4: u64,
     pub cpu_ms: u64,
+    /// Thread-local storage pointer (FS base) of Linux threads.
+    fs_base: u64,
+    fpu: Box<cpu::FpuState>,
+    /// Linux `set_tid_address`/CLONE_CHILD_CLEARTID: zeroed and woken at exit.
+    pub clear_child_tid: u64,
 }
 
 unsafe impl Send for Thread {}
@@ -71,6 +76,9 @@ pub fn init() {
         process: None,
         pml4: crate::mem::paging::kernel_pml4(),
         cpu_ms: 0,
+        fs_base: 0,
+        fpu: Box::new(cpu::fpu_initial()),
+        clear_child_tid: 0,
     }));
     s.current = 0;
 }
@@ -98,6 +106,10 @@ fn push_frame(top: u64, frame: idt::TrapFrame) -> u64 {
 }
 
 fn add_thread(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, process: Option<Arc<Process>>) -> u64 {
+    add_thread_with(name, frame_for, process, 0, cpu::fpu_initial())
+}
+
+fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, process: Option<Arc<Process>>, fs_base: u64, fpu: cpu::FpuState) -> u64 {
     let (kstack, top) = new_stack();
     let frame = frame_for(top);
     let rsp = push_frame(top, frame);
@@ -115,8 +127,59 @@ fn add_thread(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, process
         process,
         pml4,
         cpu_ms: 0,
+        fs_base,
+        fpu: Box::new(fpu),
+        clear_child_tid: 0,
     }));
     id
+}
+
+/// Start another thread of a user process from a full register frame
+/// (Linux `clone`): the new thread shares the address space.
+pub fn spawn_user_frame(process: Arc<Process>, frame: idt::TrapFrame, fs_base: u64) -> u64 {
+    let name = process.name.clone();
+    // The child starts with the parent's floating-point state.
+    let mut fpu = cpu::fpu_initial();
+    cpu::fxsave(&mut fpu);
+    add_thread_with(&name, |_| frame, Some(process), fs_base, fpu)
+}
+
+/// Set the calling thread's FS base (thread-local storage).
+pub fn set_fs_base(v: u64) {
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].fs_base = v;
+    unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, v) };
+}
+
+pub fn current_id() -> u64 {
+    let s = SCHED.lock();
+    s.threads[s.current].id
+}
+
+pub fn set_clear_child_tid(addr: u64) {
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].clear_child_tid = addr;
+}
+
+/// Set the clear-child-tid address of another thread (after `clone`).
+pub fn set_clear_child_tid_of(id: u64, addr: u64) {
+    let mut s = SCHED.lock();
+    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+        t.clear_child_tid = addr;
+    }
+}
+
+pub fn clear_child_tid() -> u64 {
+    let s = SCHED.lock();
+    s.threads[s.current].clear_child_tid
+}
+
+/// Threads (ids) of a process that are still alive.
+pub fn process_thread_count(pid: u64) -> usize {
+    let s = SCHED.lock();
+    s.threads.iter().filter(|t| t.state != State::Dead && t.process.as_ref().map(|p| p.pid == pid).unwrap_or(false)).count()
 }
 
 pub fn spawn_kernel(name: &str, entry: extern "C" fn(usize), arg: usize) -> u64 {
@@ -203,6 +266,14 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         if i != 0 && s.threads[i].state == State::Ready {
             next = i;
             break;
+        }
+    }
+    if next != cur {
+        // Floating-point registers and thread-local storage go with the thread.
+        cpu::fxsave(&mut s.threads[cur].fpu);
+        cpu::fxrstor(&s.threads[next].fpu);
+        if s.threads[next].fs_base != s.threads[cur].fs_base {
+            unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, s.threads[next].fs_base) };
         }
     }
     s.current = next;

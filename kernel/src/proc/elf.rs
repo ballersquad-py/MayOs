@@ -10,7 +10,18 @@ use super::usermem::USER_TOP;
 pub struct LoadedImage {
     pub entry: u64,
     pub brk: u64,
+    /// Where the program headers are in memory (Linux AT_PHDR).
+    pub phdr: u64,
+    pub phnum: u64,
+    pub phent: u64,
+    /// Load bias (non-zero for position-independent executables).
+    pub base: u64,
+    /// Built for Linux (has thread-local storage, or is a static PIE).
+    pub linux: bool,
 }
+
+/// Where static position-independent Linux executables are placed.
+const PIE_BASE: u64 = 0x0000_5555_5555_0000;
 
 fn u16at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -34,25 +45,38 @@ pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
     if data[4] != 2 || data[5] != 1 || u16at(data, 18) != 0x3e {
         return Err("not a 64-bit little-endian x86_64 ELF".into());
     }
-    if u16at(data, 16) != 2 {
-        return Err("not a static executable (ET_EXEC)".into());
+    let etype = u16at(data, 16);
+    if etype != 2 && etype != 3 {
+        return Err("not an executable".into());
     }
-    let entry = u64at(data, 24);
     let phoff = u64at(data, 32) as usize;
     let phentsize = u16at(data, 54) as usize;
     let phnum = u16at(data, 56) as usize;
-    let mut brk = 0u64;
+    let mut has_tls = false;
+    let mut first_load = None;
     for i in 0..phnum {
         let ph = phoff + i * phentsize;
         if ph + 56 > data.len() {
             return Err("truncated program header".into());
         }
+        match u32at(data, ph) {
+            3 => return Err("dynamically linked programs are not supported (build it static, e.g. with musl)".into()),
+            7 => has_tls = true,
+            1 if first_load.is_none() => first_load = Some((u64at(data, ph + 16), u64at(data, ph + 8))),
+            _ => {}
+        }
+    }
+    let base = if etype == 3 { PIE_BASE } else { 0 };
+    let entry = u64at(data, 24) + base;
+    let mut brk = 0u64;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
         if u32at(data, ph) != 1 {
             continue; // not PT_LOAD
         }
         let flags = u32at(data, ph + 4);
         let offset = u64at(data, ph + 8) as usize;
-        let vaddr = u64at(data, ph + 16);
+        let vaddr = u64at(data, ph + 16) + base;
         let filesz = u64at(data, ph + 32) as usize;
         let memsz = u64at(data, ph + 40);
         if memsz == 0 {
@@ -100,5 +124,14 @@ pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
     if entry == 0 || brk == 0 {
         return Err("no loadable segments".into());
     }
-    Ok(LoadedImage { entry, brk: brk.div_ceil(PAGE_SIZE) * PAGE_SIZE })
+    let phdr = first_load.map(|(v, o)| v + base - o + phoff as u64).unwrap_or(0);
+    Ok(LoadedImage {
+        entry,
+        brk: brk.div_ceil(PAGE_SIZE) * PAGE_SIZE,
+        phdr,
+        phnum: phnum as u64,
+        phent: phentsize as u64,
+        base,
+        linux: has_tls || etype == 3,
+    })
 }

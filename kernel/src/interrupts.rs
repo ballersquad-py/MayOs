@@ -80,6 +80,10 @@ extern "C" fn interrupt_dispatch(frame: &mut TrapFrame) -> u64 {
 fn exception(frame: &mut TrapFrame) -> u64 {
     let v = frame.vector as usize;
     let name = EXCEPTION_NAMES[v];
+    if frame.from_user() && v == 14 && crate::proc::linux::page_fault(cpu::read_cr2(), frame.error) {
+        // Memory handed out on first use (Linux programs).
+        return frame as *mut TrapFrame as u64;
+    }
     if frame.from_user() {
         let msg = alloc::format!(
             "\n[process crashed] {} at rip={:#x} addr={:#x} err={:#x}\n",

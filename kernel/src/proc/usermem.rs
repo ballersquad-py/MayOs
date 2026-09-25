@@ -19,6 +19,8 @@ fn range_ok(pml4: u64, addr: u64, len: u64, write: bool) -> bool {
     while page < end {
         match paging::translate(pml4, page) {
             Some((_, flags)) if flags & USER != 0 && (!write || flags & WRITABLE != 0) => {}
+            // Linux programs' memory is handed out on first use.
+            None if super::linux::fault_in(page, write) => {}
             _ => return false,
         }
         page += 0x1000;
@@ -48,4 +50,35 @@ pub fn write_bytes(pml4: u64, addr: u64, data: &[u8]) -> bool {
     }
     unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
     true
+}
+
+/// A NUL-terminated string from user memory (at most `max` bytes).
+pub fn read_cstr(pml4: u64, addr: u64, max: usize) -> Option<String> {
+    let mut out = Vec::new();
+    let mut a = addr;
+    while out.len() < max {
+        // Read up to the end of the current page at a time.
+        let chunk = (0x1000 - (a & 0xfff)).min((max - out.len()) as u64);
+        let b = read_bytes(pml4, a, chunk)?;
+        if let Some(p) = b.iter().position(|&c| c == 0) {
+            out.extend_from_slice(&b[..p]);
+            return String::from_utf8(out).ok();
+        }
+        out.extend_from_slice(&b);
+        a += chunk;
+    }
+    None
+}
+
+pub fn read_u64(pml4: u64, addr: u64) -> Option<u64> {
+    let b = read_bytes(pml4, addr, 8)?;
+    Some(u64::from_le_bytes(b.try_into().ok()?))
+}
+
+pub fn write_u32(pml4: u64, addr: u64, v: u32) -> bool {
+    write_bytes(pml4, addr, &v.to_le_bytes())
+}
+
+pub fn write_u64(pml4: u64, addr: u64, v: u64) -> bool {
+    write_bytes(pml4, addr, &v.to_le_bytes())
 }

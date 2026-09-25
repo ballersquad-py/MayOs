@@ -52,6 +52,7 @@ extern "C" fn kmain() -> ! {
     let tsc_per_ms = apic::start_timer(1000);
     time::init(tsc_per_ms);
     idt::init_syscall();
+    cpu::enable_sse();
 
     let wheel = ps2::init();
     apic::route_irq(acpi, 1, idt::VEC_KEYBOARD);

@@ -69,6 +69,9 @@ pub fn handle(f: &mut TrapFrame) -> bool {
         f.rax = ENOSYS as u64;
         return false;
     };
+    if p.linux.is_some() {
+        return super::linux::syscall(&p, f);
+    }
     let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
     let ret: i64 = match f.rax {
         SYS_EXIT => {

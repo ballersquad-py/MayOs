@@ -1,0 +1,13 @@
+[package]
+name = "linux-hello"
+version = "0.1.0"
+edition = "2024"
+
+# A normal Rust program (full standard library) that MayOS runs through its
+# Linux compatibility layer. Build it on any PC with:
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+# then copy target/x86_64-unknown-linux-musl/release/linux-hello to /bin on
+# MayOS (e.g. with the file-sharing web page) and run it in the Terminal.
+
+[workspace]

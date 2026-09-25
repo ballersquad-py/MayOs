@@ -56,6 +56,12 @@ impl Console {
     }
 
     /// Non-blocking read. `None` means end of input.
+    /// Whether a read would return right away (input or end of input).
+    pub fn has_input(&self) -> bool {
+        let c = self.inner.lock();
+        !c.input.is_empty() || c.input_closed
+    }
+
     pub fn try_read(&self, max: usize) -> Option<Vec<u8>> {
         let mut c = self.inner.lock();
         if c.input.is_empty() {
@@ -85,6 +91,8 @@ pub struct Process {
     pub brk: Spin<(u64, u64)>,
     pub files: Mutex<Vec<Option<OpenFile>>>,
     pub exit_code: Spin<Option<i64>>,
+    /// Set for Linux programs (their descriptor table, memory map...).
+    pub linux: Option<alloc::boxed::Box<super::linux::LinuxState>>,
 }
 
 impl Drop for Process {
@@ -107,6 +115,32 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
             return Err(alloc::format!("{}: {}", path, e));
         }
     };
+    if image.linux {
+        let (state, rsp) = match super::linux::setup(pml4, &image, path, args, cwd) {
+            Ok(v) => v,
+            Err(e) => {
+                paging::destroy_address_space(pml4);
+                return Err(alloc::format!("{}: {}", path, e));
+            }
+        };
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let proc = Arc::new(Process {
+            pid,
+            name: String::from(crate::fs::file_name(path)),
+            pml4,
+            cwd: String::from(cwd),
+            args: String::from(args),
+            console,
+            brk: Spin::new((image.brk, image.brk)),
+            files: Mutex::new(Vec::new()),
+            exit_code: Spin::new(None),
+            linux: Some(alloc::boxed::Box::new(state)),
+        });
+        TABLE.lock().push(proc.clone());
+        // Linux entry: registers zero, rsp at argc.
+        sched::spawn_user(proc.clone(), image.entry, rsp, 0, 0);
+        return Ok(proc);
+    }
     // Stack, with the argument string copied to its top.
     let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
     let mut frames = Vec::new();
@@ -140,6 +174,7 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
         brk: Spin::new((image.brk, image.brk)),
         files: Mutex::new(Vec::new()),
         exit_code: Spin::new(None),
+        linux: None,
     });
     TABLE.lock().push(proc.clone());
     sched::spawn_user(proc.clone(), image.entry, user_rsp, args_addr, args_len as u64);

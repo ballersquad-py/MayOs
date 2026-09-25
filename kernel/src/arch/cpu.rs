@@ -122,3 +122,46 @@ pub const MSR_EFER: u32 = 0xc000_0080;
 pub const MSR_STAR: u32 = 0xc000_0081;
 pub const MSR_LSTAR: u32 = 0xc000_0082;
 pub const MSR_SFMASK: u32 = 0xc000_0084;
+
+pub const MSR_FS_BASE: u32 = 0xc000_0100;
+
+/// Saved x87/SSE register state (`fxsave` format).
+#[repr(C, align(16))]
+#[derive(Clone)]
+pub struct FpuState(pub [u8; 512]);
+
+static mut FPU_INIT: FpuState = FpuState([0; 512]);
+
+/// Turn on SSE for user programs (the kernel itself never uses it) and
+/// record the clean register state new threads start with.
+pub fn enable_sse() {
+    unsafe {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        cr0 &= !(1 << 2); // EM: no emulation
+        cr0 |= 1 << 1; // MP
+        cr0 &= !(1 << 3); // TS: no lazy switching
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        cr4 |= (1 << 9) | (1 << 10); // OSFXSR, OSXMMEXCPT
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+        let mxcsr: u32 = 0x1f80;
+        asm!("fninit", "ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
+        asm!("fxsave64 [{}]", in(reg) &raw mut FPU_INIT, options(nostack));
+    }
+}
+
+pub fn fpu_initial() -> FpuState {
+    unsafe { (*(&raw const FPU_INIT)).clone() }
+}
+
+#[inline]
+pub fn fxsave(s: &mut FpuState) {
+    unsafe { asm!("fxsave64 [{}]", in(reg) s as *mut FpuState, options(nostack)) }
+}
+
+#[inline]
+pub fn fxrstor(s: &FpuState) {
+    unsafe { asm!("fxrstor64 [{}]", in(reg) s as *const FpuState, options(nostack)) }
+}

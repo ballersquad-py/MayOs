@@ -491,7 +491,7 @@ pub fn ping(dst: Ipv4, seq: u16, timeout_ms: u64) -> Result<u64, NetError> {
     }
 }
 
-fn udp_bind() -> u16 {
+pub(crate) fn udp_bind() -> u16 {
     let mut p = NEXT_PORT.lock();
     *p = if *p >= 65000 { 49152 } else { *p + 1 };
     let port = *p;
@@ -502,20 +502,20 @@ fn udp_bind() -> u16 {
     port
 }
 
-fn udp_unbind(port: u16) {
+pub(crate) fn udp_unbind(port: u16) {
     if let Some(i) = IFACE.lock().as_mut() {
         i.udp.remove(&port);
     }
 }
 
-fn udp_send(src_port: u16, dst: Ipv4, dst_port: u16, data: &[u8]) {
+pub(crate) fn udp_send(src_port: u16, dst: Ipv4, dst_port: u16, data: &[u8]) {
     if let Some(i) = IFACE.lock().as_mut() {
         let u = net::build_udp(i.ip, dst, src_port, dst_port, data);
         i.send_ip(dst, net::PROTO_UDP, &u);
     }
 }
 
-fn udp_recv(port: u16, timeout_ms: u64) -> Option<(Ipv4, u16, Vec<u8>)> {
+pub(crate) fn udp_recv(port: u16, timeout_ms: u64) -> Option<(Ipv4, u16, Vec<u8>)> {
     let deadline = uptime_ms() + timeout_ms;
     loop {
         if let Some(i) = IFACE.lock().as_mut()
@@ -582,4 +582,9 @@ pub fn describe(s: &Status) -> String {
         s.mask.prefix_len(),
         s.gateway
     )
+}
+
+/// Whether a datagram is waiting on a UDP port.
+pub(crate) fn udp_pending(port: u16) -> bool {
+    IFACE.lock().as_ref().and_then(|i| i.udp.get(&port).map(|q| !q.is_empty())).unwrap_or(false)
 }

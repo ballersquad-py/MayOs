@@ -31,6 +31,13 @@ Settings app are done.
   `<canvas>` 2D, cookies and `localStorage`. Try `/docs/snake.html`.
   Certificates are not checked yet; `fetch`/XHR, floats, grid and WOFF2
   fonts are still missing.
+- **Linux programs**: MayOS speaks the Linux system-call ABI, so
+  statically linked Linux x86_64 programs run unchanged: Rust programs
+  built with `--target x86_64-unknown-linux-musl` (full `std`: files,
+  threads, networking, time) or C programs built with `musl-gcc -static`.
+  Supported: files and directories, `mmap`/`brk` with memory on demand,
+  threads (`clone`, `futex`, TLS), TCP/UDP sockets and DNS, pipes, `poll`.
+  Not yet: `fork`/`exec`, signals, graphics. See `examples/linux-hello`.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
