@@ -126,6 +126,7 @@ extern "C" fn engine_thread(arg: usize) {
 fn engine(args: &EngineArgs) -> Result<(), String> {
     let shared = &args.shared;
     let stream = &args.stream;
+    let opened = uptime_ms();
     let file = fs::open(&args.path).map_err(|e| e.to_string())?;
     let mut src: Box<dyn demux::Source + Send> = Box::new(file);
     let tags = media::tags::read(&mut *src);
@@ -186,7 +187,7 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
         cover: tags.cover.as_deref().and_then(cover_surface),
         warning,
     };
-    crate::kprintln!("player: {} ({})", args.path, summary.description);
+    crate::kprintln!("player: {} ({}), ready in {} ms", args.path, summary.description, uptime_ms() - opened);
     {
         let mut s = shared.lock();
         s.summary = Some(Arc::new(summary));
@@ -198,10 +199,17 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
     let mut audio_next: Option<i64> = None;
     let mut eof = false;
     let mut pcm48: Vec<i16> = Vec::new();
+    // Compressed video waiting to be decoded. Audio always comes first:
+    // video is decoded only while enough sound is queued, and when the CPU
+    // can't keep up, video skips ahead to the next keyframe instead of
+    // making the sound stutter.
+    let mut vq: VecDeque<demux::Packet> = VecDeque::new();
+    let mut skipping = false;
+    let mut flushed = false;
     loop {
-        let (stop, seek, late, frames) = {
+        let (stop, seek, late, frames, base) = {
             let mut s = shared.lock();
-            (s.stop, s.seek.take(), s.late, s.frames.len())
+            (s.stop, s.seek.take(), s.late, s.frames.len(), s.base_us)
         };
         if stop {
             return Ok(());
@@ -220,6 +228,9 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
             skip_until = t;
             audio_next = None;
             eof = false;
+            flushed = false;
+            vq.clear();
+            skipping = false;
             let mut s = shared.lock();
             s.frames.clear();
             s.base_us = t;
@@ -229,79 +240,116 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
             continue;
         }
         if let Some(v) = vdec.as_mut() {
-            v.set_skip_nonref(late);
+            v.set_skip_nonref(late || skipping);
         }
-        let need_audio = atrack.is_some() && stream.queued() < 24_000;
-        let need_video = vtrack.is_some() && frames < 8;
-        // Without audio the video queue alone sets the pace.
-        let hungry = if atrack.is_some() { need_audio || (need_video && frames < 3) } else { need_video };
-        if eof || !hungry || frames >= 24 {
-            crate::proc::sched::sleep_ms(6);
-            continue;
+        let queued = stream.queued();
+        let audio_low = atrack.is_some() && queued < 14_400; // 0.3 s
+        let audio_full = atrack.is_none() || queued >= 24_000; // 0.5 s
+        let video_wanted = vtrack.is_some() && frames < 8;
+        let mut worked = false;
+
+        // 1. Read the next packet: while sound is short, or video needs one.
+        if !eof && (!audio_full || (video_wanted && vq.is_empty())) && vq.len() < 3000 {
+            worked = true;
+            match dm.next_packet() {
+                Some(Ok(pkt)) => {
+                    if Some(pkt.track) == vtrack {
+                        vq.push_back(pkt);
+                    } else if Some(pkt.track) == atrack {
+                        if let Some(a) = adec.as_mut() {
+                            let samples = a.decode(&pkt);
+                            let ch = a.channels.max(1);
+                            let rate = a.sample_rate.max(1);
+                            if resampler.in_rate() != rate {
+                                resampler = media::resample::Resampler::new(rate, 48000);
+                            }
+                            let frames_in = samples.len() / ch;
+                            // Drop audio before the seek target (and encoder priming).
+                            let mut start = 0usize;
+                            if pkt.pts < skip_until {
+                                start = (((skip_until - pkt.pts) as i128 * rate as i128 / 1_000_000) as usize).min(frames_in);
+                            }
+                            let pts0 = pkt.pts + (start as i64 * 1_000_000 / rate as i64);
+                            // Fill gaps (audio starting late, or missing packets) with silence.
+                            let expected = audio_next.unwrap_or(skip_until);
+                            pcm48.clear();
+                            if pts0 > expected + 30_000 && start < frames_in {
+                                let gap = ((pts0 - expected) as i128 * 48 / 1000).min(48_000 * 5) as usize;
+                                pcm48.resize(gap * 2, 0);
+                            }
+                            resampler.process(&samples[start * ch..], ch, &mut pcm48);
+                            if start < frames_in {
+                                audio_next = Some(pts0 + ((frames_in - start) as i64 * 1_000_000 / rate as i64));
+                            }
+                            stream.push(&pcm48);
+                            let mut s = shared.lock();
+                            if s.viz.len() != VIZ_RING {
+                                s.viz = vec![0; VIZ_RING];
+                            }
+                            let mut w = s.viz_written;
+                            for pair in pcm48.chunks_exact(2) {
+                                let m = ((pair[0] as i32 + pair[1] as i32) / 2) as i16;
+                                s.viz[(w as usize) & (VIZ_RING - 1)] = m;
+                                w += 1;
+                            }
+                            s.viz_written = w;
+                        }
+                    }
+                }
+                Some(Err(_)) => {}
+                None => eof = true,
+            }
         }
-        let pkt = match dm.next_packet() {
-            Some(Ok(p)) => p,
-            Some(Err(_)) => continue,
-            None => {
-                if let Some(v) = vdec.as_mut() {
-                    v.flush();
-                    let mut s = shared.lock();
-                    while let Some(f) = v.next_frame() {
+
+        // 2. Decode one video packet, unless the sound needs the CPU first.
+        if video_wanted && !vq.is_empty() && (!audio_low || vq.len() >= 3000) {
+            worked = true;
+            let pkt = vq.pop_front().unwrap();
+            // What the listener hears now (the same clock the window uses).
+            let clock = base + (stream.played().saturating_sub(audio::latency_frames()) as i64 * 1_000_000 / 48_000);
+            let behind = atrack.is_some() && pkt.pts + 250_000 < clock;
+            let v = vdec.as_mut().unwrap();
+            let decode = if skipping {
+                if pkt.key {
+                    skipping = false;
+                    v.reset();
+                    true
+                } else {
+                    false
+                }
+            } else if (behind || vq.len() >= 3000) && !pkt.key && vq.iter().any(|q| q.key) {
+                // Far behind and a keyframe is waiting: jump to it.
+                skipping = true;
+                false
+            } else {
+                true
+            };
+            if decode {
+                v.decode(&pkt);
+                let mut s = shared.lock();
+                while let Some(f) = v.next_frame() {
+                    if f.pts + 20_000 >= skip_until {
                         s.frames.push_back(f);
                     }
                 }
-                eof = true;
-                shared.lock().eof = true;
-                continue;
             }
-        };
-        if Some(pkt.track) == vtrack {
-            let v = vdec.as_mut().unwrap();
-            v.decode(&pkt);
-            let mut s = shared.lock();
-            while let Some(f) = v.next_frame() {
-                if f.pts + 20_000 >= skip_until {
+        }
+
+        // 3. End of file: flush the decoder once everything is decoded.
+        if eof && vq.is_empty() && !flushed {
+            flushed = true;
+            if let Some(v) = vdec.as_mut() {
+                v.flush();
+                let mut s = shared.lock();
+                while let Some(f) = v.next_frame() {
                     s.frames.push_back(f);
                 }
             }
-        } else if Some(pkt.track) == atrack {
-            let Some(a) = adec.as_mut() else { continue };
-            let samples = a.decode(&pkt);
-            let ch = a.channels.max(1);
-            let rate = a.sample_rate.max(1);
-            if resampler.in_rate() != rate {
-                resampler = media::resample::Resampler::new(rate, 48000);
-            }
-            let frames_in = samples.len() / ch;
-            // Drop audio before the seek target (and encoder priming).
-            let mut start = 0usize;
-            if pkt.pts < skip_until {
-                start = (((skip_until - pkt.pts) as i128 * rate as i128 / 1_000_000) as usize).min(frames_in);
-            }
-            let pts0 = pkt.pts + (start as i64 * 1_000_000 / rate as i64);
-            // Fill gaps (audio starting late, or missing packets) with silence.
-            let expected = audio_next.unwrap_or(skip_until);
-            pcm48.clear();
-            if pts0 > expected + 30_000 && start < frames_in {
-                let gap = ((pts0 - expected) as i128 * 48 / 1000).min(48_000 * 5) as usize;
-                pcm48.resize(gap * 2, 0);
-            }
-            resampler.process(&samples[start * ch..], ch, &mut pcm48);
-            if start < frames_in {
-                audio_next = Some(pts0 + ((frames_in - start) as i64 * 1_000_000 / rate as i64));
-            }
-            stream.push(&pcm48);
-            let mut s = shared.lock();
-            if s.viz.len() != VIZ_RING {
-                s.viz = vec![0; VIZ_RING];
-            }
-            let mut w = s.viz_written;
-            for pair in pcm48.chunks_exact(2) {
-                let m = ((pair[0] as i32 + pair[1] as i32) / 2) as i16;
-                s.viz[(w as usize) & (VIZ_RING - 1)] = m;
-                w += 1;
-            }
-            s.viz_written = w;
+            shared.lock().eof = true;
+        }
+
+        if !worked {
+            crate::proc::sched::sleep_ms(6);
         }
     }
 }
@@ -347,6 +395,10 @@ pub struct Player {
     controls_alpha: u32,
     bars: [u8; 32],
     last_bars: u64,
+    /// Music view without the visualiser, cached: (size, song, pixels).
+    music_bg: Option<((i32, i32), usize, Surface)>,
+    /// Where the visualiser bars were last drawn.
+    viz_rect: Rect,
     opened_at: u64,
 }
 
@@ -380,6 +432,8 @@ impl Player {
             controls_alpha: 255,
             bars: [0; 32],
             last_bars: 0,
+            music_bg: None,
+            viz_rect: Rect::default(),
             opened_at: uptime_ms(),
         };
         p.apply_volume();
@@ -669,7 +723,34 @@ impl Player {
         c.fill_circle(vr.x + vx, vr.y + 3, 6, with_alpha(white, a as u8));
     }
 
-    fn draw_music(&mut self, c: &mut Canvas, s: &Summary) {
+    fn draw_music(&mut self, c: &mut Canvas, s: &Arc<Summary>) {
+        // The background, cover and text only change with the song or the
+        // window size; draw them once and reuse them.
+        let key = (self.size, Arc::as_ptr(s) as usize ^ ((theme::accent() as usize) << 48));
+        if self.music_bg.as_ref().map(|(sz, id, _)| (*sz, *id) != key).unwrap_or(true) {
+            let mut bg = Surface::new(self.size.0, self.size.1, 0);
+            let viz = self.draw_music_static(&mut bg.canvas(), s);
+            self.viz_rect = viz;
+            self.music_bg = Some((key.0, key.1, bg));
+        }
+        if let Some((_, _, bg)) = &self.music_bg {
+            c.blit(bg, 0, 0);
+        }
+        let accent = theme::accent();
+        let vz = self.viz_rect;
+        let n = self.bars.len() as i32;
+        let bw = (vz.w / n).max(3);
+        for (i, &v) in self.bars.iter().enumerate() {
+            let bh = (v as i32 * vz.h / 255).max(3);
+            let r = Rect::new(vz.x + i as i32 * bw, vz.bottom() - bh, (bw - 3).max(2), bh);
+            let col = mix(accent, rgb(255, 255, 255), (i as u32 * 120 / n as u32).min(255));
+            c.fill_rounded_rect(r, 2, with_alpha(col, 230));
+        }
+    }
+
+    /// Everything in the music view except the visualiser; returns the
+    /// visualiser's rectangle.
+    fn draw_music_static(&self, c: &mut Canvas, s: &Summary) -> Rect {
         let (w, h) = self.size;
         let f = fonts();
         let accent = theme::accent();
@@ -704,32 +785,26 @@ impl Player {
         c.draw_text_clipped(&f.ui, tx, y + 8, &s.description, tw, rgba(255, 255, 255, 110));
         // Visualiser below the text, down to the bottom of the cover.
         let top = (y + 30).max(ar.bottom() - 140);
-        let vz = Rect::new(tx, top, tw.max(40), (ar.bottom() - top).max(30));
-        let n = self.bars.len() as i32;
-        let bw = (vz.w / n).max(3);
-        for (i, &v) in self.bars.iter().enumerate() {
-            let bh = (v as i32 * vz.h / 255).max(3);
-            let r = Rect::new(vz.x + i as i32 * bw, vz.bottom() - bh, (bw - 3).max(2), bh);
-            let col = mix(accent, rgb(255, 255, 255), (i as u32 * 120 / n as u32).min(255));
-            c.fill_rounded_rect(r, 2, with_alpha(col, 230));
-        }
+        Rect::new(tx, top, tw.max(40), (ar.bottom() - top).max(30))
     }
 
-    fn update_bars(&mut self, clock: i64) {
+    /// Advance the visualiser (about 30 times a second); true if it changed.
+    fn update_bars(&mut self, clock: i64) -> bool {
         let now = uptime_ms();
         if now - self.last_bars < 33 {
-            return;
+            return false;
         }
         self.last_bars = now;
+        let before = self.bars;
         let mut frame = [0i16; 512];
         {
             let s = self.shared.lock();
             if s.viz.len() != VIZ_RING {
-                return;
+                return false;
             }
             let pos = ((clock - s.base_us).max(0) as i128 * 48 / 1000) as u64;
             if pos + 512 > s.viz_written || s.viz_written - pos > (VIZ_RING - 1024) as u64 {
-                return;
+                return false;
             }
             for (i, v) in frame.iter_mut().enumerate() {
                 *v = s.viz[((pos + i as u64) as usize) & (VIZ_RING - 1)];
@@ -742,6 +817,7 @@ impl Player {
             let target = (*l as u32).saturating_sub(40) * 255 / 215;
             *b = if target as u8 > *b { target as u8 } else { b.saturating_sub(10).max(target as u8) };
         }
+        self.bars != before
     }
 }
 
@@ -1049,15 +1125,16 @@ impl App for Player {
             drop(s);
             if let Some(f) = newest {
                 self.current = Some(f);
-                ctx.redraw();
+                // The client area only: no title bar or shadow work.
+                ctx.redraw_rect(Rect::new(0, 0, self.size.0, self.size.1));
             }
-        } else {
-            self.update_bars(clock);
-            ctx.redraw();
+        } else if self.update_bars(clock) {
+            ctx.redraw_rect(self.viz_rect);
         }
         let new_pos = clock.clamp(0, self.duration().max(clock));
-        if new_pos / 250_000 != self.position / 250_000 {
-            ctx.redraw();
+        if new_pos / 250_000 != self.position / 250_000 && self.controls_alpha > 0 {
+            // Seek bar and time.
+            ctx.redraw_rect(Rect::new(0, self.size.1 - 110, self.size.0, 110));
         }
         self.position = new_pos;
         // End of the file: everything played.

@@ -98,6 +98,8 @@ struct Window {
     closing: bool,
     surface: Surface,
     needs_render: bool,
+    /// When set, only this part of the client area changed (client coords).
+    render_area: Option<Rect>,
     hover_button: Option<u8>,
     anim: Option<Anim>,
     /// Screen area painted last frame (for damage while animating).
@@ -427,6 +429,7 @@ impl Wm {
             closing: false,
             surface: Surface::new(w, h_total, theme::WINDOW_BG),
             needs_render: true,
+            render_area: None,
             hover_button: None,
             anim,
             last_paint: shadow_bounds(rect),
@@ -519,11 +522,13 @@ impl Wm {
         {
             self.deliver(i, AppEvent::Focus(false));
             self.windows[i].needs_render = true;
+            self.windows[i].render_area = None;
         }
         self.focused = id;
         if let Some(i) = id.and_then(|id| self.index_of(id)) {
             self.deliver(i, AppEvent::Focus(true));
             self.windows[i].needs_render = true;
+            self.windows[i].render_area = None;
             self.raise(i);
         }
         self.damage(Rect::new(0, 0, self.width, theme::TOPBAR_H));
@@ -590,6 +595,7 @@ impl Wm {
             self.deliver(i, AppEvent::Resized { w: cw, h: ch });
         }
         self.windows[i].needs_render = true;
+        self.windows[i].render_area = None;
         self.focus(Some(id));
         self.damage(old);
         self.damage_all();
@@ -628,6 +634,7 @@ impl Wm {
         if resized {
             w.surface = Surface::new(r.w, r.h, theme::WINDOW_BG);
             w.needs_render = true;
+            w.render_area = None;
             let (cw, ch) = w.client_size();
             self.deliver(i, AppEvent::Resized { w: cw, h: ch });
         }
@@ -646,10 +653,19 @@ impl Wm {
 
     fn apply(&mut self, ctx: Ctx) {
         let id = ctx.window;
-        if ctx.redraw
-            && let Some(i) = self.index_of(id)
-        {
-            self.windows[i].needs_render = true;
+        if let Some(i) = self.index_of(id) {
+            let w = &mut self.windows[i];
+            if ctx.redraw {
+                w.needs_render = true;
+                w.render_area = None;
+            } else if let Some(r) = ctx.redraw_area {
+                if !w.needs_render {
+                    w.needs_render = true;
+                    w.render_area = Some(r);
+                } else if let Some(a) = w.render_area {
+                    w.render_area = Some(a.union(&r));
+                }
+            }
         }
         for cmd in ctx.commands {
             match cmd {
@@ -976,6 +992,7 @@ impl Wm {
             {
                 if self.windows[i].hover_button.take().is_some() {
                     self.windows[i].needs_render = true;
+                    self.windows[i].render_area = None;
                 }
                 self.deliver(i, AppEvent::MouseLeave);
             }
@@ -991,6 +1008,7 @@ impl Wm {
             if hb != self.windows[i].hover_button {
                 self.windows[i].hover_button = hb;
                 self.windows[i].needs_render = true;
+                self.windows[i].render_area = None;
             }
             let th = self.windows[i].title_h();
             if ly >= th {
@@ -1279,6 +1297,7 @@ impl Wm {
         if new.accent != self.cfg.accent {
             for w in self.windows.iter_mut() {
                 w.needs_render = true;
+                w.render_area = None;
             }
             self.damage_all();
         }
@@ -1418,6 +1437,23 @@ impl Wm {
                 continue;
             }
             let is_focused = focused == Some(self.windows[i].id);
+            // Partial update: only that part of the client is redrawn and
+            // composited (e.g. a visualiser or a clock).
+            let w = &self.windows[i];
+            if let Some(area) = w.render_area
+                && w.anim.is_none()
+                && !w.minimized
+            {
+                let (cw, ch) = w.client_size();
+                let area = area.intersect(&Rect::new(0, 0, cw, ch));
+                let top = w.title_h();
+                let (wx, wy) = (w.rect.x, w.rect.y);
+                render_window_area(&mut self.windows[i], is_focused, area);
+                if !area.is_empty() {
+                    self.damage(area.offset(wx, wy + top));
+                }
+                continue;
+            }
             render_window(&mut self.windows[i], is_focused);
             if !self.windows[i].minimized {
                 let b = self.windows[i].visual_bounds(now).union(&self.windows[i].paint_bounds());
@@ -1724,8 +1760,26 @@ impl Wm {
     }
 }
 
+/// Re-render only `area` of the client (client coordinates); the rest of
+/// the window surface keeps its pixels.
+fn render_window_area(w: &mut Window, focused: bool, area: Rect) {
+    w.needs_render = false;
+    w.render_area = None;
+    if area.is_empty() {
+        return;
+    }
+    let (cw, ch) = w.client_size();
+    let top = w.title_h();
+    let mut c = w.surface.canvas();
+    c.translate(0, top);
+    let old = c.push_clip(area);
+    w.app.render(&mut c, (cw, ch), focused);
+    c.restore_clip(old);
+}
+
 fn render_window(w: &mut Window, focused: bool) {
     w.needs_render = false;
+    w.render_area = None;
     if w.fullscreen.is_some() {
         let (cw, ch) = w.client_size();
         let mut c = w.surface.canvas();

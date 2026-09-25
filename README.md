@@ -104,6 +104,13 @@ VirtualBox, add an empty disk (*Storage → SATA controller → Add hard disk
 → Create*, VDI, 1 GB or more), boot, and click **Set up for MayOS** in
 Settings → Storage (or run `setupdisk sata0` in the terminal).
 
+**Updating MayOS**: the system always starts from the ISO; the disk only
+holds your files and settings. To update, shut MayOS down, put the new
+`mayos.iso` in the VM's optical drive (*Settings → Storage*, click the
+disc, choose the new file) and start it again. Nothing needs
+reinstalling: your files and settings stay, and the programs in `/bin`
+and the guides in `/docs` are refreshed from the new ISO automatically.
+
 If the dock is ever out of view, move it with Settings → Personalization →
 Dock (or `dock left` in the terminal), or just resize the VirtualBox
 window: MayOS follows it.

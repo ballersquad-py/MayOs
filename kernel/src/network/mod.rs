@@ -113,6 +113,7 @@ pub fn init(nic: E1000) {
 }
 
 extern "C" fn net_thread(_: usize) {
+    let (mut seen, mut active_at) = (0u64, 0u64);
     loop {
         {
             let mut g = IFACE.lock();
@@ -121,9 +122,16 @@ extern "C" fn net_thread(_: usize) {
                 i.dhcp_tick();
                 i.retry_pending();
                 i.tcp_flush();
+                let packets = i.stats[0] + i.stats[1];
+                if packets != seen {
+                    seen = packets;
+                    active_at = uptime_ms();
+                }
             }
         }
-        sched::sleep_ms(2);
+        // Poll quickly while packets flow, and gently when the line is quiet
+        // (every wake-up costs the host CPU time under virtualisation).
+        sched::sleep_ms(if uptime_ms() - active_at < 200 { 2 } else { 10 });
     }
 }
 

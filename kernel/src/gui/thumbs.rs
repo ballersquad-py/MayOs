@@ -98,6 +98,11 @@ pub fn get(path: &str, size: u64) -> Option<Arc<Thumb>> {
 
 extern "C" fn worker(_: usize) {
     loop {
+        // Stay out of the way while music or a video plays.
+        if crate::audio::streaming() {
+            crate::proc::sched::sleep_ms(250);
+            continue;
+        }
         let job = STATE.lock().queue.pop_front();
         let Some(k) = job else {
             crate::proc::sched::sleep_ms(30);
@@ -128,6 +133,8 @@ extern "C" fn worker(_: usize) {
         }
         drop(s);
         GENERATION.fetch_add(1, Ordering::Relaxed);
+        // Leave the CPU to the desktop between previews.
+        crate::proc::sched::sleep_ms(10);
     }
 }
 
@@ -195,28 +202,20 @@ fn media_thumb(path: &str) -> Option<image::Image> {
     if target > 0 && dm.seek(target).is_err() {
         dm.seek(0).ok()?;
     }
+    // Decode just the keyframe the seek landed on: one picture is plenty
+    // for a preview and keeps big videos cheap.
+    let _ = target;
     let mut frame = None;
-    for _ in 0..400 {
+    for _ in 0..200 {
         match dm.next_packet() {
-            Some(Ok(p)) if p.track == vi => dec.decode(&p),
-            Some(Ok(_)) => continue,
-            _ => {
+            Some(Ok(p)) if p.track == vi && p.key => {
+                dec.decode(&p);
                 dec.flush();
                 frame = dec.next_frame();
                 break;
             }
-        }
-        // First frame at or after the seek target (keyframes may be earlier).
-        while let Some(f) = dec.next_frame() {
-            if f.pts + 100_000 >= target || frame.is_none() {
-                frame = Some(f);
-            }
-            if frame.as_ref().map(|f| f.pts + 100_000 >= target).unwrap_or(false) {
-                break;
-            }
-        }
-        if frame.as_ref().map(|f| f.pts + 100_000 >= target).unwrap_or(false) {
-            break;
+            Some(Ok(_)) => continue,
+            _ => break,
         }
     }
     let f = frame?;

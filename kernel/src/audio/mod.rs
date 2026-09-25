@@ -79,6 +79,11 @@ impl AudioStream {
     }
 }
 
+/// Whether a music or video stream is currently playing.
+pub fn streaming() -> bool {
+    STREAMS.lock().iter().any(|s| !s.paused.load(Ordering::Relaxed) && s.queued() > 0)
+}
+
 pub fn open_stream() -> Arc<AudioStream> {
     let s = Arc::new(AudioStream {
         queue: Spin::new(VecDeque::new()),
@@ -101,8 +106,16 @@ static MUTED: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Frames mixed so far (lets the self-test see that audio is flowing).
 pub static FRAMES_MIXED: AtomicU64 = AtomicU64::new(0);
+/// Times a playing stream had too little audio queued (it went silent).
+pub static STARVED: AtomicU64 = AtomicU64::new(0);
+/// Times the sound card ran out of mixed buffers (audio glitches).
+pub static UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+/// Longest gap between two runs of the audio thread (ms).
+pub static MAX_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
-const AHEAD: u8 = 4;
+/// Buffers mixed ahead of the hardware (8 x 21 ms): enough to ride out
+/// a busy moment without the card replaying stale audio.
+const AHEAD: u8 = 8;
 
 pub fn init(dev: Ac97, name: &str) {
     DEVICE_NAME.set(String::from(name));
@@ -209,6 +222,9 @@ fn fill(m: &mut Mixer, buf: usize) {
             }
             let vol = s.volume.load(Ordering::Relaxed) as i32;
             let mut q = s.queue.lock();
+            if !q.is_empty() && q.len() < frames * 2 {
+                STARVED.fetch_add(1, Ordering::Relaxed);
+            }
             let n = q.len().min(frames * 2) & !1;
             for (a, v) in acc[..n].iter_mut().zip(q.drain(..n)) {
                 *a += (v as i32 * vol) >> 8;
@@ -224,7 +240,22 @@ fn fill(m: &mut Mixer, buf: usize) {
 }
 
 extern "C" fn audio_thread(_: usize) {
+    let mut last = crate::time::uptime_ms();
+    let mut last_report = last;
     loop {
+        let now = crate::time::uptime_ms();
+        let gap = now - last;
+        last = now;
+        if gap > MAX_GAP_MS.load(Ordering::Relaxed) {
+            MAX_GAP_MS.store(gap, Ordering::Relaxed);
+        }
+        if now - last_report >= 5000 {
+            last_report = now;
+            let (st, un, mg) = (STARVED.load(Ordering::Relaxed), UNDERRUNS.load(Ordering::Relaxed), MAX_GAP_MS.swap(0, Ordering::Relaxed));
+            if st + un > 0 || mg > 40 {
+                crate::kprintln!("audio: {} starved, {} underruns, longest gap {} ms", st, un, mg);
+            }
+        }
         {
             let mut g = MIXER.lock();
             if let Some(m) = g.as_mut() {
@@ -248,6 +279,9 @@ extern "C" fn audio_thread(_: usize) {
                 if !m.voices.is_empty() || streaming || m.dev.is_running() {
                     let civ = m.dev.current();
                     let mut lvi = m.dev.last_valid();
+                    if m.dev.is_running() && civ == lvi {
+                        UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                    }
                     let mut filled = false;
                     while lvi.wrapping_sub(civ) & 31 < AHEAD {
                         lvi = (lvi + 1) & 31;
@@ -261,6 +295,7 @@ extern "C" fn audio_thread(_: usize) {
                 }
             }
         }
-        crate::proc::sched::sleep_ms(5);
+        let idle = MIXER.lock().as_ref().map(|m| !m.dev.is_running()).unwrap_or(true);
+        crate::proc::sched::sleep_ms(if idle { 20 } else { 5 });
     }
 }

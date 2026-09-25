@@ -134,12 +134,18 @@ pub extern "C" fn desktop_main(_: usize) {
 
     let (mut stat_frames, mut stat_us, mut stat_since) = (0u64, 0u64, 0u64);
     let mut vbox_checked = 0u64;
+    let mut vbox_mouse = 0u64;
+    let mut last_input = 0u64;
     loop {
         for dev in INPUTS.lock().iter_mut() {
             dev.poll();
         }
-        crate::drivers::vmmdev::poll_mouse();
         let now = crate::time::uptime_ms();
+        // Each VirtualBox request is a trip out of the VM: at most 100/s.
+        if now - vbox_mouse >= 10 {
+            vbox_mouse = now;
+            crate::drivers::vmmdev::poll_mouse();
+        }
         if now - vbox_checked >= 500 {
             vbox_checked = now;
             // Follow the VirtualBox window size.
@@ -174,7 +180,17 @@ pub extern "C" fn desktop_main(_: usize) {
         // Up to ~120 frames a second while anything moves (animations,
         // drags, pointer); a short idle nap otherwise keeps input snappy.
         let spent = crate::time::uptime_ms() - start;
-        let budget: u64 = if wm.is_animating() || handled > 0 { 8 } else { 4 };
+        if handled > 0 {
+            last_input = start;
+        }
+        let budget: u64 = if wm.is_animating() || handled > 0 {
+            8
+        } else if start - last_input < 1000 {
+            4
+        } else {
+            // Nothing happening: wake less often (easier on the host PC).
+            12
+        };
         crate::proc::sched::sleep_ms(budget.saturating_sub(spent).max(1));
     }
 }

@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use gfx::icons::Icon;
-use gfx::Canvas;
+use gfx::{Canvas, Rect};
 
 use crate::input::KeyEvent;
 
@@ -53,16 +53,27 @@ pub enum Command {
 pub struct Ctx {
     pub window: WindowId,
     pub redraw: bool,
+    /// Part of the client area to redraw when `redraw` is not set.
+    pub redraw_area: Option<Rect>,
     pub commands: Vec<Command>,
 }
 
 impl Ctx {
     pub fn new(window: WindowId) -> Ctx {
-        Ctx { window, redraw: false, commands: Vec::new() }
+        Ctx { window, redraw: false, redraw_area: None, commands: Vec::new() }
     }
 
     pub fn redraw(&mut self) {
         self.redraw = true;
+    }
+
+    /// Redraw only `r` (client coordinates). The app's `render` is called
+    /// with a clip, so it may draw everything and only `r` changes.
+    pub fn redraw_rect(&mut self, r: Rect) {
+        self.redraw_area = Some(match self.redraw_area {
+            Some(a) => a.union(&r),
+            None => r,
+        });
     }
 
     pub fn open(&mut self, app: Box<dyn App>) {

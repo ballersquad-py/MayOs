@@ -45,7 +45,7 @@ impl TcpListener {
             if uptime_ms() >= deadline {
                 return None;
             }
-            sched::sleep_ms(5);
+            sched::sleep_ms(20);
         }
     }
 }

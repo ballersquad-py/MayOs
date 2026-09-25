@@ -81,8 +81,13 @@ pub fn init() {
             Ok(mut vol) => {
                 let is_mayos = vol.exists(MARKER);
                 if is_mayos && !root_persistent && !fs::root_is_persistent() {
+                    // The ISO may be newer than the disk: bring its programs
+                    // and help files up to date before switching over.
+                    fs::mount_volume(UPDATE_POINT, vol);
+                    let updated = update_system_files();
+                    let vol = fs::take_mount(UPDATE_POINT).expect("disk mounted a moment ago");
                     fs::mount_volume("/", vol);
-                    crate::kprintln!("disk: {} is the MayOS disk; mounted at /", name);
+                    crate::kprintln!("disk: {} is the MayOS disk; mounted at / ({} system files updated)", name, updated);
                 } else {
                     let point = format!("/disk{}", next);
                     next += 1;
@@ -96,6 +101,45 @@ pub fn init() {
             }
         }
     }
+}
+
+const UPDATE_POINT: &str = "/mayos-update";
+/// Folders that belong to the system: refreshed from the ISO at every boot.
+/// Everything else on the disk is the user's and is left alone.
+const SYSTEM_DIRS: &[&str] = &["/bin", "/docs"];
+
+/// Copy new or changed files from the ISO's system folders onto the MayOS
+/// disk (mounted at `UPDATE_POINT`). Returns how many files were written.
+fn update_system_files() -> usize {
+    let mut n = 0;
+    for dir in SYSTEM_DIRS {
+        let _ = update_dir(dir, &format!("{}{}", UPDATE_POINT, dir), &mut n);
+    }
+    n
+}
+
+fn update_dir(from: &str, to: &str, n: &mut usize) -> fs::Result<()> {
+    if !fs::is_dir(from) {
+        return Ok(());
+    }
+    if !fs::exists(to) {
+        fs::create_dir(to)?;
+    }
+    for e in fs::read_dir(from)? {
+        let (src, dst) = (fs::join(from, &e.name), fs::join(to, &e.name));
+        if e.is_dir {
+            update_dir(&src, &dst, n)?;
+            continue;
+        }
+        let new = fs::read_file(&src)?;
+        let same = fs::stat(&dst).map(|d| d.size as usize == new.len()).unwrap_or(false)
+            && fs::read_file(&dst).map(|old| old == new).unwrap_or(false);
+        if !same {
+            fs::write_file(&dst, &new)?;
+            *n += 1;
+        }
+    }
+    Ok(())
 }
 
 /// What to set up.

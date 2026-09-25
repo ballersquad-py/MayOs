@@ -74,6 +74,13 @@ Keeping settings and files between restarts
   then Settings > Storage > "Set up for MayOS" (or `setupdisk sata0` in
   the Terminal). After that everything you change is saved on that disk.
 
+Updating MayOS
+  MayOS always starts from the ISO file; your disk only keeps your files
+  and settings. To update: shut down, then in VirtualBox go to Settings >
+  Storage, click the disc under the controller, pick the new mayos.iso
+  with the disc button on the right, and start the VM. Your files and
+  settings stay; /bin and /docs are refreshed from the new ISO.
+
 Screen size in VirtualBox
   MayOS follows the size of the VirtualBox window: resize or maximise the
   window and the desktop fits itself to it. The mouse moves in and out of
