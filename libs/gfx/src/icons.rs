@@ -16,6 +16,7 @@ pub enum Icon {
     Info,
     Drive,
     Home,
+    Settings,
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
@@ -50,6 +51,10 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
             c.fill_rounded_rect(r, s / 10, rgb(0x6b, 0x77, 0x8c));
             c.fill_rounded_rect(r.inset(1), s / 10, rgb(0x9a, 0xa5, 0xb8));
             c.fill_circle(x + s * 3 / 4, y + s / 2, (s / 16).max(1), rgb(0x4c, 0xd9, 0x64));
+        }
+        Icon::Settings => {
+            app_tile(c, x, y, s, rgb(0x9a, 0xa3, 0xb2), rgb(0x5f, 0x68, 0x78));
+            gear(c, x + s / 2, y + s / 2, s * 3 / 10, rgb(255, 255, 255), rgb(0x7d, 0x86, 0x96));
         }
         Icon::Home => {
             let body = Rect::new(x + s / 4, y + s * 9 / 20, s / 2, s * 2 / 5);
@@ -145,4 +150,18 @@ fn terminal(c: &mut Canvas, x: i32, y: i32, s: i32) {
         c.fill_rect(Rect::new(px + i, py + 2 * (s / 7) - i, t, t), g);
     }
     c.fill_rect(Rect::new(x + s / 2, py + 2 * (s / 7), s / 4, t), g);
+}
+
+/// A gear centred at (cx, cy) with outer radius `r`.
+pub fn gear(c: &mut Canvas, cx: i32, cy: i32, r: i32, color: Color, hole: Color) {
+    const DIRS: [(i32, i32); 8] = [(1000, 0), (707, 707), (0, 1000), (-707, 707), (-1000, 0), (-707, -707), (0, -1000), (707, -707)];
+    let body = r * 3 / 4;
+    let tooth = (r / 4).max(2);
+    for (dx, dy) in DIRS {
+        let tx = cx + dx * (r - tooth / 2) / 1000;
+        let ty = cy + dy * (r - tooth / 2) / 1000;
+        c.fill_rounded_rect(Rect::new(tx - tooth, ty - tooth, tooth * 2, tooth * 2), tooth / 2, color);
+    }
+    c.fill_circle(cx, cy, body, color);
+    c.fill_circle(cx, cy, (r / 3).max(1), hole);
 }

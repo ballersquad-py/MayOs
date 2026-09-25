@@ -12,6 +12,7 @@ bench = false
 [dependencies]
 fat32 = { path = "../libs/fat32" }
 gfx = { path = "../libs/gfx" }
+net = { path = "../libs/net" }
 
 [profile.dev]
 panic = "abort"

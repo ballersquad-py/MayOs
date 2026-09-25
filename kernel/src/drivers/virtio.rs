@@ -237,10 +237,6 @@ impl Virtqueue {
         self.size
     }
 
-    pub fn free_descriptors(&self) -> usize {
-        self.free.len()
-    }
-
     /// Publish a descriptor chain. Returns the head index.
     pub fn submit(&mut self, bufs: &[Buf]) -> Option<u16> {
         if bufs.is_empty() || self.free.len() < bufs.len() {

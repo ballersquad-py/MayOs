@@ -18,7 +18,7 @@ pub enum ButtonStyle {
 pub fn button(c: &mut Canvas, r: Rect, label: &str, style: ButtonStyle, hovered: bool, enabled: bool) {
     let f = &fonts().ui;
     let (bg, fg, border) = match style {
-        ButtonStyle::Primary => (if hovered { theme::ACCENT_DARK } else { theme::ACCENT }, theme::TEXT_ON_ACCENT, 0),
+        ButtonStyle::Primary => (if hovered { theme::accent_dark() } else { theme::accent() }, theme::TEXT_ON_ACCENT, 0),
         ButtonStyle::Danger => (if hovered { rgb(0xc9, 0x35, 0x3a) } else { theme::DANGER }, theme::TEXT_ON_ACCENT, 0),
         ButtonStyle::Normal => (
             if hovered { rgb(0xf0, 0xf2, 0xf5) } else { rgb(0xff, 0xff, 0xff) },
@@ -127,7 +127,7 @@ impl TextInput {
     pub fn render(&mut self, c: &mut Canvas, r: Rect, focused: bool) {
         let f: &Font = &fonts().ui;
         c.fill_rounded_rect(r, 6, rgb(0xff, 0xff, 0xff));
-        let border = if focused { theme::ACCENT } else { with_alpha(0x000000, 50) };
+        let border = if focused { theme::accent() } else { with_alpha(0x000000, 50) };
         c.stroke_rounded_rect(r, 6, if focused { 2 } else { 1 }, border);
         let inner = r.inset(8);
         let carets = f.caret_positions(&self.text);
@@ -142,11 +142,11 @@ impl TextInput {
         let base = r.y + (r.h + f.ascent - f.descent) / 2;
         if self.all_selected && focused {
             let w = caret_x.max(4);
-            c.fill_rect(Rect::new(inner.x - self.scroll, r.y + 5, w, r.h - 10), theme::SELECTION);
+            c.fill_rect(Rect::new(inner.x - self.scroll, r.y + 5, w, r.h - 10), theme::selection());
         }
         c.draw_text(f, inner.x - self.scroll, base, &self.text, theme::TEXT);
         if focused && !self.all_selected {
-            c.fill_rect(Rect::new(inner.x - self.scroll + caret_x, r.y + 6, 1, r.h - 12), theme::ACCENT);
+            c.fill_rect(Rect::new(inner.x - self.scroll + caret_x, r.y + 6, 1, r.h - 12), theme::accent());
         }
         c.restore_clip(old);
     }

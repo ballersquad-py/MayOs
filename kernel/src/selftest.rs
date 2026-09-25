@@ -144,6 +144,66 @@ fn user_programs() -> TestResult {
     Ok(())
 }
 
+fn settings_persist() -> TestResult {
+    let before = crate::settings::get();
+    crate::settings::update(|s| {
+        s.volume = 42;
+        s.tz_offset_min = 90;
+        s.hostname = String::from("selftest-host");
+    });
+    let text = fs::read_file(crate::settings::PATH).map_err(|e| format!("settings file: {}", e))?;
+    let parsed = crate::settings::parse(&String::from_utf8_lossy(&text));
+    ensure!(parsed.volume == 42 && parsed.tz_offset_min == 90 && parsed.hostname == "selftest-host", "settings did not round-trip: {:?}", parsed);
+    ensure!(crate::settings::parse(&crate::settings::serialize(&before)) == before, "serialize/parse mismatch");
+    let t = crate::arch::rtc::DateTime { year: 2024, month: 12, day: 31, hour: 23, minute: 30, second: 0 };
+    let u = crate::settings::shift_minutes(t, 60);
+    ensure!((u.year, u.month, u.day, u.hour, u.minute) == (2025, 1, 1, 0, 30), "time zone rollover wrong: {:?}", u);
+    let d = crate::settings::shift_minutes(crate::arch::rtc::DateTime { year: 2024, month: 3, day: 1, hour: 0, minute: 10, second: 0 }, -20);
+    ensure!((d.month, d.day, d.hour, d.minute) == (2, 29, 23, 50), "leap day rollback wrong: {:?}", d);
+    crate::settings::update(|s| *s = before.clone());
+    Ok(())
+}
+
+fn network_works() -> TestResult {
+    if !crate::network::is_present() {
+        crate::kprintln!("selftest: (no network adapter, skipping network test)");
+        return Ok(());
+    }
+    ensure!(crate::network::wait_configured(15_000), "DHCP did not configure an address");
+    let st = crate::network::status().unwrap();
+    crate::kprintln!("selftest: network {}", crate::network::describe(&st));
+    ensure!(!st.gateway.is_unspecified(), "no gateway from DHCP");
+    let rtt = crate::network::ping(st.gateway, 1, 3000).map_err(|e| format!("ping gateway: {}", e))?;
+    crate::kprintln!("selftest: ping {} = {} us", st.gateway, rtt);
+    // DNS depends on the host having internet access; report but don't fail.
+    match crate::network::resolve("example.com") {
+        Ok(ip) => crate::kprintln!("selftest: example.com -> {}", ip),
+        Err(e) => crate::kprintln!("selftest: (DNS lookup not available here: {})", e),
+    }
+    Ok(())
+}
+
+fn audio_works() -> TestResult {
+    if !crate::audio::is_present() {
+        crate::kprintln!("selftest: (no sound card, skipping audio test)");
+        return Ok(());
+    }
+    let tone = alloc::sync::Arc::new(crate::audio::sounds::click());
+    let wav = crate::audio::wav::encode(&tone);
+    let (info, decoded) = crate::audio::wav::decode(&wav).map_err(|e| String::from(e))?;
+    ensure!(info.rate == 48000 && decoded.len() == tone.len(), "WAV round-trip changed the audio");
+    let before = crate::audio::FRAMES_MIXED.load(core::sync::atomic::Ordering::Relaxed);
+    let id = crate::audio::play(alloc::sync::Arc::new(crate::audio::sounds::notify())).ok_or("play failed")?;
+    let start = crate::time::uptime_ms();
+    while crate::audio::is_playing(id) {
+        ensure!(crate::time::uptime_ms() - start < 5000, "sound never finished playing (DMA not running?)");
+        sched::sleep_ms(20);
+    }
+    let mixed = crate::audio::FRAMES_MIXED.load(core::sync::atomic::Ordering::Relaxed) - before;
+    ensure!(mixed >= 48000 * 4 / 10, "only {} frames mixed", mixed);
+    Ok(())
+}
+
 fn desktop_is_drawing() -> TestResult {
     let start = crate::time::uptime_ms();
     while crate::gui::FRAMES.load(core::sync::atomic::Ordering::Relaxed) < 3 {
@@ -160,6 +220,9 @@ pub extern "C" fn run(_: usize) {
         ("shell_commands", shell_commands),
         ("explorer_actions", explorer_actions),
         ("user_programs", user_programs),
+        ("settings_persist", settings_persist),
+        ("network_works", network_works),
+        ("audio_works", audio_works),
         ("desktop_is_drawing", desktop_is_drawing),
     ];
     let mut failed = 0;

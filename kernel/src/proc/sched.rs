@@ -22,7 +22,6 @@ pub enum State {
     Ready,
     Running,
     Sleeping(u64),
-    Blocked,
     Dead,
 }
 
@@ -124,8 +123,8 @@ pub fn spawn_kernel(name: &str, entry: extern "C" fn(usize), arg: usize) -> u64 
     add_thread(
         name,
         |top| idt::TrapFrame {
-            rip: kernel_thread_trampoline as usize as u64,
-            rdi: entry as usize as u64,
+            rip: kernel_thread_trampoline as *const () as u64,
+            rdi: entry as *const () as u64,
             rsi: arg as u64,
             cs: gdt::KERNEL_CS as u64,
             ss: gdt::KERNEL_DS as u64,
@@ -248,11 +247,6 @@ pub fn exit_current() -> ! {
     set_current_state(State::Dead);
     yield_now();
     unreachable!("dead thread was scheduled");
-}
-
-pub fn current_id() -> u64 {
-    let s = SCHED.lock();
-    s.threads[s.current].id
 }
 
 pub fn current_process() -> Option<Arc<Process>> {

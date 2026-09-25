@@ -14,14 +14,6 @@ pub fn phys_to_virt(phys: u64) -> u64 {
     phys + HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
-#[inline]
-pub fn virt_to_phys(virt: u64) -> u64 {
-    virt - HHDM_OFFSET.load(Ordering::Relaxed)
-}
-
-pub fn hhdm_offset() -> u64 {
-    HHDM_OFFSET.load(Ordering::Relaxed)
-}
 
 pub fn init() {
     let hhdm = crate::boot::HHDM.response().expect("no HHDM response").offset;
@@ -40,11 +32,15 @@ pub struct DmaBuf {
 
 impl DmaBuf {
     pub fn new(bytes: usize) -> DmaBuf {
+        DmaBuf::try_new(bytes).expect("out of memory for DMA buffer")
+    }
+
+    pub fn try_new(bytes: usize) -> Option<DmaBuf> {
         let pages = bytes.div_ceil(PAGE_SIZE as usize).max(1);
-        let phys = pmm::alloc_contiguous(pages).expect("out of memory for DMA buffer");
+        let phys = pmm::alloc_contiguous(pages)?;
         let b = DmaBuf { phys, pages };
         unsafe { core::ptr::write_bytes(b.virt() as *mut u8, 0, pages * PAGE_SIZE as usize) };
-        b
+        Some(b)
     }
 
     pub fn virt(&self) -> u64 {

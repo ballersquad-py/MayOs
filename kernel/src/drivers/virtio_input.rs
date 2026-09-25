@@ -82,10 +82,6 @@ impl VirtioInput {
         Some(self.t.cfg_read32(CFG_DATA + 4))
     }
 
-    pub fn is_tablet(&self) -> bool {
-        self.select(CFG_ABS_INFO, ABS_X as u8) >= 8
-    }
-
     /// Drain completed events into the global input queue.
     pub fn poll(&mut self) {
         let mut any = false;

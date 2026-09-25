@@ -23,7 +23,7 @@ impl About {
 fn cpu_brand() -> String {
     let mut out = Vec::new();
     for leaf in 0x8000_0002u32..=0x8000_0004 {
-        let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+        let r = core::arch::x86_64::__cpuid(leaf);
         for v in [r.eax, r.ebx, r.ecx, r.edx] {
             out.extend_from_slice(&v.to_le_bytes());
         }

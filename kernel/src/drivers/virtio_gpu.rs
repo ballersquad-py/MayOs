@@ -6,6 +6,8 @@ use crate::mem::DmaBuf;
 
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
+const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
@@ -19,6 +21,7 @@ const FORMAT_B8G8R8A8: u32 = 1;
 const FORMAT_B8G8R8X8: u32 = 2;
 
 const FB_RESOURCE: u32 = 1;
+const FB_RESOURCE_ALT: u32 = 3;
 const CURSOR_RESOURCE: u32 = 2;
 pub const CURSOR_SIZE: u32 = 64;
 
@@ -31,6 +34,7 @@ pub struct VirtioGpu {
     cursor: DmaBuf,
     pub width: u32,
     pub height: u32,
+    fb_resource: u32,
 }
 
 /// Little helper to build command structures in the DMA page.
@@ -73,6 +77,7 @@ impl VirtioGpu {
             cursor: DmaBuf::new((CURSOR_SIZE * CURSOR_SIZE * 4) as usize),
             width: 0,
             height: 0,
+            fb_resource: FB_RESOURCE,
         };
         let (w, h) = gpu.display_info().unwrap_or((1280, 800));
         gpu.width = w;
@@ -133,6 +138,49 @@ impl VirtioGpu {
         if enabled == 0 || w == 0 || h == 0 { None } else { Some((w, h)) }
     }
 
+    /// Switch to a new resolution: create a new scanout resource, show it,
+    /// then release the old one.
+    pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
+        if w < 640 || h < 480 || w > 3840 || h > 2160 {
+            return false;
+        }
+        let new_res = if self.fb_resource == FB_RESOURCE { FB_RESOURCE_ALT } else { FB_RESOURCE };
+        let Some(fb) = DmaBuf::try_new((w * h * 4) as usize) else { return false };
+        let (phys, len) = (fb.phys, w * h * 4);
+        let ok = self
+            .command(|c| {
+                c.hdr(CMD_RESOURCE_CREATE_2D).u32(new_res).u32(FORMAT_B8G8R8X8).u32(w).u32(h);
+            })
+            .and_then(|_| {
+                self.command(|c| {
+                    c.hdr(CMD_RESOURCE_ATTACH_BACKING).u32(new_res).u32(1).u64(phys).u32(len).u32(0);
+                })
+            })
+            .and_then(|_| {
+                self.command(|c| {
+                    c.hdr(CMD_SET_SCANOUT).u32(0).u32(0).u32(w).u32(h).u32(0).u32(new_res);
+                })
+            });
+        if ok.is_none() {
+            let _ = self.command(|c| {
+                c.hdr(CMD_RESOURCE_UNREF).u32(new_res).u32(0);
+            });
+            return false;
+        }
+        let old = self.fb_resource;
+        let _ = self.command(|c| {
+            c.hdr(CMD_RESOURCE_DETACH_BACKING).u32(old).u32(0);
+        });
+        let _ = self.command(|c| {
+            c.hdr(CMD_RESOURCE_UNREF).u32(old).u32(0);
+        });
+        self.fb = fb;
+        self.fb_resource = new_res;
+        self.width = w;
+        self.height = h;
+        true
+    }
+
     pub fn framebuffer(&mut self) -> &mut [u32] {
         let n = (self.width * self.height) as usize;
         unsafe { core::slice::from_raw_parts_mut(self.fb.virt() as *mut u32, n) }
@@ -144,11 +192,12 @@ impl VirtioGpu {
             return;
         }
         let offset = (y as u64 * self.width as u64 + x as u64) * 4;
+        let res = self.fb_resource;
         let _ = self.command(|c| {
-            c.hdr(CMD_TRANSFER_TO_HOST_2D).u32(x).u32(y).u32(w).u32(h).u64(offset).u32(FB_RESOURCE).u32(0);
+            c.hdr(CMD_TRANSFER_TO_HOST_2D).u32(x).u32(y).u32(w).u32(h).u64(offset).u32(res).u32(0);
         });
         let _ = self.command(|c| {
-            c.hdr(CMD_RESOURCE_FLUSH).u32(x).u32(y).u32(w).u32(h).u32(FB_RESOURCE).u32(0);
+            c.hdr(CMD_RESOURCE_FLUSH).u32(x).u32(y).u32(w).u32(h).u32(res).u32(0);
         });
     }
 

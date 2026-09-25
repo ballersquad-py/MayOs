@@ -14,6 +14,7 @@ pub struct PciDevice {
     pub device: u16,
     pub class: u8,
     pub subclass: u8,
+    #[allow(dead_code)]
     pub prog_if: u8,
 }
 
@@ -56,6 +57,12 @@ impl PciDevice {
     pub fn enable(&self) {
         let cmd = self.read32(0x04);
         self.write32(0x04, (cmd & 0xffff) | 0x6);
+    }
+
+    /// Enable I/O port decoding and bus mastering.
+    pub fn enable_io(&self) {
+        let cmd = self.read32(0x04);
+        self.write32(0x04, (cmd & 0xffff) | 0x5);
     }
 
     /// Physical address of a memory BAR (handles 64-bit BARs).

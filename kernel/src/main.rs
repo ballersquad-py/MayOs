@@ -8,6 +8,7 @@ mod log;
 
 mod acpi;
 mod arch;
+mod audio;
 mod boot;
 mod drivers;
 mod fs;
@@ -15,10 +16,12 @@ mod gui;
 mod input;
 mod interrupts;
 mod mem;
+mod network;
 mod power;
 mod proc;
 mod selftest;
 mod serial;
+mod settings;
 mod sync;
 mod time;
 
@@ -58,6 +61,9 @@ extern "C" fn kmain() -> ! {
     init_devices();
 
     proc::sched::init();
+    // Drivers that start their own threads come after the scheduler.
+    init_threaded_devices();
+    settings::load();
     let selftest = boot::cmdline().contains("selftest");
     if selftest {
         proc::sched::spawn_kernel("selftest", selftest::run, 0);
@@ -67,6 +73,29 @@ extern "C" fn kmain() -> ! {
     kprintln!("boot complete in {} ms", time::uptime_ms());
     loop {
         cpu::sti_hlt();
+    }
+}
+
+fn init_threaded_devices() {
+    for d in pci::devices() {
+        if d.vendor == 0x8086 && drivers::e1000::DEVICE_IDS.contains(&d.device) && !network::is_present() {
+            match drivers::e1000::E1000::new(&d) {
+                Some(nic) => {
+                    kprintln!("net: {} mac {}, link {}", nic.model, nic.mac, if nic.link_up() { "up" } else { "down" });
+                    network::init(nic);
+                }
+                None => kprintln!("net: e1000 init failed"),
+            }
+        }
+        if d.vendor == audio::ac97::VENDOR_INTEL && audio::ac97::DEVICE_IDS.contains(&d.device) && !audio::is_present() {
+            match audio::ac97::Ac97::new(&d) {
+                Some(dev) => {
+                    kprintln!("audio: Intel AC'97 at {:02x}:{:02x}.{}", d.bus, d.slot, d.func);
+                    audio::init(dev, "Intel AC'97 Audio");
+                }
+                None => kprintln!("audio: AC'97 init failed"),
+            }
+        }
     }
 }
 

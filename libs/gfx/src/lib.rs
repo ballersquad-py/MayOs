@@ -54,6 +54,12 @@ pub fn blend(dst: u32, src: u32, a: u32) -> u32 {
     0xff00_0000 | rb | g
 }
 
+/// Multiply a colour's alpha by `opacity` (0..=255).
+pub const fn fade(c: Color, opacity: u32) -> Color {
+    let a = (c >> 24) * opacity / 255;
+    (c & 0x00ff_ffff) | a << 24
+}
+
 /// Linear interpolation between two colors, `t` in 0..=255.
 pub fn mix(a: Color, b: Color, t: u32) -> Color {
     let t = t.min(255);
@@ -475,6 +481,39 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Draw `src` scaled into `dst` (nearest-neighbour), with a global
+    /// opacity (0..=255) and rounded corners. Used for window animations.
+    pub fn blit_scaled(&mut self, src: &Surface, dst: Rect, opacity: u32, radius: i32) {
+        if dst.is_empty() || opacity == 0 {
+            return;
+        }
+        let abs = dst.offset(self.ox, self.oy);
+        let c = abs.intersect(&self.clip);
+        if c.is_empty() {
+            return;
+        }
+        let radius = radius.min(dst.w / 2).min(dst.h / 2).max(0);
+        let step_x = ((src.w as i64) << 16) / dst.w as i64;
+        let step_y = ((src.h as i64) << 16) / dst.h as i64;
+        for py in c.y..c.bottom() {
+            let sy = (((py - abs.y) as i64 * step_y) >> 16).min(src.h as i64 - 1) as i32;
+            let row = (sy * src.w) as usize;
+            let in_band = py < abs.y + radius || py >= abs.bottom() - radius;
+            let mut sx_fp = (c.x - abs.x) as i64 * step_x;
+            for px in c.x..c.right() {
+                let sx = ((sx_fp >> 16) as i32).min(src.w - 1);
+                sx_fp += step_x;
+                let cov = if in_band { rrect_coverage(px, py, abs.x, abs.y, abs.right(), abs.bottom(), radius) } else { 256 };
+                if cov == 0 {
+                    continue;
+                }
+                let a = opacity * cov / 256;
+                let i = self.idx(px, py);
+                self.data[i] = blend(self.data[i], src.data[row + sx as usize], a);
+            }
+        }
+    }
+
     pub fn hline(&mut self, x: i32, y: i32, w: i32, color: Color) {
         self.fill_rect(Rect::new(x, y, w, 1), color);
     }
@@ -596,6 +635,19 @@ mod tests {
         assert!(s.pixel(50, 71) & 0xff < 200);
         assert_eq!(s.pixel(50, 85), 0xffffffff);
         assert_eq!(s.pixel(5, 5), 0xffffffff);
+    }
+
+    #[test]
+    fn scaled_blit_covers_target() {
+        let src = Surface::new(10, 10, rgb(200, 0, 0));
+        let mut dst = Surface::new(40, 40, rgb(0, 0, 0));
+        dst.canvas().blit_scaled(&src, Rect::new(5, 5, 20, 20), 255, 0);
+        assert_eq!(dst.pixel(5, 5), rgb(200, 0, 0));
+        assert_eq!(dst.pixel(24, 24), rgb(200, 0, 0));
+        assert_eq!(dst.pixel(25, 25), rgb(0, 0, 0));
+        let mut half = Surface::new(4, 4, rgb(0, 0, 0));
+        half.canvas().blit_scaled(&src, Rect::new(0, 0, 4, 4), 128, 0);
+        assert!((half.pixel(1, 1) >> 16 & 0xff) > 90 && (half.pixel(1, 1) >> 16 & 0xff) < 110);
     }
 
     #[test]

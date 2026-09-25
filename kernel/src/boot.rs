@@ -102,10 +102,6 @@ impl FramebufferResponse {
 }
 
 pub const MEMMAP_USABLE: u64 = 0;
-pub const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
-pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
-pub const MEMMAP_EXECUTABLE: u64 = 6;
-pub const MEMMAP_FRAMEBUFFER: u64 = 7;
 
 #[repr(C)]
 pub struct MemmapEntry {

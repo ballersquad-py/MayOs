@@ -10,6 +10,8 @@ cp "$DISK" "$SCRATCH"
 timeout 300 $QEMU -M q35 -m 512M -cpu max -smp 1 -accel kvm -accel tcg -bios "$OVMF" \
     -vga none -device virtio-gpu-pci -device virtio-tablet-pci \
     -drive file="$SCRATCH",if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 \
+    -netdev user,id=net0 -device e1000,netdev=net0 \
+    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -cdrom "$ISO" -display none -serial file:"$LOG" -no-reboot 2>/dev/null
 CODE=$?

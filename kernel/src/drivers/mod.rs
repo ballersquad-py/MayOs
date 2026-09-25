@@ -5,3 +5,4 @@ pub mod virtio_blk;
 pub mod virtio_gpu;
 pub mod virtio_input;
 pub mod ramdisk;
+pub mod e1000;

@@ -12,6 +12,23 @@ working reliably.
 
 ---
 
+## Progress
+
+| Area | Status |
+|---|---|
+| Phase 1: kernel, FAT32, drivers, processes, desktop, explorer, terminal, editor | Done |
+| Phase 2: animated compositor, wallpapers, accent colours, resolution switching (virtio-gpu) | Done |
+| Phase 2: in-OS TrueType rasterizer, user-space compositor, GPU (virgl) | Next |
+| Phase 3b: audio (AC'97 driver, mixer, system sounds, WAV playback) | Done |
+| Phase 3a: image decoders (PNG, JPEG, GIF, WebP) | Not started |
+| Phase 4a: e1000 driver, Ethernet, ARP, IPv4, ICMP → `ping` | Done |
+| Phase 4b: UDP, DHCP, DNS | Done |
+| Phase 4b/c: TCP, sockets API, HTTP, TLS | Next |
+| Settings app (display, personalisation, sound, network, input, time, storage) | Done |
+| Phases 5-6: HTML/CSS, JavaScript | Not started |
+
+---
+
 ## 0. Key decisions (made up front)
 
 | Decision | Choice | Why |

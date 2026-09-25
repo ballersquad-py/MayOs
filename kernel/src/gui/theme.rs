@@ -2,11 +2,42 @@
 
 use gfx::{rgb, rgba, Color, Font};
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::sync::Once;
 
-pub const ACCENT: Color = rgb(0x2f, 0x7c, 0xf6);
-pub const ACCENT_DARK: Color = rgb(0x1f, 0x63, 0xd6);
-pub const SELECTION: Color = rgb(0xd6, 0xe6, 0xff);
+/// Accent colours offered in Settings: (name, colour).
+pub const ACCENTS: &[(&str, Color)] = &[
+    ("Blue", rgb(0x2f, 0x7c, 0xf6)),
+    ("Purple", rgb(0x8e, 0x5c, 0xe6)),
+    ("Pink", rgb(0xe0, 0x4f, 0x92)),
+    ("Red", rgb(0xe5, 0x48, 0x4d)),
+    ("Orange", rgb(0xf0, 0x8a, 0x24)),
+    ("Green", rgb(0x2f, 0xa8, 0x5a)),
+    ("Teal", rgb(0x14, 0x9e, 0xa8)),
+    ("Graphite", rgb(0x6e, 0x74, 0x80)),
+];
+
+static ACCENT_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_accent(i: usize) {
+    ACCENT_INDEX.store(i.min(ACCENTS.len() - 1), Ordering::Relaxed);
+}
+
+pub fn accent() -> Color {
+    ACCENTS[ACCENT_INDEX.load(Ordering::Relaxed)].1
+}
+
+/// A darker shade of the accent (hover / pressed states).
+pub fn accent_dark() -> Color {
+    gfx::mix(accent(), rgb(0, 0, 0), 40)
+}
+
+/// A pale tint of the accent (text selection).
+pub fn selection() -> Color {
+    gfx::mix(rgb(0xff, 0xff, 0xff), accent(), 55)
+}
+
 pub const TEXT: Color = rgb(0x1d, 0x1f, 0x24);
 pub const TEXT_DIM: Color = rgb(0x6b, 0x71, 0x7e);
 pub const TEXT_ON_ACCENT: Color = rgb(0xff, 0xff, 0xff);

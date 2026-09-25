@@ -15,8 +15,12 @@ pub type WindowId = u32;
 pub enum Msg {
     /// Result of a dialog: `None` when cancelled.
     DialogResult { tag: u32, value: Option<String> },
+    /// Reply to `Command::SetResolution`.
+    ResolutionResult(bool),
 }
 
+/// Events delivered to apps; not every app reads every field.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AppEvent {
     MouseDown { x: i32, y: i32, button: u8, clicks: u8 },
@@ -36,6 +40,7 @@ pub enum Command {
     OpenChild(Box<dyn App>),
     Close,
     Send(WindowId, Msg),
+    SetResolution(u32, u32),
     Shutdown,
     Reboot,
 }
@@ -76,6 +81,8 @@ impl Ctx {
 pub trait App {
     fn title(&self) -> String;
 
+    /// Icon for the app (used by future task switchers).
+    #[allow(dead_code)]
     fn icon(&self) -> Icon {
         Icon::File
     }
@@ -116,6 +123,7 @@ pub enum AppKind {
     Explorer,
     Terminal,
     Editor,
+    Settings,
     About,
     Other,
 }

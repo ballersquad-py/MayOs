@@ -68,6 +68,31 @@ impl Display {
         }
     }
 
+    /// Resolutions the user may pick. The boot framebuffer is fixed by the
+    /// firmware, so it only offers its current mode.
+    pub fn modes(&self) -> alloc::vec::Vec<(u32, u32)> {
+        match self {
+            Display::Virtio(_) => alloc::vec![
+                (1024, 768),
+                (1280, 720),
+                (1280, 800),
+                (1366, 768),
+                (1440, 900),
+                (1600, 900),
+                (1680, 1050),
+                (1920, 1080),
+            ],
+            Display::Framebuffer { width, height, .. } => alloc::vec![(*width, *height)],
+        }
+    }
+
+    pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
+        match self {
+            Display::Virtio(g) => g.set_mode(w, h),
+            Display::Framebuffer { width, height, .. } => (*width, *height) == (w, h),
+        }
+    }
+
     pub fn has_hw_cursor(&self) -> bool {
         matches!(self, Display::Virtio(_))
     }

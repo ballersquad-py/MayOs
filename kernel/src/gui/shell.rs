@@ -1,6 +1,8 @@
 //! The built-in command shell used by the terminal.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -9,7 +11,9 @@ use core::fmt::Write;
 use super::app::{Command, Ctx};
 use super::editor::Editor;
 use super::explorer::Explorer;
-use super::terminal::Terminal;
+use super::terminal::{Job, Terminal};
+use crate::proc::process::Console;
+use crate::sync::Spin;
 use crate::fs;
 
 const C_DIR: &str = "\x1b[94m";
@@ -42,6 +46,13 @@ const HELP: &[(&str, &str)] = &[
     ("kill <pid>", "stop a process"),
     ("uptime / date", "time since boot / current date"),
     ("lspci", "list PCI devices"),
+    ("ifconfig", "network adapter and address"),
+    ("ping <host> [count]", "send ICMP echo requests"),
+    ("nslookup <name>", "resolve a host name with DNS"),
+    ("dhcp", "request a new IP address"),
+    ("play <file.wav>", "play a WAV file"),
+    ("beep / volume [0-100]", "test sound / get or set the volume"),
+    ("settings", "open the Settings app"),
     ("dmesg", "kernel log"),
     ("uname", "system name"),
     ("history", "previous commands"),
@@ -465,7 +476,6 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                     crate::proc::sched::State::Ready => "ready",
                     crate::proc::sched::State::Running => "running",
                     crate::proc::sched::State::Sleeping(_) => "sleeping",
-                    crate::proc::sched::State::Blocked => "blocked",
                     crate::proc::sched::State::Dead => "dead",
                 };
                 let pid = t.pid.map(|p| format!("{}", p)).unwrap_or_else(|| String::from("-"));
@@ -532,6 +542,82 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
             None => err(out, "usage: open <path>"),
         },
+        "ifconfig" | "ip" => match crate::network::status() {
+            Some(st) => {
+                let _ = writeln!(out, "{}eth0{}  {}", C_HEAD, C_OFF, st.adapter);
+                let _ = writeln!(out, "      link {}  {} Mb/s  mac {}", if st.link_up { "up" } else { "down" }, st.speed_mbps, st.mac);
+                let _ = writeln!(out, "      inet {}/{}  gateway {}", st.ip, st.mask.prefix_len(), st.gateway);
+                let dns: Vec<String> = st.dns.iter().map(|d| format!("{}", d)).collect();
+                let _ = writeln!(out, "      dns {}  config {:?}", if dns.is_empty() { String::from("-") } else { dns.join(", ") }, st.dhcp);
+                let _ = writeln!(out, "      rx {} packets ({} bytes)  tx {} packets ({} bytes)", st.rx_packets, st.rx_bytes, st.tx_packets, st.tx_bytes);
+            }
+            None => err(out, "no network adapter (MayOS supports Intel e1000 NICs)"),
+        },
+        "dhcp" => {
+            if crate::network::is_present() {
+                crate::settings::update(|s| s.dhcp = true);
+                crate::network::use_dhcp();
+                let _ = writeln!(out, "requesting a new address; check with ifconfig");
+            } else {
+                err(out, "no network adapter");
+            }
+        }
+        "ping" => match args.first() {
+            Some(_) => term.start_job("ping", args.join(" "), job_ping),
+            None => err(out, "usage: ping <host> [count]  (or ping -c <count> <host>)"),
+        },
+        "nslookup" | "host" => match args.first() {
+            Some(name) => term.start_job("nslookup", String::from(*name), job_nslookup),
+            None => err(out, "usage: nslookup <name>"),
+        },
+        "play" => match args.first() {
+            Some(p) => match fs::read_file(&abs(p)) {
+                Ok(data) => match crate::audio::wav::decode(&data) {
+                    Ok((info, samples)) => {
+                        if !crate::audio::is_present() {
+                            err(out, "no sound card");
+                        } else {
+                            let secs = samples.len() / 2 / 48000;
+                            let _ = writeln!(
+                                out,
+                                "playing {} ({} Hz, {}-bit, {} ch, {}:{:02})",
+                                p,
+                                info.rate,
+                                info.bits,
+                                info.channels,
+                                secs / 60,
+                                secs % 60
+                            );
+                            crate::audio::play(alloc::sync::Arc::new(samples));
+                        }
+                    }
+                    Err(e) => err(out, format!("play: {}", e)),
+                },
+                Err(e) => err(out, format!("play: {}: {}", p, e)),
+            },
+            None => err(out, "usage: play <file.wav>"),
+        },
+        "beep" => {
+            if crate::audio::is_present() {
+                crate::audio::play_system(crate::audio::SystemSound::Test);
+            } else {
+                err(out, "no sound card");
+            }
+        }
+        "volume" => match args.first().and_then(|v| v.parse::<u8>().ok()) {
+            Some(v) => {
+                crate::settings::update(|s| {
+                    s.volume = v.min(100);
+                    s.muted = false;
+                });
+                let _ = writeln!(out, "volume {}%", v.min(100));
+            }
+            None => {
+                let s = crate::settings::get();
+                let _ = writeln!(out, "volume {}%{}  ({})", s.volume, if s.muted { " (muted)" } else { "" }, crate::audio::device_name());
+            }
+        },
+        "settings" => ctx.open(super::settings_app::boxed()),
         "shutdown" | "poweroff" => ctx.commands.push(Command::Shutdown),
         "reboot" | "restart" => ctx.commands.push(Command::Reboot),
         "exit" => ctx.close(),
@@ -580,5 +666,116 @@ fn run_program(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String) 
     let joined: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     if let Err(e) = term.start_program(&path, &joined.join(" ")) {
         err(out, e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs
+// ---------------------------------------------------------------------------
+
+pub type JobFn = fn(&str, &Console, &AtomicBool) -> i64;
+
+struct JobStart {
+    f: JobFn,
+    args: String,
+    console: Arc<Console>,
+    result: Arc<Spin<Option<i64>>>,
+    cancel: Arc<AtomicBool>,
+}
+
+extern "C" fn job_entry(ptr: usize) {
+    let start = unsafe { Box::from_raw(ptr as *mut JobStart) };
+    let code = (start.f)(&start.args, &start.console, &start.cancel);
+    *start.result.lock() = Some(code);
+}
+
+pub fn spawn_job(name: &str, args: String, console: Arc<Console>, f: JobFn) -> Job {
+    let result = Arc::new(Spin::new(None));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let start = Box::new(JobStart { f, args, console, result: result.clone(), cancel: cancel.clone() });
+    crate::proc::sched::spawn_kernel(name, job_entry, Box::into_raw(start) as usize);
+    Job { name: String::from(name), result, cancel }
+}
+
+fn say(c: &Console, s: &str) {
+    c.write(s.as_bytes());
+}
+
+fn job_ping(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
+    // Accept `ping host [count]`, `ping -c N host` (Unix) and `ping -n N host` (Windows).
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let mut host = "";
+    let mut count: u16 = 4;
+    let mut i = 0;
+    while i < words.len() {
+        match words[i] {
+            "-c" | "-n" if i + 1 < words.len() => {
+                count = words[i + 1].parse().unwrap_or(4);
+                i += 1;
+            }
+            w if host.is_empty() => host = w,
+            w => count = w.parse().unwrap_or(count),
+        }
+        i += 1;
+    }
+    let count = count.clamp(1, 1000);
+    let ip = match crate::network::resolve(host) {
+        Ok(ip) => ip,
+        Err(e) => {
+            say(c, &format!("{}ping: {}: {}{}\n", C_ERR, host, e, C_OFF));
+            return 1;
+        }
+    };
+    say(c, &format!("PING {} ({}): 56 data bytes\n", host, ip));
+    let (mut ok, mut min, mut max, mut sum) = (0u32, u64::MAX, 0u64, 0u64);
+    let mut sent = 0;
+    for seq in 0..count {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        sent += 1;
+        let t0 = crate::time::uptime_ms();
+        match crate::network::ping(ip, seq, 2000) {
+            Ok(us) => {
+                ok += 1;
+                min = min.min(us);
+                max = max.max(us);
+                sum += us;
+                say(c, &format!("64 bytes from {}: icmp_seq={} time={}.{:03} ms\n", ip, seq, us / 1000, us % 1000));
+            }
+            Err(e) => say(c, &format!("{}icmp_seq={}: {}{}\n", C_DIM, seq, e, C_OFF)),
+        }
+        // One request per second.
+        while crate::time::uptime_ms() - t0 < 1000 && seq + 1 < count && !cancel.load(Ordering::Relaxed) {
+            crate::proc::sched::sleep_ms(20);
+        }
+    }
+    say(c, &format!("--- {} ping statistics ---\n", host));
+    let loss = if sent > 0 { (sent - ok) * 100 / sent } else { 0 };
+    say(c, &format!("{} packets transmitted, {} received, {}% packet loss\n", sent, ok, loss));
+    if ok > 0 {
+        let avg = sum / ok as u64;
+        say(c, &format!(
+            "round-trip min/avg/max = {}.{:03}/{}.{:03}/{}.{:03} ms\n",
+            min / 1000, min % 1000, avg / 1000, avg % 1000, max / 1000, max % 1000
+        ));
+    }
+    if ok > 0 { 0 } else { 1 }
+}
+
+fn job_nslookup(name: &str, c: &Console, _cancel: &AtomicBool) -> i64 {
+    let dns = crate::network::status().map(|s| s.dns).unwrap_or_default();
+    if let Some(d) = dns.first() {
+        say(c, &format!("Server:  {}\n", d));
+    }
+    match crate::network::resolve(name) {
+        Ok(ip) => {
+            say(c, &format!("Name:    {}\nAddress: {}\n", name, ip));
+            0
+        }
+        Err(e) => {
+            say(c, &format!("{}nslookup: {}: {}{}\n", C_ERR, name, e, C_OFF));
+            1
+        }
     }
 }

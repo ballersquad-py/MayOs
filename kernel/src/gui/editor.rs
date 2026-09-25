@@ -127,6 +127,7 @@ impl Editor {
             Ok(()) => {
                 self.path = Some(String::from(path));
                 self.modified = false;
+                crate::audio::play_system(crate::audio::SystemSound::Notify);
                 self.flash(format!("Saved to {}", path), false);
                 true
             }
@@ -503,12 +504,12 @@ impl App for Editor {
             {
                 let from = if li == s.0 { s.1 } else { 0 };
                 let to = if li == e.0 { e.1 } else { char_len(line) + 1 };
-                let sel_col = if focused { theme::SELECTION } else { rgb(0xe6, 0xe8, 0xec) };
+                let sel_col = if focused { theme::selection() } else { rgb(0xe6, 0xe8, 0xec) };
                 c.fill_rect(Rect::new(text_x + from as i32 * cw, y - 1, (to - from) as i32 * cw, lh), sel_col);
             }
             c.draw_text(&f.mono, text_x, y + f.mono.ascent, line, theme::TEXT);
             if li == self.cursor.0 && focused && self.blink_on {
-                c.fill_rect(Rect::new(text_x + self.cursor.1 as i32 * cw, y - 1, 2, lh), theme::ACCENT);
+                c.fill_rect(Rect::new(text_x + self.cursor.1 as i32 * cw, y - 1, 2, lh), theme::accent());
             }
             c.restore_clip(old);
         }
@@ -521,7 +522,7 @@ impl App for Editor {
         c.hline(0, s.y, w, theme::SEPARATOR);
         let sb = s.y + (s.h + f.ui.ascent - f.ui.descent) / 2;
         let (msg, col) = match &self.message {
-            Some((m, err, _)) => (m.clone(), if *err { theme::DANGER } else { theme::ACCENT_DARK }),
+            Some((m, err, _)) => (m.clone(), if *err { theme::DANGER } else { theme::accent_dark() }),
             None => (
                 format!(
                     "{} lines \u{00b7} {}{}",

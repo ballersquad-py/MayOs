@@ -39,10 +39,6 @@ impl<T: ?Sized> Spin<T> {
         SpinGuard { lock: self, irq }
     }
 
-    /// Used by the panic handler, which must never deadlock.
-    pub unsafe fn force_unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
 }
 
 pub struct SpinGuard<'a, T: ?Sized> {

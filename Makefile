@@ -13,12 +13,17 @@ USER_BINS  := hello count cat write ls guess sysinfo
 USER_DIR   := userspace/target/x86_64-unknown-none/release
 
 QEMU       ?= qemu-system-x86_64
+# Sound backend for QEMU: pa (PulseAudio), pipewire, alsa, sdl, dsound
+# (Windows), coreaudio (macOS) or none.
+AUDIO      ?= pa
 QEMU_BASE  := -M q35 -m 512M -cpu max -smp 1 \
               -accel kvm -accel tcg \
               -bios $(OVMF) \
               -vga none -device virtio-gpu-pci \
               -device virtio-tablet-pci \
               -drive file=$(DISK),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0 \
+              -netdev user,id=net0 -device e1000,netdev=net0 \
+              -audiodev $(AUDIO),id=snd0 -device AC97,audiodev=snd0 \
               -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
               -no-reboot
 

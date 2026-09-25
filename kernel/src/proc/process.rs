@@ -79,6 +79,7 @@ pub struct Process {
     pub name: String,
     pub pml4: u64,
     pub cwd: String,
+    #[allow(dead_code)]
     pub args: String,
     pub console: Arc<Console>,
     pub brk: Spin<(u64, u64)>,

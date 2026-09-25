@@ -5,6 +5,10 @@
 //! shadows, rounded window surfaces, top bar and dock are painted in
 //! z-order inside each damaged rectangle, then that rectangle is sent to
 //! the display (for virtio-gpu: a transfer + flush of just that region).
+//!
+//! Animations (open, close, minimise, restore, maximise) are time-based:
+//! each frame computes where a window should appear and at what opacity,
+//! and draws its existing surface scaled there.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -12,15 +16,76 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use gfx::icons::{self, Icon};
-use gfx::{rgb, rgba, with_alpha, Canvas, Rect, Surface};
+use gfx::{fade, rgb, rgba, with_alpha, Canvas, Rect, Surface};
 
 use super::app::{App, AppEvent, AppKind, Command, Ctx, Msg, WindowId};
 use super::display::{Display, CURSOR_DIM};
 use super::theme::{self, fonts};
 use crate::input::{InputEvent, Key, KeyEvent};
+use crate::settings::{self, Settings};
+use crate::time::uptime_ms;
 
 const RESIZE_BORDER: i32 = 7;
-const DOUBLE_CLICK_MS: u64 = 450;
+
+const OPEN_MS: u64 = 230;
+const CLOSE_MS: u64 = 170;
+const MINIMIZE_MS: u64 = 280;
+const MORPH_MS: u64 = 220;
+const MENU_FADE_MS: u64 = 130;
+const BOOT_FADE_MS: u64 = 700;
+const BOUNCE_MS: u64 = 900;
+
+/// Ease-out cubic on a 0..=1024 scale.
+fn ease_out(p: i64) -> i64 {
+    let q = 1024 - p.clamp(0, 1024);
+    1024 - q * q / 1024 * q / 1024
+}
+
+/// Ease-in quadratic on a 0..=1024 scale.
+fn ease_in(p: i64) -> i64 {
+    let p = p.clamp(0, 1024);
+    p * p / 1024
+}
+
+fn lerp(a: i32, b: i32, t: i64) -> i32 {
+    a + ((b - a) as i64 * t / 1024) as i32
+}
+
+fn lerp_rect(a: Rect, b: Rect, t: i64) -> Rect {
+    Rect::new(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.w, b.w, t).max(1), lerp(a.h, b.h, t).max(1))
+}
+
+/// `r` scaled about its centre by `s`/1024.
+fn scale_rect(r: Rect, s: i64) -> Rect {
+    let w = (r.w as i64 * s / 1024).max(1) as i32;
+    let h = (r.h as i64 * s / 1024).max(1) as i32;
+    Rect::new(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimKind {
+    /// Grow in, optionally from a rectangle (e.g. the dock icon).
+    Open(Option<Rect>),
+    Close,
+    /// Shrink into the dock icon.
+    Minimize(Rect),
+    Restore(Rect),
+    /// Move/resize from a previous rectangle (maximise and restore).
+    Morph(Rect),
+}
+
+#[derive(Clone, Copy)]
+struct Anim {
+    kind: AnimKind,
+    start: u64,
+    duration: u64,
+}
+
+impl Anim {
+    fn progress(&self, now: u64) -> i64 {
+        ((now.saturating_sub(self.start)) as i64 * 1024 / self.duration.max(1) as i64).clamp(0, 1024)
+    }
+}
 
 struct Window {
     id: WindowId,
@@ -28,9 +93,18 @@ struct Window {
     rect: Rect,
     restore: Option<Rect>,
     minimized: bool,
+    closing: bool,
     surface: Surface,
     needs_render: bool,
     hover_button: Option<u8>,
+    anim: Option<Anim>,
+    /// Screen area painted last frame (for damage while animating).
+    last_paint: Rect,
+}
+
+fn shadow_bounds(r: Rect) -> Rect {
+    let b = theme::SHADOW_BLUR;
+    Rect::new(r.x - b, r.y - b, r.w + 2 * b, r.h + 2 * b + theme::SHADOW_OFFSET)
 }
 
 impl Window {
@@ -42,13 +116,52 @@ impl Window {
         if self.maximized() { 0 } else { theme::WINDOW_RADIUS }
     }
 
-    /// Everything this window paints, including its shadow.
+    /// Everything this window paints at rest, including its shadow.
     fn paint_bounds(&self) -> Rect {
-        if self.maximized() {
-            return self.rect;
+        if self.maximized() { self.rect } else { shadow_bounds(self.rect) }
+    }
+
+    /// Hidden from hit-testing (minimised, or animating out).
+    fn gone(&self) -> bool {
+        self.minimized || self.closing || matches!(self.anim.map(|a| a.kind), Some(AnimKind::Minimize(_)))
+    }
+
+    /// Where the window appears right now and its opacity.
+    fn visual(&self, now: u64) -> (Rect, u32) {
+        let Some(a) = self.anim else { return (self.rect, 255) };
+        let p = a.progress(now);
+        match a.kind {
+            AnimKind::Open(None) => {
+                let e = ease_out(p);
+                let r = scale_rect(self.rect, 940 + 84 * e / 1024);
+                (r.offset(0, (14 * (1024 - e) / 1024) as i32), (e * 255 / 1024) as u32)
+            }
+            AnimKind::Open(Some(from)) => {
+                let e = ease_out(p);
+                (lerp_rect(from, self.rect, e), ((e * 2).min(1024) * 255 / 1024) as u32)
+            }
+            AnimKind::Close => {
+                let e = ease_in(p);
+                (scale_rect(self.rect, 1024 - 80 * e / 1024), ((1024 - e) * 255 / 1024) as u32)
+            }
+            AnimKind::Minimize(target) => {
+                let e = ease_in(p);
+                (lerp_rect(self.rect, target, e), (255 - e * 200 / 1024) as u32)
+            }
+            AnimKind::Restore(from) => {
+                let e = ease_out(p);
+                (lerp_rect(from, self.rect, e), (55 + e * 200 / 1024) as u32)
+            }
+            AnimKind::Morph(from) => (lerp_rect(from, self.rect, ease_out(p)), 255),
         }
-        let b = theme::SHADOW_BLUR;
-        Rect::new(self.rect.x - b, self.rect.y - b, self.rect.w + 2 * b, self.rect.h + 2 * b + theme::SHADOW_OFFSET)
+    }
+
+    fn visual_bounds(&self, now: u64) -> Rect {
+        if self.minimized && self.anim.is_none() {
+            return Rect::default();
+        }
+        let (r, _) = self.visual(now);
+        if self.maximized() && self.anim.is_none() { r } else { shadow_bounds(r) }
     }
 
     fn client_size(&self) -> (i32, i32) {
@@ -69,6 +182,7 @@ enum Drag {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuItem {
     About,
+    Settings,
     Explorer,
     Terminal,
     Editor,
@@ -78,6 +192,7 @@ enum MenuItem {
 
 const MENU: &[Option<(MenuItem, &str)>] = &[
     Some((MenuItem::About, "About MayOS")),
+    Some((MenuItem::Settings, "Settings\u{2026}")),
     None,
     Some((MenuItem::Explorer, "New Explorer Window")),
     Some((MenuItem::Terminal, "New Terminal")),
@@ -91,6 +206,7 @@ const DOCK: &[(AppKind, Icon, &str)] = &[
     (AppKind::Explorer, Icon::Explorer, "Files"),
     (AppKind::Terminal, Icon::Terminal, "Terminal"),
     (AppKind::Editor, Icon::Editor, "Text Editor"),
+    (AppKind::Settings, Icon::Settings, "Settings"),
     (AppKind::About, Icon::Info, "About MayOS"),
 ];
 
@@ -113,10 +229,17 @@ pub struct Wm {
     cursor: Vec<u32>,
     cursor_hot: (i32, i32),
     dock_hover: Option<usize>,
+    dock_bounce: Option<(AppKind, u64)>,
     menu_open: bool,
+    menu_opened_at: u64,
     menu_hover: Option<usize>,
     clock: String,
     cascade: i32,
+    boot_at: u64,
+    cfg: Settings,
+    cfg_gen: u64,
+    /// Remaining sub-pixel motion for pointer-speed scaling.
+    motion_rem: (i32, i32),
     pub launcher: fn(AppKind) -> Option<Box<dyn App>>,
 }
 
@@ -135,36 +258,20 @@ fn month_name(m: u8) -> &'static str {
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m as usize).clamp(1, 12) - 1]
 }
 
-fn render_background(w: i32, h: i32) -> Surface {
-    let mut s = Surface::new(w, h, 0);
-    {
-        let mut c = s.canvas();
-        c.fill_gradient_v(Rect::new(0, 0, w, h), rgb(0x1b, 0x2a, 0x5e), rgb(0x5a, 0x2d, 0x7a));
-        // Soft glowing blobs for depth.
-        let blobs = [
-            (w * 3 / 4, h / 4, h / 2, rgba(0x6f, 0x8c, 0xff, 70)),
-            (w / 5, h * 3 / 4, h * 2 / 5, rgba(0xff, 0x7e, 0xb6, 55)),
-            (w / 2, h, h / 2, rgba(0x49, 0xc6, 0xe5, 45)),
-        ];
-        for (cx, cy, r, col) in blobs {
-            let area = Rect::new(cx - r, cy - r, r * 2, r * 2);
-            // Radial falloff: blend with strength decreasing with distance.
-            for y in area.y.max(0)..area.bottom().min(h) {
-                for x in area.x.max(0)..area.right().min(w) {
-                    let dx = (x - cx) as i64;
-                    let dy = (y - cy) as i64;
-                    let d = gfx::isqrt((dx * dx + dy * dy) as u64) as i32;
-                    if d >= r {
-                        continue;
-                    }
-                    let t = (r - d) as u32 * 255 / r as u32;
-                    let s = t * t / 255;
-                    c.blend_pixel(x, y, col, s);
-                }
-            }
-        }
-    }
-    s
+/// Format the top-bar clock according to the settings.
+pub fn format_clock(cfg: &Settings) -> String {
+    let t = settings::local_time();
+    let (h, suffix) = if cfg.clock_24h {
+        (t.hour, "")
+    } else {
+        (if t.hour % 12 == 0 { 12 } else { t.hour % 12 }, if t.hour < 12 { " AM" } else { " PM" })
+    };
+    let time = if cfg.show_seconds {
+        format!("{:02}:{:02}:{:02}{}", h, t.minute, t.second, suffix)
+    } else {
+        format!("{:02}:{:02}{}", h, t.minute, suffix)
+    };
+    format!("{} {} {}   {}", weekday(t.year, t.month, t.day), month_name(t.month), t.day, time)
 }
 
 impl Wm {
@@ -173,11 +280,12 @@ impl Wm {
         let (cursor, cursor_hot) = super::cursor::arrow();
         let pointer = (width / 2, height / 2);
         display.set_cursor(&cursor, cursor_hot, pointer);
+        let cfg = settings::get();
         let mut wm = Wm {
             display,
             width,
             height,
-            background: render_background(width, height),
+            background: super::wallpaper::render(cfg.wallpaper, width, height),
             windows: Vec::new(),
             focused: None,
             next_id: 1,
@@ -192,23 +300,24 @@ impl Wm {
             cursor,
             cursor_hot,
             dock_hover: None,
+            dock_bounce: None,
             menu_open: false,
+            menu_opened_at: 0,
             menu_hover: None,
             clock: String::new(),
             cascade: 0,
+            boot_at: uptime_ms(),
+            cfg_gen: settings::generation(),
+            cfg,
+            motion_rem: (0, 0),
             launcher,
         };
+        if !wm.cfg.animations {
+            wm.boot_at = 0;
+        }
         wm.update_clock();
         wm.damage_all();
         wm
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        self.display.name()
-    }
-
-    pub fn size(&self) -> (i32, i32) {
-        (self.width, self.height)
     }
 
     fn damage_all(&mut self) {
@@ -226,11 +335,29 @@ impl Wm {
         self.windows.iter().position(|w| w.id == id)
     }
 
+    fn animate(&self, kind: AnimKind, duration: u64) -> Option<Anim> {
+        if self.cfg.animations { Some(Anim { kind, start: uptime_ms(), duration }) } else { None }
+    }
+
+    /// True while anything on screen is moving (the desktop loop then
+    /// renders frames back to back).
+    pub fn is_animating(&self) -> bool {
+        let now = uptime_ms();
+        self.windows.iter().any(|w| w.anim.is_some())
+            || self.dock_bounce.is_some()
+            || (self.menu_open && now - self.menu_opened_at < MENU_FADE_MS + 20)
+            || (self.boot_at != 0 && now - self.boot_at < BOOT_FADE_MS + 20)
+    }
+
     // -----------------------------------------------------------------
     // Window lifecycle
     // -----------------------------------------------------------------
 
     pub fn open(&mut self, app: Box<dyn App>, over: Option<WindowId>) -> WindowId {
+        self.open_from(app, over, None)
+    }
+
+    fn open_from(&mut self, app: Box<dyn App>, over: Option<WindowId>, origin: Option<Rect>) -> WindowId {
         let (mut w, mut h) = app.initial_size();
         w = w.min(self.width - 40);
         h = h.min(self.height - theme::TOPBAR_H - 90);
@@ -243,9 +370,7 @@ impl Wm {
             None => {
                 let step = self.cascade % 8;
                 self.cascade += 1;
-                let x = (self.width - w) / 2 - 120 + step * 32;
-                let y = theme::TOPBAR_H + 40 + step * 28;
-                (x, y)
+                ((self.width - w) / 2 - 120 + step * 32, theme::TOPBAR_H + 40 + step * 28)
             }
         };
         let x = x.clamp(8, (self.width - w - 8).max(8));
@@ -253,32 +378,47 @@ impl Wm {
         let id = self.next_id;
         self.next_id += 1;
         let rect = Rect::new(x, y, w, h_total);
+        let anim = self.animate(AnimKind::Open(origin), OPEN_MS);
         self.windows.push(Window {
             id,
             app,
             rect,
             restore: None,
             minimized: false,
+            closing: false,
             surface: Surface::new(w, h_total, theme::WINDOW_BG),
             needs_render: true,
             hover_button: None,
+            anim,
+            last_paint: shadow_bounds(rect),
         });
         self.focus(Some(id));
-        let b = self.windows.last().unwrap().paint_bounds();
-        self.damage(b);
+        self.damage(shadow_bounds(rect));
         id
     }
 
     pub fn open_kind(&mut self, kind: AppKind) {
+        let origin = DOCK.iter().position(|d| d.0 == kind).map(|i| self.dock_icon_rect(i));
         if let Some(app) = (self.launcher)(kind) {
-            self.open(app, None);
+            self.open_from(app, None, origin);
+            if self.cfg.animations {
+                self.dock_bounce = Some((kind, uptime_ms()));
+            }
         }
     }
 
+    /// Start closing a window (it is removed when its animation ends).
     fn close(&mut self, id: WindowId) {
         let Some(i) = self.index_of(id) else { return };
-        let w = self.windows.remove(i);
-        self.damage(w.paint_bounds());
+        if self.windows[i].closing {
+            return;
+        }
+        self.windows[i].closing = true;
+        let anim = self.animate(AnimKind::Close, CLOSE_MS);
+        self.windows[i].anim = anim;
+        if anim.is_none() {
+            self.remove_window(id);
+        }
         if self.capture == Some(id) {
             self.capture = None;
         }
@@ -287,10 +427,22 @@ impl Wm {
         }
         if self.focused == Some(id) {
             self.focused = None;
-            let next = self.windows.iter().rev().find(|w| !w.minimized).map(|w| w.id);
-            self.focus(next);
+            self.focus_next();
         }
-        self.damage(self.dock_rect());
+        self.damage(self.dock_damage_rect());
+    }
+
+    fn remove_window(&mut self, id: WindowId) {
+        if let Some(i) = self.index_of(id) {
+            let w = self.windows.remove(i);
+            self.damage(w.last_paint);
+            self.damage(w.paint_bounds());
+        }
+    }
+
+    fn focus_next(&mut self) {
+        let next = self.windows.iter().rev().find(|w| !w.gone()).map(|w| w.id);
+        self.focus(next);
     }
 
     fn request_close(&mut self, id: WindowId) {
@@ -318,7 +470,6 @@ impl Wm {
         }
         self.focused = id;
         if let Some(i) = id.and_then(|id| self.index_of(id)) {
-            self.windows[i].minimized = false;
             self.deliver(i, AppEvent::Focus(true));
             self.windows[i].needs_render = true;
             self.raise(i);
@@ -334,17 +485,40 @@ impl Wm {
         }
     }
 
-    fn minimize(&mut self, id: WindowId) {
-        if let Some(i) = self.index_of(id) {
-            self.windows[i].minimized = true;
-            let b = self.windows[i].paint_bounds();
-            self.damage(b);
-            if self.focused == Some(id) {
-                self.focused = None;
-                let next = self.windows.iter().rev().find(|w| !w.minimized).map(|w| w.id);
-                self.focus(next);
+    fn dock_target(&self, kind: AppKind) -> Rect {
+        match DOCK.iter().position(|d| d.0 == kind) {
+            Some(i) => self.dock_icon_rect(i),
+            None => {
+                let d = self.dock_rect();
+                Rect::new(d.x + d.w / 2 - 24, d.y, 48, 48)
             }
         }
+    }
+
+    fn minimize(&mut self, id: WindowId) {
+        let Some(i) = self.index_of(id) else { return };
+        let target = self.dock_target(self.windows[i].app.kind());
+        match self.animate(AnimKind::Minimize(target), MINIMIZE_MS) {
+            Some(a) => self.windows[i].anim = Some(a),
+            None => self.windows[i].minimized = true,
+        }
+        let b = self.windows[i].paint_bounds();
+        self.damage(b);
+        if self.focused == Some(id) {
+            self.focused = None;
+            self.focus_next();
+        }
+    }
+
+    fn unminimize(&mut self, i: usize) {
+        if !self.windows[i].minimized {
+            return;
+        }
+        let from = self.dock_target(self.windows[i].app.kind());
+        self.windows[i].minimized = false;
+        self.windows[i].anim = self.animate(AnimKind::Restore(from), MINIMIZE_MS);
+        let b = self.windows[i].paint_bounds();
+        self.damage(b);
     }
 
     fn toggle_maximize(&mut self, id: WindowId) {
@@ -352,6 +526,7 @@ impl Wm {
         if !self.windows[i].app.resizable() {
             return;
         }
+        let old_rect = self.windows[i].rect;
         let old = self.windows[i].paint_bounds();
         let new = match self.windows[i].restore.take() {
             Some(r) => r,
@@ -361,6 +536,7 @@ impl Wm {
             }
         };
         self.set_rect(i, new);
+        self.windows[i].anim = self.animate(AnimKind::Morph(old_rect), MORPH_MS);
         self.damage(old);
     }
 
@@ -405,6 +581,10 @@ impl Wm {
                 }
                 Command::Close => self.close(id),
                 Command::Send(to, msg) => self.send(to, msg),
+                Command::SetResolution(w, h) => {
+                    let ok = self.set_resolution(w, h);
+                    self.send(id, Msg::ResolutionResult(ok));
+                }
                 Command::Shutdown => crate::power::shutdown(),
                 Command::Reboot => crate::power::reboot(),
             }
@@ -417,6 +597,41 @@ impl Wm {
         }
     }
 
+    /// Change the display mode and re-lay out the desktop.
+    pub fn set_resolution(&mut self, w: u32, h: u32) -> bool {
+        if (w as i32, h as i32) == (self.width, self.height) {
+            return true;
+        }
+        if !self.display.set_mode(w, h) {
+            return false;
+        }
+        let (width, height) = self.display.size();
+        self.width = width;
+        self.height = height;
+        super::update_display_description(&self.display);
+        self.background = super::wallpaper::render(self.cfg.wallpaper, width, height);
+        let full = Rect::new(0, theme::TOPBAR_H, width, height - theme::TOPBAR_H);
+        for i in 0..self.windows.len() {
+            let r = self.windows[i].rect;
+            let new = if self.windows[i].maximized() {
+                full
+            } else {
+                let rw = r.w.min(width - 16);
+                let rh = r.h.min(height - theme::TOPBAR_H - 16);
+                Rect::new(r.x.clamp(8, (width - rw - 8).max(8)), r.y.clamp(theme::TOPBAR_H, (height - rh).max(theme::TOPBAR_H)), rw, rh)
+            };
+            self.set_rect(i, new);
+            self.windows[i].last_paint = self.windows[i].paint_bounds();
+        }
+        self.pointer = (self.pointer.0.min(width - 1), self.pointer.1.min(height - 1));
+        let (cursor, hot) = (core::mem::take(&mut self.cursor), self.cursor_hot);
+        self.display.set_cursor(&cursor, hot, self.pointer);
+        self.cursor = cursor;
+        self.damage.clear();
+        self.damage_all();
+        true
+    }
+
     // -----------------------------------------------------------------
     // Geometry of shell elements
     // -----------------------------------------------------------------
@@ -425,7 +640,6 @@ impl Wm {
         let n = DOCK.len() as i32;
         let w = n * theme::DOCK_ICON + (n + 1) * theme::DOCK_PAD + 8;
         let h = theme::DOCK_ICON + theme::DOCK_PAD * 2;
-        // Extra room above for the tooltip.
         Rect::new((self.width - w) / 2, self.height - h - 10, w, h)
     }
 
@@ -441,7 +655,7 @@ impl Wm {
 
     fn dock_damage_rect(&self) -> Rect {
         let d = self.dock_rect();
-        Rect::new(d.x - 60, d.y - 40, d.w + 120, d.h + 50)
+        Rect::new(d.x - 60, d.y - 60, d.w + 120, d.h + 70)
     }
 
     fn menu_rect(&self) -> Rect {
@@ -470,8 +684,7 @@ impl Wm {
     }
 
     fn update_clock(&mut self) -> bool {
-        let t = crate::arch::rtc::now();
-        let s = format!("{} {} {}   {:02}:{:02}", weekday(t.year, t.month, t.day), month_name(t.month), t.day, t.hour, t.minute);
+        let s = format_clock(&self.cfg);
         if s != self.clock {
             self.clock = s;
             return true;
@@ -486,9 +699,13 @@ impl Wm {
     pub fn handle(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::MouseMove { dx, dy } => {
-                // Simple acceleration for relative mice.
+                // Pointer speed (1..=10, 5 = 1:1) plus acceleration.
+                let speed = self.cfg.pointer_speed as i32;
                 let accel = |d: i32| if d.abs() > 6 { d * 2 } else { d };
-                let (x, y) = (self.pointer.0 + accel(dx), self.pointer.1 + accel(dy));
+                let sx = accel(dx) * speed + self.motion_rem.0;
+                let sy = accel(dy) * speed + self.motion_rem.1;
+                self.motion_rem = (sx % 5, sy % 5);
+                let (x, y) = (self.pointer.0 + sx / 5, self.pointer.1 + sy / 5);
                 self.pointer_moved(x, y);
             }
             InputEvent::MouseAbsolute { x, y } => {
@@ -505,7 +722,7 @@ impl Wm {
                     self.mouse_up(button);
                 }
             }
-            InputEvent::Wheel(d) => self.wheel(d),
+            InputEvent::Wheel(d) => self.wheel(if self.cfg.natural_scroll { -d } else { d }),
             InputEvent::Key(k) => self.key(k),
         }
     }
@@ -548,7 +765,6 @@ impl Wm {
             self.dock_hover = dh;
             self.damage(self.dock_damage_rect());
         }
-        // Hover tracking for windows.
         let under = self.window_at(x, y);
         if under != self.hovered {
             if let Some(old) = self.hovered
@@ -585,7 +801,7 @@ impl Wm {
         self.windows
             .iter()
             .rev()
-            .filter(|w| !w.minimized)
+            .filter(|w| !w.gone())
             .find(|w| {
                 // Resize handles sit outside the left, right and bottom edges.
                 let r = if w.maximized() {
@@ -604,7 +820,7 @@ impl Wm {
                 if let Some(i) = self.index_of(id) {
                     let mut r = self.windows[i].rect;
                     if self.windows[i].maximized() {
-                        // Dragging a maximized window restores it under the pointer.
+                        // Dragging a maximised window restores it under the pointer.
                         let restore = self.windows[i].restore.take().unwrap();
                         r = Rect::new(x - restore.w / 2, y - 12, restore.w, restore.h);
                         self.drag = Some(Drag::Move { id, dx: x - r.x, dy: y - r.y });
@@ -638,6 +854,12 @@ impl Wm {
         }
     }
 
+    fn is_double_click(&self, now: u64, x: i32, y: i32) -> bool {
+        now - self.last_click.0 < self.cfg.double_click_ms as u64
+            && (x - self.last_click.1).abs() < 5
+            && (y - self.last_click.2).abs() < 5
+    }
+
     fn mouse_down(&mut self, button: u8) {
         let (x, y) = self.pointer;
 
@@ -658,6 +880,7 @@ impl Wm {
         if y < theme::TOPBAR_H {
             if self.logo_rect().contains(x, y) && button == 0 {
                 self.menu_open = true;
+                self.menu_opened_at = if self.cfg.animations { uptime_ms() } else { 0 };
                 self.menu_hover = None;
                 self.damage(self.menu_rect());
             }
@@ -672,16 +895,12 @@ impl Wm {
             return;
         }
 
-        let Some(id) = self.window_at(x, y) else {
-            return;
-        };
-        let i = self.index_of(id).unwrap();
+        let Some(id) = self.window_at(x, y) else { return };
         self.focus(Some(id));
-        let i = self.index_of(id).unwrap_or(i);
+        let Some(i) = self.index_of(id) else { return };
         let r = self.windows[i].rect;
         let (lx, ly) = (x - r.x, y - r.y);
 
-        // Resize edges.
         if !self.windows[i].maximized() && self.windows[i].app.resizable() && button == 0 {
             let right = lx >= r.w - 2 && lx < r.w + RESIZE_BORDER;
             let bottom = ly >= r.h - 2 && ly < r.h + RESIZE_BORDER;
@@ -695,6 +914,7 @@ impl Wm {
             return;
         }
 
+        let now = uptime_ms();
         if ly < theme::TITLEBAR_H {
             if button != 0 {
                 return;
@@ -710,10 +930,7 @@ impl Wm {
                     return;
                 }
             }
-            let now = crate::time::uptime_ms();
-            let double = now - self.last_click.0 < DOUBLE_CLICK_MS
-                && (x - self.last_click.1).abs() < 5
-                && (y - self.last_click.2).abs() < 5;
+            let double = self.is_double_click(now, x, y);
             self.last_click = (now, x, y, 1);
             if double {
                 self.toggle_maximize(id);
@@ -724,15 +941,7 @@ impl Wm {
             return;
         }
 
-        let now = crate::time::uptime_ms();
-        let clicks = if now - self.last_click.0 < DOUBLE_CLICK_MS
-            && (x - self.last_click.1).abs() < 5
-            && (y - self.last_click.2).abs() < 5
-        {
-            self.last_click.3.saturating_add(1)
-        } else {
-            1
-        };
+        let clicks = if self.is_double_click(now, x, y) { self.last_click.3.saturating_add(1) } else { 1 };
         self.last_click = (now, x, y, clicks);
         self.capture = Some(id);
         self.deliver(i, AppEvent::MouseDown { x: lx, y: ly - theme::TITLEBAR_H, button, clicks });
@@ -775,6 +984,10 @@ impl Wm {
                 self.open_kind(AppKind::Explorer);
                 return;
             }
+            if k.ctrl && k.alt && k.key == Key::Char('s') {
+                self.dock_click(AppKind::Settings, false);
+                return;
+            }
             if k.alt && k.key == Key::F(4) {
                 if let Some(id) = self.focused {
                     self.request_close(id);
@@ -782,8 +995,7 @@ impl Wm {
                 return;
             }
             if k.alt && k.key == Key::Tab {
-                // Cycle focus through visible windows.
-                if let Some(w) = self.windows.iter().find(|w| !w.minimized).map(|w| w.id) {
+                if let Some(w) = self.windows.iter().find(|w| !w.gone()).map(|w| w.id) {
                     self.focus(Some(w));
                 }
                 return;
@@ -798,12 +1010,13 @@ impl Wm {
 
     fn close_menu(&mut self) {
         self.menu_open = false;
-        self.damage(self.menu_rect());
+        self.damage(self.menu_rect().inset(-20));
     }
 
     fn menu_action(&mut self, item: MenuItem) {
         match item {
             MenuItem::About => self.dock_click(AppKind::About, false),
+            MenuItem::Settings => self.dock_click(AppKind::Settings, false),
             MenuItem::Explorer => self.open_kind(AppKind::Explorer),
             MenuItem::Terminal => self.open_kind(AppKind::Terminal),
             MenuItem::Editor => self.open_kind(AppKind::Editor),
@@ -817,18 +1030,15 @@ impl Wm {
     fn dock_click(&mut self, kind: AppKind, new_window: bool) {
         if !new_window {
             let existing: Vec<WindowId> =
-                self.windows.iter().filter(|w| w.app.kind() == kind).map(|w| w.id).collect();
+                self.windows.iter().filter(|w| w.app.kind() == kind && !w.closing).map(|w| w.id).collect();
             if !existing.is_empty() {
-                // If the top window of this kind is already focused, cycle.
                 let target = if existing.len() > 1 && self.focused == existing.last().copied() {
                     existing[0]
                 } else {
                     *existing.last().unwrap()
                 };
                 if let Some(i) = self.index_of(target) {
-                    self.windows[i].minimized = false;
-                    let b = self.windows[i].paint_bounds();
-                    self.damage(b);
+                    self.unminimize(i);
                 }
                 self.focus(Some(target));
                 return;
@@ -841,8 +1051,28 @@ impl Wm {
     // Frame
     // -----------------------------------------------------------------
 
-    /// Tick apps, re-render dirty windows and composite damaged regions.
+    fn settings_changed(&mut self) {
+        let new = settings::get();
+        if new.wallpaper != self.cfg.wallpaper {
+            self.background = super::wallpaper::render(new.wallpaper, self.width, self.height);
+            self.damage_all();
+        }
+        if new.accent != self.cfg.accent {
+            for w in self.windows.iter_mut() {
+                w.needs_render = true;
+            }
+            self.damage_all();
+        }
+        self.cfg = new;
+        self.clock.clear();
+    }
+
+    /// Tick apps, advance animations, re-render dirty windows and composite.
     pub fn frame(&mut self) {
+        if settings::generation() != self.cfg_gen {
+            self.cfg_gen = settings::generation();
+            self.settings_changed();
+        }
         for i in 0..self.windows.len() {
             if i >= self.windows.len() {
                 break;
@@ -853,7 +1083,45 @@ impl Wm {
             self.apply(ctx);
         }
         if self.update_clock() {
-            self.damage(Rect::new(self.width - 260, 0, 260, theme::TOPBAR_H));
+            self.damage(Rect::new(self.width - 300, 0, 300, theme::TOPBAR_H));
+        }
+
+        let now = uptime_ms();
+        // Advance animations.
+        let mut finished_close = Vec::new();
+        for i in 0..self.windows.len() {
+            let Some(a) = self.windows[i].anim else { continue };
+            let done = now >= a.start + a.duration;
+            if done {
+                self.windows[i].anim = None;
+                match a.kind {
+                    AnimKind::Close => finished_close.push(self.windows[i].id),
+                    AnimKind::Minimize(_) => self.windows[i].minimized = true,
+                    _ => {}
+                }
+            }
+            let b = self.windows[i].visual_bounds(now);
+            let last = self.windows[i].last_paint;
+            self.damage(last.union(&b));
+            self.windows[i].last_paint = if done { self.windows[i].paint_bounds() } else { b };
+        }
+        for id in finished_close {
+            self.remove_window(id);
+        }
+        if let Some((_, start)) = self.dock_bounce {
+            self.damage(self.dock_damage_rect());
+            if now - start > BOUNCE_MS {
+                self.dock_bounce = None;
+            }
+        }
+        if self.menu_open && now - self.menu_opened_at < MENU_FADE_MS + 20 {
+            self.damage(self.menu_rect().inset(-20));
+        }
+        if self.boot_at != 0 {
+            self.damage_all();
+            if now - self.boot_at > BOOT_FADE_MS {
+                self.boot_at = 0;
+            }
         }
 
         let focused = self.focused;
@@ -864,7 +1132,7 @@ impl Wm {
             let is_focused = focused == Some(self.windows[i].id);
             render_window(&mut self.windows[i], is_focused);
             if !self.windows[i].minimized {
-                let b = self.windows[i].paint_bounds();
+                let b = self.windows[i].visual_bounds(now).union(&self.windows[i].paint_bounds());
                 self.damage(b);
             }
         }
@@ -878,7 +1146,6 @@ impl Wm {
 
     fn merged_damage(&mut self) -> Vec<Rect> {
         let mut rects: Vec<Rect> = core::mem::take(&mut self.damage);
-        // Merge overlapping rectangles until stable.
         let mut changed = true;
         while changed {
             changed = false;
@@ -888,8 +1155,7 @@ impl Wm {
                 while j < rects.len() {
                     let a = rects[i];
                     let b = rects[j];
-                    let grown = a.inset(-16);
-                    if grown.intersects(&b) {
+                    if a.inset(-16).intersects(&b) {
                         rects[i] = a.union(&b);
                         rects.swap_remove(j);
                         changed = true;
@@ -914,6 +1180,7 @@ impl Wm {
         let rects = self.merged_damage();
         let (w, h) = (self.width, self.height);
         let screen = Rect::new(0, 0, w, h);
+        let now = uptime_ms();
         for r in rects {
             let r = r.intersect(&screen);
             if r.is_empty() {
@@ -925,40 +1192,77 @@ impl Wm {
                 let mut c = Canvas::new(buf, w, h, w as usize);
                 c.push_clip(r);
                 c.blit_region(background, r, r.x, r.y);
-                for win in windows.iter().filter(|w| !w.minimized) {
-                    if !win.paint_bounds().intersects(&r) {
+                for win in windows.iter() {
+                    if win.minimized && win.anim.is_none() {
                         continue;
                     }
-                    let radius = win.radius();
-                    if !win.maximized() {
-                        let shadow = if focused_is(*focused, win.id) { theme::SHADOW } else { theme::SHADOW_INACTIVE };
-                        c.draw_shadow(win.rect.offset(0, theme::SHADOW_OFFSET), radius, theme::SHADOW_BLUR, shadow);
+                    if !win.visual_bounds(now).intersects(&r) {
+                        continue;
                     }
-                    c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
-                    if !win.maximized() {
-                        c.stroke_rounded_rect(win.rect, radius, 1, theme::BORDER);
+                    let shadow = if *focused == Some(win.id) { theme::SHADOW } else { theme::SHADOW_INACTIVE };
+                    let (dest, alpha) = win.visual(now);
+                    if dest == win.rect && alpha >= 255 {
+                        let radius = win.radius();
+                        if !win.maximized() {
+                            c.draw_shadow(win.rect.offset(0, theme::SHADOW_OFFSET), radius, theme::SHADOW_BLUR, shadow);
+                        }
+                        c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
+                        if !win.maximized() {
+                            c.stroke_rounded_rect(win.rect, radius, 1, theme::BORDER);
+                        }
+                    } else {
+                        let radius = (theme::WINDOW_RADIUS * dest.w / win.rect.w.max(1)).max(2);
+                        c.draw_shadow(dest.offset(0, theme::SHADOW_OFFSET), radius, theme::SHADOW_BLUR, fade(shadow, alpha));
+                        c.blit_scaled(&win.surface, dest, alpha, radius);
+                        c.stroke_rounded_rect(dest, radius, 1, fade(theme::BORDER, alpha));
                     }
                 }
             }
-            self.paint_shell(r);
+            self.paint_shell(r, now);
             self.display.present(r);
         }
     }
 
-    /// Top bar, dock, menu and (if needed) the software cursor.
-    fn paint_shell(&mut self, r: Rect) {
+    fn bounce_offset(&self, kind: AppKind, now: u64) -> i32 {
+        match self.dock_bounce {
+            Some((k, start)) if k == kind => {
+                let t = (now - start).min(BOUNCE_MS) as i64;
+                // Two hops, the second smaller: parabolic arcs.
+                let (phase, amp) = if t < 450 { (t * 1024 / 450, 18) } else { ((t - 450) * 1024 / 450, 8) };
+                (amp * 4 * phase * (1024 - phase) / (1024 * 1024)) as i32
+            }
+            _ => 0,
+        }
+    }
+
+    /// Top bar, dock, menu, boot fade and (if needed) the software cursor.
+    fn paint_shell(&mut self, r: Rect, now: u64) {
         let (w, h) = (self.width, self.height);
         let focused_title = self
             .focused
             .and_then(|id| self.windows.iter().find(|x| x.id == id))
             .map(|x| x.app.title())
             .unwrap_or_default();
-        let running: Vec<AppKind> = self.windows.iter().map(|w| w.app.kind()).collect();
+        let running: Vec<AppKind> = self.windows.iter().filter(|w| !w.closing).map(|w| w.app.kind()).collect();
         let dock = self.dock_rect();
         let icon_rects: Vec<Rect> = (0..DOCK.len()).map(|i| self.dock_icon_rect(i)).collect();
+        let bounces: Vec<i32> = DOCK.iter().map(|d| self.bounce_offset(d.0, now)).collect();
         let menu_rect = self.menu_rect();
+        let menu_alpha = if self.menu_opened_at == 0 {
+            255
+        } else {
+            (((now - self.menu_opened_at) * 255 / MENU_FADE_MS).min(255)) as u32
+        };
+        let boot_alpha = if self.boot_at == 0 {
+            0
+        } else {
+            let p = ((now - self.boot_at) as i64 * 1024 / BOOT_FADE_MS as i64).min(1024);
+            (255 - ease_out(p) * 255 / 1024) as u32
+        };
         let logo = self.logo_rect();
+        let dock_area = self.dock_damage_rect();
         let f = fonts();
+        let accent = theme::accent();
         let Wm { display, clock, dock_hover, menu_open, menu_hover, pointer, cursor, cursor_hot, .. } = self;
         let hw_cursor = display.has_hw_cursor();
         let buf = display.buffer();
@@ -973,7 +1277,7 @@ impl Wm {
             if *menu_open {
                 c.fill_rounded_rect(logo, 6, with_alpha(0x000000, 30));
             }
-            c.fill_circle(logo.x + 14, logo.y + logo.h / 2, 7, theme::ACCENT);
+            c.fill_circle(logo.x + 14, logo.y + logo.h / 2, 7, accent);
             c.fill_circle(logo.x + 14, logo.y + logo.h / 2, 3, rgb(255, 255, 255));
             let base = (theme::TOPBAR_H + f.bold.ascent - f.bold.descent) / 2;
             c.draw_text(&f.bold, logo.x + 28, base, "MayOS", theme::TEXT);
@@ -982,17 +1286,42 @@ impl Wm {
             }
             let cw = f.ui.measure(clock);
             c.draw_text(&f.ui, w - cw - 16, base, clock, theme::TEXT);
+            // Status indicators: network and volume.
+            let mut x = w - cw - 40;
+            if let Some(s) = crate::network::status() {
+                let online = s.link_up && !s.ip.is_unspecified();
+                let col = if online { theme::TEXT } else { with_alpha(theme::TEXT, 90) };
+                for (k, bar_h) in [4, 7, 10, 13].iter().enumerate() {
+                    c.fill_rounded_rect(Rect::new(x + k as i32 * 4, base - bar_h + 1, 3, *bar_h), 1, col);
+                }
+                x -= 26;
+            }
+            if crate::audio::is_present() {
+                let cfg = settings::get();
+                let col = theme::TEXT;
+                c.fill_rect(Rect::new(x, base - 8, 3, 6), col);
+                for k in 0..5 {
+                    c.fill_rect(Rect::new(x + 3 + k, base - 9 - k + 1, 1, 8 + k * 2 - 2), col);
+                }
+                if cfg.muted || cfg.volume == 0 {
+                    c.draw_text(&f.small_bold, x + 11, base, "\u{2715}", col);
+                } else {
+                    let arcs = if cfg.volume > 66 { 3 } else if cfg.volume > 33 { 2 } else { 1 };
+                    for a in 0..arcs {
+                        c.fill_rect(Rect::new(x + 10 + a * 3, base - 7 - a * 2, 1, 4 + a * 4), col);
+                    }
+                }
+            }
         }
 
         // Dock.
-        let dock_area = Rect::new(dock.x - 60, dock.y - 40, dock.w + 120, dock.h + 50);
         if dock_area.intersects(&r) {
             c.draw_shadow(dock, 20, 18, rgba(0, 0, 0, 60));
             c.fill_rounded_rect(dock, 20, rgba(255, 255, 255, 165));
             c.stroke_rounded_rect(dock, 20, 1, rgba(255, 255, 255, 200));
             for (i, (kind, icon, name)) in DOCK.iter().enumerate() {
                 let ir = icon_rects[i];
-                let lift = if *dock_hover == Some(i) { 4 } else { 0 };
+                let lift = if *dock_hover == Some(i) { 4 } else { 0 } + bounces[i];
                 icons::draw(&mut c, *icon, ir.x, ir.y - lift, ir.w);
                 if running.contains(kind) {
                     c.fill_circle(ir.x + ir.w / 2, dock.bottom() - 5, 2, rgba(30, 30, 40, 200));
@@ -1006,31 +1335,38 @@ impl Wm {
             }
         }
 
-        // Menu.
-        if *menu_open && menu_rect.intersects(&r) {
-            c.draw_shadow(menu_rect, 10, 16, rgba(0, 0, 0, 80));
-            c.fill_rounded_rect(menu_rect, 10, rgba(250, 251, 253, 245));
-            c.stroke_rounded_rect(menu_rect, 10, 1, rgba(0, 0, 0, 40));
-            let mut y = menu_rect.y + 6;
-            for (i, m) in MENU.iter().enumerate() {
-                match m {
+        // Menu (fades and drops in when opened).
+        if *menu_open && menu_rect.inset(-20).intersects(&r) {
+            let a = menu_alpha;
+            let m = menu_rect.offset(0, -((255 - a as i32) * 8 / 255));
+            c.draw_shadow(m, 10, 16, fade(rgba(0, 0, 0, 80), a));
+            c.fill_rounded_rect(m, 10, fade(rgba(250, 251, 253, 245), a));
+            c.stroke_rounded_rect(m, 10, 1, fade(rgba(0, 0, 0, 40), a));
+            let mut y = m.y + 6;
+            for (i, item) in MENU.iter().enumerate() {
+                match item {
                     Some((_, label)) => {
-                        let row = Rect::new(menu_rect.x + 6, y, menu_rect.w - 12, 28);
+                        let row = Rect::new(m.x + 6, y, m.w - 12, 28);
                         let hovered = *menu_hover == Some(i);
                         if hovered {
-                            c.fill_rounded_rect(row, 6, theme::ACCENT);
+                            c.fill_rounded_rect(row, 6, fade(accent, a));
                         }
                         let col = if hovered { rgb(255, 255, 255) } else { theme::TEXT };
                         let base = row.y + (row.h + f.ui.ascent - f.ui.descent) / 2;
-                        c.draw_text(&f.ui, row.x + 12, base, label, col);
+                        c.draw_text(&f.ui, row.x + 12, base, label, fade(col, a));
                         y += 28;
                     }
                     None => {
-                        c.hline(menu_rect.x + 12, y + 4, menu_rect.w - 24, theme::SEPARATOR);
+                        c.hline(m.x + 12, y + 4, m.w - 24, fade(theme::SEPARATOR, a));
                         y += 9;
                     }
                 }
             }
+        }
+
+        // Boot fade-in from black.
+        if boot_alpha > 0 {
+            c.fill_rect(r, rgba(0, 0, 0, boot_alpha as u8));
         }
 
         // Software cursor when the display has no hardware cursor.
@@ -1047,14 +1383,6 @@ impl Wm {
             }
         }
     }
-
-    pub fn window_count(&self) -> usize {
-        self.windows.len()
-    }
-}
-
-fn focused_is(f: Option<WindowId>, id: WindowId) -> bool {
-    f == Some(id)
 }
 
 fn render_window(w: &mut Window, focused: bool) {

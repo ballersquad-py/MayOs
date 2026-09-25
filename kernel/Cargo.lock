@@ -16,4 +16,9 @@ version = "0.1.0"
 dependencies = [
  "fat32",
  "gfx",
+ "net",
 ]
+
+[[package]]
+name = "net"
+version = "0.1.0"

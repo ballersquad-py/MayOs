@@ -30,6 +30,15 @@ const PAD: i32 = 10;
 
 type Line = Vec<(char, Color)>;
 
+/// A built-in command running on its own kernel thread (e.g. `ping`), so
+/// the desktop stays responsive. It talks to the terminal through a
+/// console, like a user program.
+pub struct Job {
+    pub name: String,
+    pub result: Arc<crate::sync::Spin<Option<i64>>>,
+    pub cancel: Arc<core::sync::atomic::AtomicBool>,
+}
+
 enum Ansi {
     Normal,
     Escape,
@@ -46,6 +55,7 @@ pub struct Terminal {
     history: Vec<String>,
     history_pos: Option<usize>,
     process: Option<Arc<Process>>,
+    job: Option<Job>,
     console: Option<Arc<Console>>,
     proc_input: String,
     scroll: i32,
@@ -72,6 +82,7 @@ impl Terminal {
             history: Vec::new(),
             history_pos: None,
             process: None,
+            job: None,
             console: None,
             proc_input: String::new(),
             scroll: 0,
@@ -108,10 +119,6 @@ impl Terminal {
 
     fn line_h(&self) -> i32 {
         fonts().mono.line_height + 1
-    }
-
-    pub fn set_color(&mut self, c: Color) {
-        self.color = c;
     }
 
     /// Append text, interpreting newlines, backspace, tabs and ANSI colour
@@ -211,7 +218,7 @@ impl Terminal {
 
     /// The editable line shown after the scrollback.
     fn live_line(&self) -> (Line, usize) {
-        if self.process.is_some() {
+        if self.busy() {
             let mut l = self.lines.last().cloned().unwrap_or_default();
             let start = l.len();
             for c in self.proc_input.chars() {
@@ -232,10 +239,10 @@ impl Terminal {
     fn visual_rows(&self) -> (Vec<Line>, (usize, usize)) {
         let cols = self.cols.max(10);
         let mut rows: Vec<Line> = Vec::new();
-        let body = if self.process.is_some() { &self.lines[..self.lines.len() - 1] } else { &self.lines[..] };
+        let body = if self.busy() { &self.lines[..self.lines.len() - 1] } else { &self.lines[..] };
         // When no program is running the last scrollback line is empty
         // (output always ends with a newline before the prompt).
-        let body = if self.process.is_none() && body.last().map(|l| l.is_empty()).unwrap_or(false) {
+        let body = if !self.busy() && body.last().map(|l| l.is_empty()).unwrap_or(false) {
             &body[..body.len() - 1]
         } else {
             body
@@ -306,6 +313,20 @@ impl Terminal {
         lines.join("\n")
     }
 
+    /// A program or job is running and owns the keyboard.
+    fn busy(&self) -> bool {
+        self.process.is_some() || self.job.is_some()
+    }
+
+    /// Run `f(args, console, cancel)` on a kernel thread as a job.
+    pub fn start_job(&mut self, name: &str, args: String, f: super::shell::JobFn) {
+        let console = Console::new();
+        let job = super::shell::spawn_job(name, args, console.clone(), f);
+        self.job = Some(job);
+        self.console = Some(console);
+        self.proc_input.clear();
+    }
+
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -318,7 +339,11 @@ impl Terminal {
             self.print(&s);
             ctx.redraw();
         }
-        let exited = self.process.as_ref().and_then(|p| p.has_exited());
+        let exited = match (&self.process, &self.job) {
+            (Some(p), _) => p.has_exited(),
+            (None, Some(j)) => *j.result.lock(),
+            _ => None,
+        };
         if let Some(code) = exited {
             let out = console.take_output();
             if !out.is_empty() {
@@ -328,6 +353,7 @@ impl Terminal {
             if let Some(p) = self.process.take() {
                 process::reap(p.pid);
             }
+            self.job = None;
             self.console = None;
             if !self.lines.last().map(|l| l.is_empty()).unwrap_or(true) {
                 self.print("\n");
@@ -426,9 +452,10 @@ impl Terminal {
 
 impl App for Terminal {
     fn title(&self) -> String {
-        match &self.process {
-            Some(p) => format!("{} \u{2014} Terminal", p.name),
-            None => format!("Terminal \u{2014} {}", self.cwd),
+        match (&self.process, &self.job) {
+            (Some(p), _) => format!("{} \u{2014} Terminal", p.name),
+            (None, Some(j)) => format!("{} \u{2014} Terminal", j.name),
+            _ => format!("Terminal \u{2014} {}", self.cwd),
         }
     }
     fn icon(&self) -> Icon {
@@ -503,15 +530,18 @@ impl App for Terminal {
             AppEvent::Key(k) if k.pressed => {
                 self.blink_on = true;
                 self.last_blink = crate::time::uptime_ms();
-                if self.close_when_done && self.process.is_none() {
+                if self.close_when_done && !self.busy() {
                     ctx.close();
                     return;
                 }
-                if self.process.is_some() {
+                if self.busy() {
                     match k.key {
                         Key::Char('c') if k.ctrl => {
                             if let Some(p) = &self.process {
                                 process::kill(p);
+                            }
+                            if let Some(j) = &self.job {
+                                j.cancel.store(true, core::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         Key::Char('d') if k.ctrl => {
@@ -613,7 +643,7 @@ impl App for Terminal {
     fn tick(&mut self, ctx: &mut Ctx) {
         if let Some(cmd) = self.startup.take() {
             super::shell::run(self, &cmd, ctx);
-            if self.process.is_some() {
+            if self.busy() {
                 self.close_when_done = true;
             }
             ctx.redraw();
@@ -631,6 +661,9 @@ impl App for Terminal {
         if let Some(p) = self.process.take() {
             process::kill(&p);
             process::reap(p.pid);
+        }
+        if let Some(j) = self.job.take() {
+            j.cancel.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         true
     }

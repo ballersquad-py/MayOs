@@ -188,7 +188,7 @@ pub fn init_syscall() {
         let efer = rdmsr(MSR_EFER);
         wrmsr(MSR_EFER, efer | 1 | (1 << 11));
         wrmsr(MSR_STAR, (0x10u64 << 48) | ((KERNEL_CS as u64) << 32));
-        wrmsr(MSR_LSTAR, syscall_entry as usize as u64);
+        wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
         // Clear IF, TF, DF and AC on entry.
         wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x40000);
     }

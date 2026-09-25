@@ -219,6 +219,9 @@ impl Explorer {
     }
 
     fn flash(&mut self, msg: String, error: bool) {
+        if error {
+            crate::audio::play_system(crate::audio::SystemSound::Error);
+        }
         self.message = Some((msg, error, crate::time::uptime_ms() + 4000));
     }
 
@@ -619,7 +622,7 @@ impl Explorer {
             let total = s.total_bytes().max(1);
             let used = total - s.free_bytes();
             let uw = ((bar.w as u64 * used / total) as i32).max(8);
-            c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 4, theme::ACCENT);
+            c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 4, theme::accent());
             let text = format!("{} free", fs::format_size(s.free_bytes()));
             c.draw_text_clipped(&f.ui, 18, y + 38, &text, SIDEBAR_W - 30, theme::TEXT_DIM);
         }
@@ -671,7 +674,7 @@ impl Explorer {
             let e = &self.entries[i];
             let selected = self.selected == Some(i);
             if selected {
-                c.fill_rounded_rect(r, 7, if focused { theme::ACCENT } else { with_alpha(0x000000, 30) });
+                c.fill_rounded_rect(r, 7, if focused { theme::accent() } else { with_alpha(0x000000, 30) });
             } else if self.hover == Hover::Row(i) {
                 c.fill_rounded_rect(r, 7, theme::HOVER);
             } else if i % 2 == 1 {
@@ -707,7 +710,7 @@ impl Explorer {
         c.hline(r.x, r.y, r.w, theme::SEPARATOR);
         let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
         if let Some((msg, error, _)) = &self.message {
-            let col = if *error { theme::DANGER } else { theme::ACCENT_DARK };
+            let col = if *error { theme::DANGER } else { theme::accent_dark() };
             c.draw_text_clipped(&f.ui, r.x + 16, base, msg, r.w - 32, col);
             return;
         }
@@ -744,7 +747,7 @@ impl Explorer {
                     let row = Rect::new(r.x + 5, y, r.w - 10, 26);
                     let hovered = self.hover == Hover::Menu(i);
                     if hovered {
-                        c.fill_rounded_rect(row, 6, if *a == Action::Delete { theme::DANGER } else { theme::ACCENT });
+                        c.fill_rounded_rect(row, 6, if *a == Action::Delete { theme::DANGER } else { theme::accent() });
                     }
                     let col = if hovered {
                         rgb(255, 255, 255)

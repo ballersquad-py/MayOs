@@ -164,8 +164,29 @@ fn set1_key(code: u8, extended: bool, shift: bool, caps: bool) -> Key {
     }
 }
 
+/// Set typematic repeat: `level` 1 (slow) ..= 5 (fast).
+pub fn set_repeat(level: u8) {
+    let (rate, delay) = match level {
+        1 => (20u8, 3u8),
+        2 => (15, 2),
+        3 => (10, 1),
+        4 => (5, 1),
+        _ => (0, 0),
+    };
+    // The keyboard answers with 0xFA (ACK), which the IRQ handler ignores.
+    write_data(0xf3);
+    for _ in 0..10_000 {
+        core::hint::spin_loop();
+    }
+    write_data(rate | delay << 5);
+}
+
 pub fn on_keyboard_irq() {
     let code = unsafe { inb(DATA) };
+    // Controller/keyboard responses, not key codes.
+    if matches!(code, 0xfa | 0xfe | 0xaa | 0xee) {
+        return;
+    }
     let mut s = STATE.lock();
     if code == 0xe0 {
         s.extended = true;
