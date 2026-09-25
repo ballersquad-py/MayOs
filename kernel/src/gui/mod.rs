@@ -16,6 +16,7 @@ pub mod settings_app;
 pub mod shell;
 pub mod terminal;
 pub mod theme;
+pub mod thumbs;
 pub mod widgets;
 pub mod player;
 pub mod wallpaper;

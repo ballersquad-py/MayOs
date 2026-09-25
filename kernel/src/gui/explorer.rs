@@ -23,6 +23,10 @@ const SIDEBAR_W: i32 = 176;
 const HEADER_H: i32 = 28;
 const ROW_H: i32 = 28;
 const STATUS_H: i32 = 26;
+/// Grid (preview) view tile size.
+const TILE_W: i32 = 150;
+const TILE_H: i32 = 150;
+const THUMB_BOX: (i32, i32) = (128, 96);
 
 const TAG_NEW_FOLDER: u32 = 1;
 const TAG_NEW_FILE: u32 = 2;
@@ -39,6 +43,7 @@ enum Tool {
     Up,
     NewFolder,
     NewFile,
+    View,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +120,9 @@ pub struct Explorer {
     select_after_refresh: Option<String>,
     dragging_scrollbar: bool,
     focused: bool,
+    /// Preview tiles instead of the detailed list.
+    grid: bool,
+    thumb_gen: u64,
 }
 
 fn kind_of(e: &DirEntry, dir: &str) -> (Icon, String) {
@@ -154,6 +162,8 @@ impl Explorer {
             select_after_refresh: None,
             dragging_scrollbar: false,
             focused: true,
+            grid: crate::settings::get().explorer_grid,
+            thumb_gen: 0,
         };
         e.refresh();
         e
@@ -244,11 +254,12 @@ impl Explorer {
             Tool::Up => Rect::new(80, 10, 32, 30),
             Tool::NewFile => Rect::new(w - 96, 10, 84, 30),
             Tool::NewFolder => Rect::new(w - 196, 10, 94, 30),
+            Tool::View => Rect::new(w - 238, 10, 36, 30),
         }
     }
 
     fn crumb_area(&self) -> Rect {
-        Rect::new(124, 10, (self.size.0 - 124 - 208).max(60), 30)
+        Rect::new(124, 10, (self.size.0 - 124 - 250).max(60), 30)
     }
 
     fn crumbs(&self) -> Vec<(String, String, Rect)> {
@@ -311,12 +322,28 @@ impl Explorer {
         Rect::new(SIDEBAR_W, TOOLBAR_H + HEADER_H, w - SIDEBAR_W, h - TOOLBAR_H - HEADER_H - STATUS_H)
     }
 
+    /// Tiles per row in grid view.
+    fn grid_cols(&self) -> usize {
+        ((self.list_rect().w - 30) / TILE_W).max(1) as usize
+    }
+
     fn row_rect(&self, i: usize) -> Rect {
         let l = self.list_rect();
+        if self.grid {
+            let cols = self.grid_cols();
+            // Spread the spare width evenly between the tiles.
+            let spare = (l.w - 30 - cols as i32 * TILE_W) / (cols as i32 + 1);
+            let x = l.x + 8 + spare + (i % cols) as i32 * (TILE_W + spare);
+            let y = l.y + 8 + (i / cols) as i32 * TILE_H - self.scroll;
+            return Rect::new(x, y, TILE_W - 6, TILE_H - 6);
+        }
         Rect::new(l.x + 6, l.y + 4 + i as i32 * ROW_H - self.scroll, l.w - 20, ROW_H)
     }
 
     fn content_height(&self) -> i32 {
+        if self.grid {
+            return self.entries.len().div_ceil(self.grid_cols()) as i32 * TILE_H + 16;
+        }
         self.entries.len() as i32 * ROW_H + 8
     }
 
@@ -332,11 +359,12 @@ impl Explorer {
 
     fn ensure_visible(&mut self, i: usize) {
         let l = self.list_rect();
-        let top = 4 + i as i32 * ROW_H;
+        let r = self.row_rect(i);
+        let top = r.y - l.y + self.scroll;
         if top < self.scroll {
             self.scroll = top - 4;
-        } else if top + ROW_H > self.scroll + l.h {
-            self.scroll = top + ROW_H - l.h + 4;
+        } else if top + r.h > self.scroll + l.h {
+            self.scroll = top + r.h - l.h + 4;
         }
         self.clamp_scroll();
     }
@@ -345,6 +373,11 @@ impl Explorer {
         let l = self.list_rect();
         if !l.contains(x, y) || x >= l.right() - 14 {
             return None;
+        }
+        if self.grid {
+            let cols = self.grid_cols();
+            let row = ((y - l.y - 8 + self.scroll).max(0) / TILE_H) as usize;
+            return (row * cols..((row + 1) * cols).min(self.entries.len())).find(|&i| self.row_rect(i).contains(x, y));
         }
         let i = (y - l.y - 4 + self.scroll) / ROW_H;
         if y - l.y - 4 + self.scroll < 0 || i < 0 || i as usize >= self.entries.len() {
@@ -360,7 +393,7 @@ impl Explorer {
                 None => Hover::None,
             };
         }
-        for t in [Tool::Back, Tool::Forward, Tool::Up, Tool::NewFolder, Tool::NewFile] {
+        for t in [Tool::Back, Tool::Forward, Tool::Up, Tool::NewFolder, Tool::NewFile, Tool::View] {
             if self.tool_rect(t).contains(x, y) {
                 return Hover::Tool(t);
             }
@@ -609,6 +642,20 @@ impl Explorer {
             }
         }
         c.restore_clip(old);
+        // View toggle: shows the layout you switch to.
+        let vr = self.tool_rect(Tool::View);
+        button(c, vr, "", ButtonStyle::Normal, self.hover == Hover::Tool(Tool::View), true);
+        let (ox, oy) = (vr.x + (vr.w - 14) / 2, vr.y + (vr.h - 14) / 2);
+        if self.grid {
+            for i in 0..3 {
+                c.fill_rect(Rect::new(ox, oy + i * 5 + 1, 3, 3), theme::TEXT);
+                c.fill_rect(Rect::new(ox + 5, oy + i * 5 + 1, 9, 3), theme::TEXT);
+            }
+        } else {
+            for (dx, dy) in [(0, 0), (8, 0), (0, 8), (8, 8)] {
+                c.fill_rounded_rect(Rect::new(ox + dx, oy + dy, 6, 6), 1, theme::TEXT);
+            }
+        }
         button(c, self.tool_rect(Tool::NewFolder), "New Folder", ButtonStyle::Normal, self.hover == Hover::Tool(Tool::NewFolder), true);
         button(c, self.tool_rect(Tool::NewFile), "New File", ButtonStyle::Primary, self.hover == Hover::Tool(Tool::NewFile), true);
     }
@@ -661,10 +708,94 @@ impl Explorer {
         (l.x + 16, size_x, modified, kind)
     }
 
+    fn toggle_view(&mut self) {
+        self.grid = !self.grid;
+        let grid = self.grid;
+        crate::settings::update(|s| s.explorer_grid = grid);
+        self.clamp_scroll();
+        if let Some(i) = self.selected {
+            self.ensure_visible(i);
+        }
+    }
+
+    /// Preview for a file, if one exists (queued in the background).
+    fn thumb(&self, e: &DirEntry) -> Option<alloc::sync::Arc<super::thumbs::Thumb>> {
+        if e.is_dir || !super::thumbs::supported(&e.name) {
+            return None;
+        }
+        super::thumbs::get(&fs::join(&self.path, &e.name), e.size as u64)
+    }
+
+    fn draw_grid(&mut self, c: &mut Canvas, focused: bool) {
+        let f = fonts();
+        let l = self.list_rect();
+        let cols = self.grid_cols();
+        let first = ((self.scroll - 8).max(0) / TILE_H) as usize * cols;
+        let last = (((self.scroll + l.h) / TILE_H + 1) as usize * cols).min(self.entries.len());
+        for i in first..last {
+            let r = self.row_rect(i);
+            let e = &self.entries[i];
+            let selected = self.selected == Some(i);
+            if selected {
+                c.fill_rounded_rect(r, 10, if focused { with_alpha(theme::accent(), 60) } else { with_alpha(0x000000, 26) });
+                c.stroke_rounded_rect(r, 10, 1, if focused { theme::accent() } else { with_alpha(0x000000, 40) });
+            } else if self.hover == Hover::Row(i) {
+                c.fill_rounded_rect(r, 10, theme::HOVER);
+            }
+            let bx = Rect::new(r.x + (r.w - THUMB_BOX.0) / 2, r.y + 8, THUMB_BOX.0, THUMB_BOX.1);
+            match self.thumb(e) {
+                Some(t) => {
+                    let t = &t.big;
+                    let (tw, th) = (t.w.min(bx.w), t.h.min(bx.h));
+                    let (tx, ty) = (bx.x + (bx.w - tw) / 2, bx.y + (bx.h - th) / 2);
+                    c.draw_shadow(Rect::new(tx, ty, tw, th), 4, 6, with_alpha(0x000000, 50));
+                    if (tw, th) == (t.w, t.h) {
+                        c.blit_rounded(t, tx, ty, 4);
+                    } else {
+                        c.blit_scaled(t, Rect::new(tx, ty, tw, th), 255, 4);
+                    }
+                    if super::player::is_video_name(&e.name) {
+                        // Play badge.
+                        let (cx, cy) = (tx + tw - 16, ty + th - 16);
+                        c.fill_circle(cx, cy, 11, with_alpha(0x000000, 150));
+                        c.draw_text_centered(&f.small_bold, Rect::new(cx - 11, cy - 11, 23, 22), "\u{25b6}", 0xffff_ffff);
+                    }
+                }
+                None => {
+                    let (icon, _) = kind_of(e, &self.path);
+                    icons::draw(c, icon, bx.x + (bx.w - 64) / 2, bx.y + (bx.h - 64) / 2, 64);
+                }
+            }
+            // Name, centred (clipped with an ellipsis when too long).
+            let max = r.w - 12;
+            let tw = f.ui.measure(&e.name).min(max);
+            let base = r.y + 8 + THUMB_BOX.1 + 22;
+            c.draw_text_clipped(&f.ui, r.x + (r.w - tw) / 2, base, &e.name, max, theme::TEXT);
+            let sub = if e.is_dir { String::from("Folder") } else { fs::format_size(e.size as u64) };
+            c.draw_text_centered(&f.ui, Rect::new(r.x, base + 3, r.w, 18), &sub, theme::TEXT_DIM);
+        }
+    }
+
     fn draw_list(&mut self, c: &mut Canvas, focused: bool) {
         let f = fonts();
         let l = self.list_rect();
         c.fill_rect(Rect::new(l.x, l.y - HEADER_H, l.w, l.h + HEADER_H), theme::WINDOW_BG);
+        if self.grid {
+            let hy = l.y - HEADER_H;
+            let hb = hy + (HEADER_H + f.small_bold.ascent - f.small_bold.descent) / 2;
+            let title = fs::file_name(&self.path);
+            let title = if title.is_empty() { "MAYOS DISK".to_string() } else { title.to_ascii_uppercase() };
+            c.draw_text(&f.small_bold, l.x + 16, hb, &title, theme::TEXT_DIM);
+            c.hline(l.x, l.y - 1, l.w, theme::SEPARATOR);
+            let old = c.push_clip(l);
+            if self.entries.is_empty() {
+                c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 40, l.w, 30), "This folder is empty", theme::TEXT_DIM);
+            }
+            self.draw_grid(c, focused);
+            widgets::draw_scrollbar(c, self.scrollbar_track(), self.content_height(), l.h, self.scroll);
+            c.restore_clip(old);
+            return;
+        }
         // Header.
         let (name_x, size_x, mod_x, kind_x) = self.columns();
         let hy = l.y - HEADER_H;
@@ -701,7 +832,13 @@ impl Explorer {
                 c.fill_rounded_rect(r, 7, rgb(0xf8, 0xf9, 0xfb));
             }
             let (icon, kind) = kind_of(e, &self.path);
-            icons::draw(c, icon, name_x - 4, r.y + 3, 22);
+            match self.thumb(e) {
+                Some(t) => {
+                    let t = &t.small;
+                    c.blit_rounded(t, name_x - 4 + (22 - t.w) / 2, r.y + 3 + (22 - t.h) / 2, 2);
+                }
+                None => icons::draw(c, icon, name_x - 4, r.y + 3, 22),
+            }
             let text = if selected && focused { theme::TEXT_ON_ACCENT } else { theme::TEXT };
             let dim = if selected && focused { with_alpha(0xffffff, 210) } else { theme::TEXT_DIM };
             let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
@@ -885,6 +1022,7 @@ impl App for Explorer {
                         Tool::Up => self.go_up(),
                         Tool::NewFolder => self.run(Action::NewFolder, ctx),
                         Tool::NewFile => self.run(Action::NewFile, ctx),
+                        Tool::View => self.toggle_view(),
                     },
                     Hover::Crumb(i) if *button == 0 => {
                         if let Some((_, path, _)) = self.crumbs().get(i) {
@@ -931,14 +1069,25 @@ impl App for Explorer {
                     return;
                 }
                 let n = self.entries.len();
+                let step = if self.grid { self.grid_cols() } else { 1 };
                 match k.key {
-                    Key::Down if n > 0 => {
+                    Key::Right if self.grid && !k.alt && n > 0 => {
                         let i = self.selected.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
                         self.selected = Some(i);
                         self.ensure_visible(i);
                     }
-                    Key::Up if n > 0 => {
+                    Key::Left if self.grid && !k.alt && n > 0 => {
                         let i = self.selected.map(|i| i.saturating_sub(1)).unwrap_or(0);
+                        self.selected = Some(i);
+                        self.ensure_visible(i);
+                    }
+                    Key::Down if n > 0 => {
+                        let i = self.selected.map(|i| if i + step < n { i + step } else { i }).unwrap_or(0);
+                        self.selected = Some(i);
+                        self.ensure_visible(i);
+                    }
+                    Key::Up if n > 0 => {
+                        let i = self.selected.map(|i| i.checked_sub(step).unwrap_or(i)).unwrap_or(0);
                         self.selected = Some(i);
                         self.ensure_visible(i);
                     }
@@ -991,6 +1140,11 @@ impl App for Explorer {
     fn tick(&mut self, ctx: &mut Ctx) {
         if fs::generation() != self.generation {
             self.refresh();
+            ctx.redraw();
+        }
+        let tg = super::thumbs::generation();
+        if tg != self.thumb_gen {
+            self.thumb_gen = tg;
             ctx.redraw();
         }
         if let Some((_, _, until)) = &self.message

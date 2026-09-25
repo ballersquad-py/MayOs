@@ -37,6 +37,8 @@ pub struct Settings {
     pub dock_autohide: bool,
     /// 0 = small, 1 = medium, 2 = large.
     pub dock_size: u8,
+    /// Files shows large previews instead of a detailed list.
+    pub explorer_grid: bool,
     /// Media player volume, 0..=100.
     pub player_volume: u8,
 }
@@ -69,6 +71,7 @@ impl Default for Settings {
             dock_autohide: false,
             dock_size: 1,
             player_volume: 90,
+            explorer_grid: true,
         }
     }
 }
@@ -131,6 +134,7 @@ pub fn parse(text: &str) -> Settings {
             "dock_autohide" => s.dock_autohide = parse_bool(v).unwrap_or(false),
             "dock_size" => s.dock_size = num(1).min(2) as u8,
             "player_volume" => s.player_volume = num(90).min(100) as u8,
+            "explorer_grid" => s.explorer_grid = parse_bool(v).unwrap_or(true),
             _ => {}
         }
     }
@@ -149,7 +153,7 @@ pub fn serialize(s: &Settings) -> String {
          pointer_speed = {}\ndouble_click_ms = {}\nnatural_scroll = {}\nkey_repeat = {}\n\
          clock_24h = {}\nshow_seconds = {}\ntz_offset_min = {}\n\
          dhcp = {}\nstatic_ip = {}\nstatic_mask = {}\nstatic_gateway = {}\nstatic_dns = {}\nhostname = {}\n\
-         dock_position = {}\ndock_autohide = {}\ndock_size = {}\nplayer_volume = {}\n",
+         dock_position = {}\ndock_autohide = {}\ndock_size = {}\nplayer_volume = {}\nexplorer_grid = {}\n",
         res,
         s.wallpaper,
         s.wallpaper_image,
@@ -174,7 +178,8 @@ pub fn serialize(s: &Settings) -> String {
         s.dock_position,
         s.dock_autohide,
         s.dock_size,
-        s.player_volume
+        s.player_volume,
+        s.explorer_grid
     )
 }
 
