@@ -1,0 +1,166 @@
+//! 4-level page tables.
+//!
+//! We keep running on the tables Limine built (they live in
+//! bootloader-reclaimable memory, which we never reuse) and extend them. All
+//! 256 upper-half PML4 slots are populated at boot so that every process
+//! address space can share the kernel half by copying those slots.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use super::{phys_to_virt, pmm, PAGE_SIZE};
+use crate::arch::cpu;
+use crate::sync::Spin;
+
+pub const PRESENT: u64 = 1;
+pub const WRITABLE: u64 = 1 << 1;
+pub const USER: u64 = 1 << 2;
+pub const WRITE_THROUGH: u64 = 1 << 3;
+pub const NO_CACHE: u64 = 1 << 4;
+pub const HUGE: u64 = 1 << 7;
+pub const NO_EXECUTE: u64 = 1 << 63;
+
+const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+/// Serialises page-table edits.
+static LOCK: Spin<()> = Spin::new(());
+
+pub fn kernel_pml4() -> u64 {
+    KERNEL_PML4.load(Ordering::Relaxed)
+}
+
+fn table(phys: u64) -> &'static mut [u64; 512] {
+    unsafe { &mut *(phys_to_virt(phys) as *mut [u64; 512]) }
+}
+
+pub fn init() {
+    crate::arch::idt::enable_nx();
+    let pml4 = cpu::read_cr3() & ADDR_MASK;
+    KERNEL_PML4.store(pml4, Ordering::Relaxed);
+    let t = table(pml4);
+    for e in t.iter_mut().skip(256) {
+        if *e & PRESENT == 0 {
+            let f = pmm::alloc_frame_zeroed().expect("oom");
+            *e = f | PRESENT | WRITABLE;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MapError {
+    OutOfMemory,
+    HugePage,
+}
+
+fn index(virt: u64, level: u32) -> usize {
+    ((virt >> (12 + 9 * (level - 1))) & 0x1ff) as usize
+}
+
+pub fn map(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+    let _g = LOCK.lock();
+    let mut t = pml4;
+    for level in (2..=4).rev() {
+        let e = &mut table(t)[index(virt, level)];
+        if *e & PRESENT == 0 {
+            let f = pmm::alloc_frame_zeroed().ok_or(MapError::OutOfMemory)?;
+            *e = f | PRESENT | WRITABLE | (flags & USER);
+        } else if *e & HUGE != 0 {
+            return Err(MapError::HugePage);
+        } else if flags & USER != 0 {
+            *e |= USER;
+        }
+        t = *e & ADDR_MASK;
+    }
+    table(t)[index(virt, 1)] = (phys & ADDR_MASK) | flags | PRESENT;
+    cpu::invlpg(virt);
+    Ok(())
+}
+
+/// Returns the physical address and flags of the page mapping `virt`.
+pub fn translate(pml4: u64, virt: u64) -> Option<(u64, u64)> {
+    let mut t = pml4;
+    for level in (1..=4).rev() {
+        let e = table(t)[index(virt, level)];
+        if e & PRESENT == 0 {
+            return None;
+        }
+        if level == 1 || (level <= 3 && e & HUGE != 0) {
+            let page_size = 1u64 << (12 + 9 * (level - 1));
+            return Some(((e & ADDR_MASK & !(page_size - 1)) + (virt & (page_size - 1)), e));
+        }
+        t = e & ADDR_MASK;
+    }
+    None
+}
+
+pub fn unmap(pml4: u64, virt: u64) -> Option<u64> {
+    let _g = LOCK.lock();
+    let mut t = pml4;
+    for level in (2..=4).rev() {
+        let e = table(t)[index(virt, level)];
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return None;
+        }
+        t = e & ADDR_MASK;
+    }
+    let e = &mut table(t)[index(virt, 1)];
+    if *e & PRESENT == 0 {
+        return None;
+    }
+    let phys = *e & ADDR_MASK;
+    *e = 0;
+    cpu::invlpg(virt);
+    Some(phys)
+}
+
+/// Map device memory into the direct-map window (uncached) and return its
+/// virtual address. Ranges that are already mapped are left untouched.
+pub fn map_mmio(phys: u64, len: usize) -> u64 {
+    let start = phys & !(PAGE_SIZE - 1);
+    let end = (phys + len as u64).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let pml4 = kernel_pml4();
+    let mut p = start;
+    while p < end {
+        let v = phys_to_virt(p);
+        if translate(pml4, v).is_none() {
+            map(pml4, v, p, WRITABLE | NO_CACHE | WRITE_THROUGH | NO_EXECUTE).expect("map_mmio failed");
+        }
+        p += PAGE_SIZE;
+    }
+    phys_to_virt(phys)
+}
+
+/// A fresh address space sharing the kernel half.
+pub fn new_address_space() -> Option<u64> {
+    let pml4 = pmm::alloc_frame_zeroed()?;
+    let k = table(kernel_pml4());
+    let t = table(pml4);
+    t[256..].copy_from_slice(&k[256..]);
+    Some(pml4)
+}
+
+/// Free every user page and page table of an address space, then the PML4.
+pub fn destroy_address_space(pml4: u64) {
+    let _g = LOCK.lock();
+    fn free_level(t: u64, level: u32) {
+        for &e in table(t).iter() {
+            if e & PRESENT == 0 {
+                continue;
+            }
+            let child = e & ADDR_MASK;
+            if level > 1 {
+                free_level(child, level - 1);
+            }
+            pmm::free_frame(child);
+        }
+    }
+    let top = table(pml4);
+    for i in 0..256 {
+        let e = top[i];
+        if e & PRESENT != 0 {
+            free_level(e & ADDR_MASK, 3);
+            pmm::free_frame(e & ADDR_MASK);
+        }
+    }
+    pmm::free_frame(pml4);
+}

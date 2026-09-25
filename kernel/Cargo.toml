@@ -1,0 +1,26 @@
+[package]
+name = "mayos-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+fat32 = { path = "../libs/fat32" }
+gfx = { path = "../libs/gfx" }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = true
+codegen-units = 1
+
+[workspace]

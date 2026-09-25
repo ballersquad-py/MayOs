@@ -1,0 +1,5 @@
+/build/
+target/
+*.img
+*.iso
+__pycache__/
