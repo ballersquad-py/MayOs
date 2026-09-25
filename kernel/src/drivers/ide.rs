@@ -5,8 +5,18 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::arch::cpu::{inb, inw, outb, outw};
+use crate::arch::cpu::{inb, inw, outb};
 use crate::time::uptime_ms;
+
+/// `rep insw`: read `count` 16-bit words from `port` into `dst`.
+unsafe fn insw(port: u16, dst: *mut u8, count: usize) {
+    unsafe { core::arch::asm!("rep insw", in("dx") port, inout("rdi") dst => _, inout("rcx") count => _, options(nostack, preserves_flags)) }
+}
+
+/// `rep outsw`: write `count` 16-bit words from `src` to `port`.
+unsafe fn outsw(port: u16, src: *const u8, count: usize) {
+    unsafe { core::arch::asm!("rep outsw", in("dx") port, inout("rsi") src => _, inout("rcx") count => _, options(nostack, preserves_flags, readonly)) }
+}
 
 const CHANNELS: [(u16, u16); 2] = [(0x1f0, 0x3f6), (0x170, 0x376)];
 
@@ -28,6 +38,7 @@ impl IdeDisk {
 
     fn wait_ready(&self, ms: u64) -> bool {
         let start = uptime_ms();
+        let mut backoff = crate::time::Backoff::new();
         loop {
             let s = self.status();
             if s & 0x80 == 0 {
@@ -36,11 +47,13 @@ impl IdeDisk {
             if uptime_ms() - start > ms {
                 return false;
             }
+            backoff.wait();
         }
     }
 
     fn wait_drq(&self) -> bool {
         let start = uptime_ms();
+        let mut backoff = crate::time::Backoff::new();
         loop {
             let s = self.status();
             if s & 0x01 != 0 {
@@ -52,6 +65,7 @@ impl IdeDisk {
             if uptime_ms() - start > 2000 {
                 return false;
             }
+            backoff.wait();
         }
     }
 
@@ -143,11 +157,9 @@ impl fat32::BlockDevice for IdeDisk {
                     return Err(());
                 }
                 let off = (done + s) * 512;
-                for i in 0..256 {
-                    let v = unsafe { inw(self.io) };
-                    buf[off + i * 2] = v as u8;
-                    buf[off + i * 2 + 1] = (v >> 8) as u8;
-                }
+                // One string instruction per sector: the hypervisor handles
+                // it in a single exit instead of 256.
+                unsafe { insw(self.io, buf[off..off + 512].as_mut_ptr(), 256) };
             }
             done += n;
         }
@@ -165,10 +177,7 @@ impl fat32::BlockDevice for IdeDisk {
                     return Err(());
                 }
                 let off = (done + s) * 512;
-                for i in 0..256 {
-                    let v = buf[off + i * 2] as u16 | (buf[off + i * 2 + 1] as u16) << 8;
-                    unsafe { outw(self.io, v) };
-                }
+                unsafe { outsw(self.io, buf[off..off + 512].as_ptr(), 256) };
             }
             done += n;
             if !self.wait_ready(2000) {

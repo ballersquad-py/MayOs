@@ -104,6 +104,14 @@ VirtualBox, add an empty disk (*Storage → SATA controller → Add hard disk
 → Create*, VDI, 1 GB or more), boot, and click **Set up for MayOS** in
 Settings → Storage (or run `setupdisk sata0` in the terminal).
 
+**If it is slow or the sound stutters**: run `perf` in the terminal. A
+"device access" time above ~8 µs means VirtualBox is running on top of
+Hyper-V (a green turtle in its status bar), which makes every virtual
+device many times slower. Turn off Hyper-V, Virtual Machine Platform,
+Windows Hypervisor Platform and Core isolation → Memory integrity (or run
+`bcdedit /set hypervisorlaunchtype off` as administrator) and restart
+Windows. Set *Audio → Host Audio Driver* to *Windows Audio Session*.
+
 **Updating MayOS**: the system always starts from the ISO; the disk only
 holds your files and settings. To update, shut MayOS down, put the new
 `mayos.iso` in the VM's optical drive (*Settings → Storage*, click the

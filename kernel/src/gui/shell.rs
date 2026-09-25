@@ -41,6 +41,7 @@ const HELP: &[(&str, &str)] = &[
     ("wc <file>", "count lines, words and bytes"),
     ("hexdump <file>", "show file bytes in hex"),
     ("df", "disk usage"),
+    ("perf", "speed of this machine, frame rate, sound glitches"),
     ("free", "memory usage"),
     ("ps", "list threads and processes"),
     ("kill <pid>", "stop a process"),
@@ -450,6 +451,26 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             Some(Err(e)) => err(out, format!("hexdump: {}", e)),
             None => err(out, "usage: hexdump <file>"),
         },
+        "perf" => {
+            let io = crate::time::io_cost_ns();
+            let _ = writeln!(out, "Device access:   {}.{} us per register access", io / 1000, io / 100 % 10);
+            if io > 8000 {
+                let _ = writeln!(out, "  That is very slow: VirtualBox is probably running on top of Hyper-V");
+                let _ = writeln!(out, "  (a green turtle in its status bar). See Getting Started > Speed.");
+            } else {
+                let _ = writeln!(out, "  (fine: under ~3 us is normal for a virtual machine)");
+            }
+            let _ = writeln!(
+                out,
+                "Desktop loop:    {} runs/s, {:.1} ms each",
+                super::FPS.load(core::sync::atomic::Ordering::Relaxed),
+                super::FRAME_US.load(core::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+            );
+            let (starved, underruns, gap) = crate::audio::glitch_stats();
+            let _ = writeln!(out, "Sound:           {} underruns, {} short feeds, longest audio-thread wait {} ms", underruns, starved, gap);
+            let (used, total) = crate::mem::heap::stats();
+            let _ = writeln!(out, "Kernel memory:   {} MB used of {} MB", used >> 20, total >> 20);
+        }
         "df" => match fs::stats() {
             Ok(s) => {
                 let used = s.total_bytes() - s.free_bytes();

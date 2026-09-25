@@ -74,6 +74,23 @@ Keeping settings and files between restarts
   then Settings > Storage > "Set up for MayOS" (or `setupdisk sata0` in
   the Terminal). After that everything you change is saved on that disk.
 
+Speed (if MayOS or its sound is choppy in VirtualBox)
+  Type `perf` in the Terminal. If "Device access" is above about 8 us,
+  VirtualBox is running on top of Windows' Hyper-V ("turtle mode": a
+  green turtle icon at the bottom right of the VM window). Every piece of
+  virtual hardware is then many times slower, and sound stutters. To fix
+  it on Windows (then restart the PC):
+    - Windows Features: untick "Hyper-V", "Virtual Machine Platform" and
+      "Windows Hypervisor Platform".
+    - Windows Security > Device security > Core isolation: turn
+      "Memory integrity" off.
+    - Or run in an administrator Command Prompt:
+        bcdedit /set hypervisorlaunchtype off
+  (WSL 2 and some anti-cheat software need Hyper-V; turn it back on with
+  bcdedit /set hypervisorlaunchtype auto.)
+  Also in the VM's settings: Audio > Host Audio Driver "Windows Audio
+  Session" and Audio Controller "ICH AC97".
+
 Updating MayOS
   MayOS always starts from the ISO file; your disk only keeps your files
   and settings. To update: shut down, then in VirtualBox go to Settings >

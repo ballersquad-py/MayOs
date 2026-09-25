@@ -60,11 +60,12 @@ fn w(addr: usize, v: u32) {
 
 fn wait_clear(addr: usize, mask: u32, ms: u64) -> bool {
     let start = uptime_ms();
+    let mut backoff = crate::time::Backoff::new();
     while r(addr) & mask != 0 {
         if uptime_ms() - start > ms {
             return false;
         }
-        core::hint::spin_loop();
+        backoff.wait();
     }
     true
 }
@@ -202,6 +203,7 @@ impl AhciDisk {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         w(port + P_CI, 1);
         let start = uptime_ms();
+        let mut backoff = crate::time::Backoff::new();
         loop {
             if r(port + P_CI) & 1 == 0 {
                 break;
@@ -209,7 +211,7 @@ impl AhciDisk {
             if r(port + P_IS) & (1 << 30) != 0 || uptime_ms() - start > 5000 {
                 return false;
             }
-            core::hint::spin_loop();
+            backoff.wait();
         }
         r(port + P_TFD) & 1 == 0
     }

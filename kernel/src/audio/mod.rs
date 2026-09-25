@@ -110,12 +110,18 @@ pub static FRAMES_MIXED: AtomicU64 = AtomicU64::new(0);
 pub static STARVED: AtomicU64 = AtomicU64::new(0);
 /// Times the sound card ran out of mixed buffers (audio glitches).
 pub static UNDERRUNS: AtomicU64 = AtomicU64::new(0);
-/// Longest gap between two runs of the audio thread (ms).
+/// Longest gap between two runs of the audio thread (ms) since boot.
 pub static MAX_GAP_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Buffers mixed ahead of the hardware (8 x 21 ms): enough to ride out
-/// a busy moment without the card replaying stale audio.
-const AHEAD: u8 = 8;
+/// (starved, underruns, longest audio-thread gap in ms) since boot.
+pub fn glitch_stats() -> (u64, u64, u64) {
+    (STARVED.load(Ordering::Relaxed), UNDERRUNS.load(Ordering::Relaxed), MAX_GAP_MS.load(Ordering::Relaxed))
+}
+
+/// Buffers mixed ahead of the hardware (16 x 21 ms). VirtualBox's AC'97
+/// prefetches well ahead of what it plays; with a short queue it keeps
+/// hitting the end, stopping and restarting, which you hear as dropouts.
+const AHEAD: u8 = 16;
 
 pub fn init(dev: Ac97, name: &str) {
     DEVICE_NAME.set(String::from(name));
@@ -242,6 +248,7 @@ fn fill(m: &mut Mixer, buf: usize) {
 extern "C" fn audio_thread(_: usize) {
     let mut last = crate::time::uptime_ms();
     let mut last_report = last;
+    let mut reported_underruns = 0;
     loop {
         let now = crate::time::uptime_ms();
         let gap = now - last;
@@ -249,11 +256,13 @@ extern "C" fn audio_thread(_: usize) {
         if gap > MAX_GAP_MS.load(Ordering::Relaxed) {
             MAX_GAP_MS.store(gap, Ordering::Relaxed);
         }
+        // Report glitches (only when new ones happened).
         if now - last_report >= 5000 {
             last_report = now;
-            let (st, un, mg) = (STARVED.load(Ordering::Relaxed), UNDERRUNS.load(Ordering::Relaxed), MAX_GAP_MS.swap(0, Ordering::Relaxed));
-            if st + un > 0 || mg > 40 {
-                crate::kprintln!("audio: {} starved, {} underruns, longest gap {} ms", st, un, mg);
+            let un = UNDERRUNS.load(Ordering::Relaxed);
+            if un != reported_underruns {
+                reported_underruns = un;
+                crate::kprintln!("audio: {} underruns so far, longest audio-thread gap {} ms", un, MAX_GAP_MS.load(Ordering::Relaxed));
             }
         }
         {

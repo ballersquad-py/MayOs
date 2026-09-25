@@ -111,7 +111,9 @@ impl Ac97 {
     pub fn kick(&mut self) {
         unsafe {
             let sr = inw(self.nabm + PO_SR);
-            outw(self.nabm + PO_SR, 0x1c); // clear LVBCI, BCIS, FIFOE
+            if sr & 0x1c != 0 {
+                outw(self.nabm + PO_SR, sr & 0x1c); // clear LVBCI, BCIS, FIFOE
+            }
             if !self.running || sr & 1 != 0 {
                 outb(self.nabm + PO_CR, 0x1);
                 self.running = true;

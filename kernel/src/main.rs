@@ -105,6 +105,8 @@ fn init_devices() {
     pci::scan();
     let devices = pci::devices();
     kprintln!("pci: {} devices", devices.len());
+    let io = time::measure_io_cost();
+    kprintln!("cpu: device access costs {}.{} us{}", io / 1000, io / 100 % 10, if io > 8000 { " (slow virtualisation)" } else { "" });
     if let Some(d) = devices.iter().find(|d| d.vendor == 0x80ee && d.device == 0xcafe) {
         drivers::vmmdev::init(d);
     }

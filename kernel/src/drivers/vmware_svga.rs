@@ -58,6 +58,8 @@ pub struct VmwareSvga {
     pitch: usize,
     offset: usize,
     stalled: bool,
+    /// UPDATE commands queued since the last nudge.
+    pending: bool,
 }
 
 unsafe impl Send for VmwareSvga {}
@@ -97,6 +99,7 @@ impl VmwareSvga {
             pitch: 0,
             offset: 0,
             stalled: false,
+            pending: false,
         };
         dev.write(REG_ID, SVGA_ID_2);
         if dev.read(REG_ID) != SVGA_ID_2 {
@@ -208,12 +211,14 @@ impl VmwareSvga {
     /// Ask the device to process the FIFO; wait at most `ms` for it.
     fn sync(&mut self, ms: u64) -> bool {
         self.write(REG_SYNC, 1);
+        self.pending = false;
         let start = uptime_ms();
+        let mut backoff = crate::time::Backoff::new();
         while self.read(REG_BUSY) != 0 {
             if uptime_ms() - start > ms {
                 return false;
             }
-            core::hint::spin_loop();
+            backoff.wait();
         }
         true
     }
@@ -246,10 +251,15 @@ impl VmwareSvga {
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { self.fifo.add(FIFO_NEXT_CMD).write_volatile(next) };
+        self.pending = true;
     }
 
-    /// Tell the device new commands are waiting (without blocking).
+    /// Tell the device new commands are waiting (without blocking). Only
+    /// when there are some: each nudge wakes the host's graphics thread.
     pub fn kick(&mut self) {
-        self.write(REG_SYNC, 1);
+        if self.pending {
+            self.pending = false;
+            self.write(REG_SYNC, 1);
+        }
     }
 }

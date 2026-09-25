@@ -198,7 +198,8 @@ impl Reader {
         if self.pos >= self.buf_start && self.pos + need as u64 <= have_end {
             return Ok(());
         }
-        let n = need.max(32 * 1024);
+        // Big chunks: every disk command is a trip to the hypervisor.
+        let n = need.max(128 * 1024);
         let avail = src.len().saturating_sub(self.pos) as usize;
         let n = n.min(avail);
         if n < need {
