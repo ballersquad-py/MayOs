@@ -1,5 +1,5 @@
 //! The network stack: one Ethernet interface with ARP, IPv4, ICMP, UDP,
-//! a DHCP client and a DNS resolver. Packet formats live in `libs/net`.
+//! TCP, a DHCP client and a DNS resolver. Packet formats live in `libs/net`.
 //!
 //! A kernel thread polls the NIC every couple of milliseconds and runs the
 //! DHCP state machine; other threads call `ping`, `resolve` etc., which
@@ -11,6 +11,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use net::{dhcp, dns, Arp, EthFrame, Icmp, Ipv4, Ipv4Packet, Mac, Udp};
+
+pub mod httpd;
+pub mod tcp;
 
 use crate::drivers::e1000::E1000;
 use crate::proc::sched;
@@ -68,6 +71,7 @@ struct Iface {
     ip_id: u16,
     echo_replies: VecDeque<(Ipv4, u16, u16, u64)>,
     udp: BTreeMap<u16, VecDeque<(Ipv4, u16, Vec<u8>)>>,
+    tcp: net::tcp::Stack,
     stats: [u64; 4],
 }
 
@@ -102,6 +106,7 @@ pub fn init(nic: E1000) {
         ip_id: seed as u16,
         echo_replies: VecDeque::new(),
         udp: BTreeMap::new(),
+        tcp: net::tcp::Stack::new(seed),
         stats: [0; 4],
     });
     sched::spawn_kernel("network", net_thread, 0);
@@ -115,6 +120,7 @@ extern "C" fn net_thread(_: usize) {
                 i.poll();
                 i.dhcp_tick();
                 i.retry_pending();
+                i.tcp_flush();
             }
         }
         sched::sleep_ms(2);
@@ -204,7 +210,18 @@ impl Iface {
                     q.push_back((p.src, u.src_port, u.payload.to_vec()));
                 }
             }
+            net::PROTO_TCP if !self.ip.is_unspecified() && p.dst == self.ip => {
+                self.tcp.input(p.src, p.dst, p.payload, uptime_ms());
+            }
             _ => {}
+        }
+    }
+
+    /// Run TCP timers and transmit its queued segments.
+    fn tcp_flush(&mut self) {
+        self.tcp.poll(uptime_ms());
+        for (_, dst, seg) in core::mem::take(&mut self.tcp.out) {
+            self.send_ip(dst, net::PROTO_TCP, &seg);
         }
     }
 
@@ -232,7 +249,7 @@ impl Iface {
             self.send_frame(&f);
             return;
         }
-        if self.pending.len() < 32 {
+        if self.pending.len() < 256 {
             self.pending.push(Pending { next_hop: hop, packet, since: uptime_ms() });
         }
         self.arp_request(hop);
@@ -412,6 +429,9 @@ pub enum NetError {
     Timeout,
     NameNotFound,
     BadName,
+    Refused,
+    Reset,
+    AddressInUse,
 }
 
 impl core::fmt::Display for NetError {
@@ -422,6 +442,9 @@ impl core::fmt::Display for NetError {
             NetError::Timeout => "request timed out",
             NetError::NameNotFound => "host name not found",
             NetError::BadName => "invalid host name",
+            NetError::Refused => "connection refused",
+            NetError::Reset => "connection reset by peer",
+            NetError::AddressInUse => "port already in use",
         })
     }
 }

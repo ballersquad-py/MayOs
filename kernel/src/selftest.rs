@@ -177,10 +177,47 @@ fn network_works() -> TestResult {
     crate::kprintln!("selftest: ping {} = {} us", st.gateway, rtt);
     // DNS depends on the host having internet access; report but don't fail.
     match crate::network::resolve("example.com") {
-        Ok(ip) => crate::kprintln!("selftest: example.com -> {}", ip),
+        Ok(ip) => {
+            crate::kprintln!("selftest: example.com -> {}", ip);
+            // TCP: fetch a page (again only reported, it needs the internet).
+            match http_get(ip, "example.com") {
+                Ok(line) => crate::kprintln!("selftest: tcp http://example.com/ -> {}", line),
+                Err(e) => crate::kprintln!("selftest: (TCP to example.com failed: {})", e),
+            }
+        }
         Err(e) => crate::kprintln!("selftest: (DNS lookup not available here: {})", e),
     }
+    // The file-sharing server comes up with the network.
+    let start = crate::time::uptime_ms();
+    while !crate::network::httpd::is_running() && crate::time::uptime_ms() - start < 5000 {
+        crate::proc::sched::sleep_ms(20);
+    }
+    ensure!(crate::network::httpd::is_running(), "file sharing server did not start");
     Ok(())
+}
+
+/// First line of the reply to `GET /`.
+fn http_get(ip: net::Ipv4, host: &str) -> Result<String, String> {
+    use crate::network::tcp::TcpStream;
+    let mut c = TcpStream::connect(ip, 80, 5000).map_err(|e| e.to_string())?;
+    let peer = c.peer().ok_or("no peer")?;
+    ensure!(peer == (ip, 80), "connected to the wrong peer");
+    let req = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", host);
+    c.write_all(req.as_bytes(), 5000).map_err(|e| e.to_string())?;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        match c.read(&mut buf, 5000) {
+            Ok(0) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(e) if reply.is_empty() => return Err(e.to_string()),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&reply);
+    let first = text.lines().next().unwrap_or("").to_string();
+    ensure!(first.starts_with("HTTP/1."), "not an HTTP reply");
+    Ok(format!("{} ({} bytes)", first, reply.len()))
 }
 
 fn audio_works() -> TestResult {

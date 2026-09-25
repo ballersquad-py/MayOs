@@ -64,6 +64,7 @@ enum Toggle {
     ShowSeconds,
     Dhcp,
     DockAutohide,
+    FileSharing,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,6 +109,7 @@ fn toggle_value(s: &Settings, t: Toggle) -> bool {
         Toggle::ShowSeconds => s.show_seconds,
         Toggle::Dhcp => s.dhcp,
         Toggle::DockAutohide => s.dock_autohide,
+        Toggle::FileSharing => s.file_sharing,
     }
 }
 
@@ -121,6 +123,7 @@ fn set_toggle(s: &mut Settings, t: Toggle, v: bool) {
         Toggle::ShowSeconds => s.show_seconds = v,
         Toggle::Dhcp => s.dhcp = v,
         Toggle::DockAutohide => s.dock_autohide = v,
+        Toggle::FileSharing => s.file_sharing = v,
     }
 }
 
@@ -701,6 +704,34 @@ impl SettingsApp {
         let sub = format!("{} \u{00b7} {} Mb/s", st.adapter, st.speed_mbps);
         c.draw_text_clipped(&f.ui, x + 48, y + 46, &sub, w - 60, theme::TEXT_DIM);
         y = banner.bottom() + 16;
+
+        // File sharing (the built-in web server).
+        let sharing = self.cfg.file_sharing;
+        let addrs = if sharing { crate::network::httpd::addresses() } else { Vec::new() };
+        let card = Rect::new(x, y, w, ROW_H * (1 + addrs.len() as i32));
+        self.card(c, card);
+        let r = self.row(c, card, 0, "Share files with other computers", Some("Copy files in and out with any web browser"), addrs.is_empty());
+        self.toggle(c, r, Toggle::FileSharing);
+        for (i, a) in addrs.iter().enumerate() {
+            let (url, how) = a.split_once("  ").unwrap_or((a.as_str(), ""));
+            let label = if i == 0 { "Open in your browser" } else { "Or" };
+            let how = how.trim().trim_start_matches('(').trim_end_matches(')');
+            let r = self.row(c, card, i as i32 + 1, label, if how.is_empty() { None } else { Some(how) }, i + 1 == addrs.len());
+            self.value(c, r, url);
+        }
+        y = card.bottom() + 8;
+        if sharing {
+            let (reqs, bytes) = crate::network::httpd::stats();
+            let text = format!(
+                "VirtualBox: Settings \u{2192} Network \u{2192} Adapter 1 \u{2192} Advanced \u{2192} Port Forwarding, add a rule with host port 8080 and guest port 80. \
+                 With a bridged adapter use the IP address directly. {} requests served, {} received.",
+                reqs,
+                crate::fs::format_size(bytes)
+            );
+            y = self.note(c, x + 4, y + 10, w - 8, &text) + 8;
+        } else {
+            y += 10;
+        }
 
         // Details.
         let dns = if st.dns.is_empty() { String::from("\u{2014}") } else { st.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ") };

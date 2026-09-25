@@ -53,6 +53,7 @@ const HELP: &[(&str, &str)] = &[
     ("play <file>", "play music or a video (MP4, MOV, MKV, AVI, MP3, AAC, WAV)"),
     ("wallpaper <picture|N>", "set the desktop wallpaper"),
     ("dock [left|right|bottom] [autohide|show]", "move or hide the dock"),
+    ("share [on|off]", "copy files to/from MayOS with a web browser"),
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
     ("resolution [WxH]", "list or change the screen resolution"),
@@ -650,6 +651,39 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 let _ = writeln!(out, "dock: {}, {}, {}", ["bottom", "left", "right"][s.dock_position.min(2) as usize], ["small", "medium", "large"][s.dock_size.min(2) as usize], if s.dock_autohide { "hides automatically" } else { "always shown" });
                 let _ = writeln!(out, "usage: dock [bottom|left|right] [small|medium|large] [autohide|show]");
             }
+        }
+        "share" => {
+            match args.first().copied() {
+                Some("on") => crate::settings::update(|s| s.file_sharing = true),
+                Some("off") => crate::settings::update(|s| s.file_sharing = false),
+                Some(_) => {
+                    err(out, "usage: share [on|off]");
+                    return true;
+                }
+                None => {}
+            }
+            if !crate::network::is_present() {
+                err(out, "share: no network adapter");
+                return true;
+            }
+            if !crate::settings::get().file_sharing {
+                let _ = writeln!(out, "File sharing is off. Turn it on with: share on");
+                return true;
+            }
+            let addrs = crate::network::httpd::addresses();
+            if addrs.is_empty() {
+                let _ = writeln!(out, "File sharing is on, waiting for a network address\u{2026}");
+                return true;
+            }
+            let _ = writeln!(out, "File sharing is on. Open this in a web browser on your computer:");
+            for a in addrs {
+                let _ = writeln!(out, "  {}", a);
+            }
+            let _ = writeln!(out, "Drag files onto the page to copy them to MayOS; click a file to download it.");
+            let _ = writeln!(out, "VirtualBox: Settings > Network > Adapter 1 > Advanced > Port Forwarding,");
+            let _ = writeln!(out, "  add a rule: host port 8080, guest port 80.");
+            let (reqs, bytes) = crate::network::httpd::stats();
+            let _ = writeln!(out, "{} requests served, {} received so far.", reqs, fs::format_size(bytes));
         }
         "wallpaper" => match joined(args).as_deref() {
             Some(n) if n.parse::<usize>().is_ok() => {

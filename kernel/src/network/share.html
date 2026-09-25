@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MayOS Files</title>
+<style>
+  :root { --bg:#f3f4f8; --card:#fff; --text:#1d2330; --dim:#6b7385; --line:#e3e6ee; --accent:#2f7cf6; --danger:#e5484d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --card:#1f232b; --text:#e8eaf0; --dim:#9aa2b3; --line:#2d323d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:18px 24px; background:linear-gradient(135deg,#3b2a78,#2f7cf6); color:#fff; }
+  header .logo { width:34px; height:34px; border-radius:10px; background:rgba(255,255,255,.2); display:grid; place-items:center; font-weight:700; }
+  header h1 { font-size:19px; margin:0; font-weight:650; }
+  header .free { margin-left:auto; font-size:13px; opacity:.85; }
+  main { max-width:980px; margin:22px auto; padding:0 16px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .crumbs { flex:1; min-width:200px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:8px 12px; }
+  .crumbs a { color:var(--dim); text-decoration:none; cursor:pointer; }
+  .crumbs a:last-child { color:var(--text); font-weight:600; }
+  .crumbs span { color:var(--dim); margin:0 6px; }
+  button, .btn { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:9px; padding:8px 14px; cursor:pointer; }
+  button:hover, .btn:hover { border-color:var(--accent); }
+  .primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #drop { border:2px dashed var(--line); border-radius:14px; padding:26px; text-align:center; color:var(--dim); background:var(--card); margin-bottom:14px; transition:.15s; }
+  #drop.over { border-color:var(--accent); background:rgba(47,124,246,.08); color:var(--text); }
+  #drop b { color:var(--text); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  th { text-align:left; font-size:12px; letter-spacing:.04em; color:var(--dim); font-weight:600; padding:10px 14px; border-bottom:1px solid var(--line); }
+  td { padding:9px 14px; border-bottom:1px solid var(--line); }
+  tr:last-child td { border-bottom:none; }
+  tr:hover td { background:rgba(127,127,127,.06); }
+  td.name a { color:var(--text); text-decoration:none; cursor:pointer; }
+  td.name a:hover { color:var(--accent); }
+  td.num { color:var(--dim); white-space:nowrap; }
+  td.act { text-align:right; white-space:nowrap; }
+  td.act button { padding:4px 9px; font-size:13px; }
+  .icon { display:inline-block; width:22px; }
+  #uploads { margin-bottom:14px; display:grid; gap:8px; }
+  .up { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; }
+  .up .row { display:flex; justify-content:space-between; font-size:14px; }
+  .up .track { height:6px; border-radius:3px; background:var(--line); margin-top:7px; overflow:hidden; }
+  .up .fill { height:100%; width:0; background:var(--accent); transition:width .1s; }
+  .up.done .fill { background:#30a46c; }
+  .up.err .fill { background:var(--danger); }
+  .empty { text-align:center; color:var(--dim); padding:28px; }
+  .danger { color:var(--danger); }
+  footer { text-align:center; color:var(--dim); font-size:13px; margin:26px 0; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">M</div>
+  <h1>MayOS Files</h1>
+  <div class="free" id="free"></div>
+</header>
+<main>
+  <div class="bar">
+    <div class="crumbs" id="crumbs"></div>
+    <button onclick="newFolder()">New folder</button>
+    <label class="btn primary">Upload files<input type="file" id="picker" multiple hidden></label>
+  </div>
+  <div id="drop"><b>Drop files here</b> to copy them into this folder on MayOS</div>
+  <div id="uploads"></div>
+  <table>
+    <thead><tr><th>NAME</th><th>SIZE</th><th>MODIFIED</th><th></th></tr></thead>
+    <tbody id="list"></tbody>
+  </table>
+  <footer>Files go straight to the MayOS disk. Click a file to open it here, or &#8595; to download it.</footer>
+</main>
+<script>
+let cwd = new URLSearchParams(location.hash.slice(1)).get('p') || '/';
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const join = (d, n) => d === '/' ? '/' + n : d + '/' + n;
+const enc = p => p.split('/').map(encodeURIComponent).join('/');
+function size(n) {
+  if (n < 1024) return n + ' B';
+  const u = ['KB','MB','GB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < 2);
+  return n.toFixed(1) + ' ' + u[i];
+}
+function icon(e) {
+  if (e.dir) return '📁';
+  const x = e.name.split('.').pop().toLowerCase();
+  if (['png','jpg','jpeg','gif','bmp','webp'].includes(x)) return '🖼️';
+  if (['mp4','m4v','mov','mkv','webm','avi'].includes(x)) return '🎬';
+  if (['mp3','m4a','aac','wav'].includes(x)) return '🎵';
+  if (['txt','md','log','json','html','css','js'].includes(x)) return '📄';
+  return '📦';
+}
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json().catch(() => ({ ok:false, error:'bad reply' }));
+  if (!j.ok) throw new Error(j.error || 'failed');
+  return j;
+}
+async function load(path) {
+  cwd = path;
+  history.replaceState(null, '', '#p=' + encodeURIComponent(path));
+  let j;
+  try { j = await api('/api/list?path=' + encodeURIComponent(path)); }
+  catch (e) { if (path !== '/') return load('/'); $('list').innerHTML = `<tr><td colspan=4 class="empty">${esc(e.message)}</td></tr>`; return; }
+  if (j.free !== undefined) $('free').textContent = size(j.free) + ' free';
+  const parts = path.split('/').filter(Boolean);
+  let acc = '', html = `<a data-p="/">MayOS Disk</a>`;
+  for (const p of parts) { acc += '/' + p; html += `<span>›</span><a data-p="${esc(acc)}">${esc(p)}</a>`; }
+  $('crumbs').innerHTML = html;
+  $('crumbs').querySelectorAll('a').forEach(a => a.onclick = () => load(a.dataset.p));
+  const es = j.entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+  if (!es.length) { $('list').innerHTML = '<tr><td colspan=4 class="empty">This folder is empty — drop files above</td></tr>'; return; }
+  $('list').innerHTML = es.map((e, i) => `<tr>
+    <td class="name"><span class="icon">${icon(e)}</span><a data-i="${i}">${esc(e.name)}</a></td>
+    <td class="num">${e.dir ? '—' : size(e.size)}</td>
+    <td class="num">${esc(e.modified)}</td>
+    <td class="act">${e.dir ? '' : `<button data-dl="${i}" title="Download">↓</button> `}<button data-rn="${i}" title="Rename">Rename</button> <button data-rm="${i}" class="danger" title="Delete">Delete</button></td>
+  </tr>`).join('');
+  $('list').querySelectorAll('a[data-i]').forEach(a => a.onclick = () => {
+    const e = es[a.dataset.i], p = join(cwd, e.name);
+    e.dir ? load(p) : window.open('/files' + enc(p), '_blank');
+  });
+  $('list').querySelectorAll('[data-dl]').forEach(b => b.onclick = () => {
+    location.href = '/files' + enc(join(cwd, es[b.dataset.dl].name)) + '?download=1';
+  });
+  $('list').querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
+    const e = es[b.dataset.rm];
+    if (!confirm(`Delete "${e.name}"${e.dir ? ' and everything in it' : ''}?`)) return;
+    try { await api('/api/delete?path=' + encodeURIComponent(join(cwd, e.name)), { method:'POST' }); } catch (err) { alert(err.message); }
+    load(cwd);
+  });
+  $('list').querySelectorAll('[data-rn]').forEach(b => b.onclick = async () => {
+    const e = es[b.dataset.rn];
+    const n = prompt('New name', e.name);
+    if (!n || n === e.name) return;
+    try { await api(`/api/rename?path=${encodeURIComponent(join(cwd, e.name))}&to=${encodeURIComponent(join(cwd, n))}`, { method:'POST' }); } catch (err) { alert(err.message); }
+    load(cwd);
+  });
+}
+async function newFolder() {
+  const n = prompt('Folder name');
+  if (!n) return;
+  try { await api('/api/mkdir?path=' + encodeURIComponent(join(cwd, n)), { method:'POST' }); } catch (e) { alert(e.message); }
+  load(cwd);
+}
+// Uploads run one at a time so each gets the full connection.
+const queue = []; let busy = false;
+function upload(files) {
+  for (const f of files) {
+    const el = document.createElement('div');
+    el.className = 'up';
+    el.innerHTML = `<div class="row"><span>${esc(f.name)}</span><span class="st">waiting…</span></div><div class="track"><div class="fill"></div></div>`;
+    $('uploads').prepend(el);
+    queue.push({ f, el, dir: cwd });
+  }
+  pump();
+}
+function pump() {
+  if (busy || !queue.length) return;
+  busy = true;
+  const { f, el, dir } = queue.shift();
+  const st = el.querySelector('.st'), fill = el.querySelector('.fill');
+  const x = new XMLHttpRequest();
+  const t0 = Date.now();
+  x.open('PUT', '/api/upload?path=' + encodeURIComponent(join(dir, f.name)));
+  x.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    fill.style.width = (e.loaded / e.total * 100) + '%';
+    const rate = e.loaded / Math.max(1, (Date.now() - t0) / 1000);
+    st.textContent = `${size(e.loaded)} of ${size(e.total)} · ${size(rate)}/s`;
+  };
+  const finish = (ok, msg) => {
+    el.classList.add(ok ? 'done' : 'err');
+    fill.style.width = '100%';
+    st.textContent = msg;
+    busy = false;
+    if (dir === cwd) load(cwd);
+    if (ok) setTimeout(() => el.remove(), 6000);
+    pump();
+  };
+  x.onload = () => {
+    let j = {}; try { j = JSON.parse(x.responseText); } catch (e) {}
+    j.ok ? finish(true, 'done · ' + size(f.size)) : finish(false, j.error || ('error ' + x.status));
+  };
+  x.onerror = () => finish(false, 'connection lost');
+  x.send(f);
+}
+$('picker').onchange = e => { upload(e.target.files); e.target.value = ''; };
+const drop = $('drop');
+['dragenter','dragover'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); if (t === 'drop' || !e.relatedTarget) drop.classList.remove('over'); }));
+document.addEventListener('drop', e => { if (e.dataTransfer.files.length) upload(e.dataTransfer.files); });
+load(cwd);
+</script>
+</body>
+</html>

@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod dhcp;
 pub mod dns;
+pub mod tcp;
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -84,7 +85,7 @@ impl fmt::Debug for Mac {
     }
 }
 
-fn be16(b: &[u8], o: usize) -> u16 {
+pub(crate) fn be16(b: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([b[o], b[o + 1]])
 }
 
@@ -302,7 +303,7 @@ pub struct Udp<'a> {
     pub payload: &'a [u8],
 }
 
-fn pseudo_header_sum(src: Ipv4, dst: Ipv4, proto: u8, len: usize) -> u32 {
+pub(crate) fn pseudo_header_sum(src: Ipv4, dst: Ipv4, proto: u8, len: usize) -> u32 {
     let mut sum = 0u32;
     for ip in [src, dst] {
         sum += be16(&ip.0, 0) as u32 + be16(&ip.0, 2) as u32;
