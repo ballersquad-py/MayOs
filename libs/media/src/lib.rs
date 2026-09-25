@@ -12,6 +12,12 @@
 extern crate alloc;
 
 pub mod aac;
+pub mod avi;
+pub mod demux;
+pub mod mkv;
+pub mod mp4;
+pub mod pipeline;
+pub mod rawaudio;
 pub mod bits;
 pub mod dsp;
 pub mod h264;

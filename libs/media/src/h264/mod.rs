@@ -138,6 +138,8 @@ pub struct Decoder {
     /// Waiting for a picture that can be decoded without missing references.
     need_key: bool,
     active_sps: Option<u32>,
+    /// Skip pictures with nal_ref_idc == 0 (used when playback runs late).
+    pub skip_nonref: bool,
     /// Number of slices that failed to decode (for diagnostics).
     pub errors: u32,
     pub last_error: Option<Error>,
@@ -168,6 +170,7 @@ impl Decoder {
             max_long_idx: None,
             next_id: 1,
             need_key: true,
+            skip_nonref: false,
             active_sps: None,
             errors: 0,
             last_error: None,
@@ -254,6 +257,12 @@ impl Decoder {
         }
     }
 
+    /// End the current picture (for containers with one access unit per
+    /// packet but Annex B framing).
+    pub fn flush_picture(&mut self) {
+        self.finish_picture();
+    }
+
     /// Next frame in display order, if one is ready.
     pub fn next_frame(&mut self) -> Option<Frame> {
         self.out.pop_front()
@@ -290,6 +299,9 @@ impl Decoder {
         let t = hdr & 0x1f;
         match t {
             1 | 5 => {
+                if self.skip_nonref && nal_ref_idc == 0 {
+                    return Ok(());
+                }
                 let rbsp = unescape(&nal[1..]);
                 self.slice(&rbsp, t, nal_ref_idc)
             }
