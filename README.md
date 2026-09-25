@@ -8,7 +8,8 @@ networking, browser).
 ## What works today
 
 Phase 1 (kernel, file system, desktop) is complete. From the later phases,
-networking up to `ping`/DNS, audio output and the Settings app are done.
+networking with TCP, audio, media playback (H.264/AAC/MP3) and the
+Settings app are done.
 
 - **Boot**: UEFI or legacy BIOS via the Limine bootloader, from one ISO.
 - **Kernel**: GDT/TSS/IDT, physical and virtual memory, kernel heap,
@@ -17,9 +18,13 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
 - **Drivers**: PCI, virtio block / GPU / tablet, VMware SVGA II
   (VirtualBox VMSVGA/VBoxSVGA), Bochs VBE (VirtualBox VBoxVGA, QEMU std VGA),
   PS/2 keyboard and mouse (with wheel), boot framebuffer fallback, CMOS clock, Intel e1000-family
-  network adapters, Intel AC'97 audio.
-- **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, DHCP client and DNS
+  network adapters, Intel AC'97 audio, and the VirtualBox guest device
+  (the desktop follows the window size; the mouse moves in and out freely).
+- **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP client and DNS
   resolver (`ping`, `nslookup`, `ifconfig`, `dhcp` in the terminal).
+- **File sharing**: a built-in web server. Open it in a browser on your
+  PC to drag files onto MayOS, download files, and create, rename or
+  delete them (`share` in the terminal, or Settings → Network).
 - **Audio**: a software mixer, synthesised system sounds (startup chime,
   alerts) and WAV playback (`play`, or double-click a `.wav` file).
 - **File system**: FAT32 read/write with long file names, tested against
@@ -28,9 +33,15 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
   any disk can be set up as the main MayOS disk from Settings → Storage.
 - **Pictures and video**: our own PNG (all colour types, interlaced),
   JPEG (baseline and progressive) and BMP decoders, an image viewer with
-  zoom and pan, picture wallpapers, and a video player for Motion-JPEG
-  AVI with PCM sound.
-- **Desktop**: antialiased rounded windows with soft shadows, a dock,
+  zoom and pan, and picture wallpapers. Files shows previews of pictures,
+  videos and album covers.
+- **Media player**: our own H.264 video decoder (CAVLC and CABAC, B-frames,
+  up to High profile), AAC-LC and MP3 audio decoders, and MP4 / MOV / M4A,
+  MKV / WebM, AVI, MP3, AAC and WAV containers. It has seeking, volume,
+  fullscreen, a playlist of the folder, and a music view with cover art,
+  tags and a visualiser.
+- **Desktop**: antialiased rounded windows with soft shadows, a dock
+  (bottom, left or right, three sizes, optional auto-hide),
   top bar with clock, network and volume indicators, a system menu, a
   hardware cursor on virtio-gpu, drag, resize, minimise and maximise.
 - **Animations**: windows grow in from the dock, fade and scale when
@@ -59,12 +70,15 @@ Use `mayos.iso` with any of these:
 Under *System → Motherboard*, set **Pointing Device: PS/2 Mouse**. EFI can
 be on or off. Under *Display*, keep the **VMSVGA** controller, give it
 **64 MB or more** of video memory, and leave **3D acceleration off**
-(MayOS renders in software). The resolution can then be changed in
-Settings → Display or with the `resolution` terminal command. If the
+(MayOS renders in software). The desktop resizes itself to fit the
+VirtualBox window, and the mouse moves in and out without being captured.
+The resolution can also be set in Settings → Display or with the
+`resolution` terminal command. If the
 screen stays black, pick *MayOS (safe graphics)* in the boot menu. For sound, set *Audio → Audio Controller* to **ICH AC97**.
 For internet, set *Network → Adapter 1* to **NAT** with adapter type
-**Intel PRO/1000 MT Desktop**. Start the VM, then click inside it to
-capture the mouse (the right Ctrl key releases it).
+**Intel PRO/1000 MT Desktop**. To copy files to and from MayOS, click
+*Advanced → Port Forwarding* there and add a rule with host port **8080**
+and guest port **80**.
 
 **VMware Workstation Player**: Create a VM → "I will install the operating
 system later" → *Other 64-bit*, then point the CD drive at `mayos.iso`.
@@ -74,7 +88,7 @@ build the data disk on Linux or WSL (`make disk`), then run
 ```
 qemu-system-x86_64 -M q35 -m 512M -vga none -device virtio-gpu-pci -device virtio-tablet-pci ^
   -drive file=disk.img,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0 ^
-  -netdev user,id=n0 -device e1000,netdev=n0 -audiodev dsound,id=a0 -device AC97,audiodev=a0 ^
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 -device e1000,netdev=n0 -audiodev dsound,id=a0 -device AC97,audiodev=a0 ^
   -cdrom mayos.iso
 ```
 
@@ -90,13 +104,21 @@ VirtualBox, add an empty disk (*Storage → SATA controller → Add hard disk
 → Create*, VDI, 1 GB or more), boot, and click **Set up for MayOS** in
 Settings → Storage (or run `setupdisk sata0` in the terminal).
 
-If the VirtualBox window gets bigger than your monitor after changing the
-resolution, the dock is cut off: pick a smaller resolution (a 15-second
-dialog lets you undo a change) or press Host+C for scaled mode.
+If the dock is ever out of view, move it with Settings → Personalization →
+Dock (or `dock left` in the terminal), or just resize the VirtualBox
+window: MayOS follows it.
 
 ### Your own pictures, videos and files
 
-Make a FAT32 virtual disk on Windows and attach it to the VM:
+The easiest way: with MayOS running and the port-forwarding rule above,
+open **http://localhost:8080** in your web browser on Windows. Drag files
+onto the page and they are copied into MayOS; click a file to download
+it. (With a *Bridged* network adapter, open `http://<MayOS IP address>/`
+instead; the `share` command shows it.) Combine this with a MayOS disk
+(below) to keep the files.
+
+For lots of files, you can also make a FAT32 virtual disk on Windows and
+attach it to the VM:
 
 1. *Disk Management* (Win+X) → *Action → Create VHD*, 1 GB or more,
    fixed size. Right-click the new disk → *Initialize Disk* (MBR), then
@@ -108,9 +130,12 @@ Make a FAT32 virtual disk on Windows and attach it to the VM:
    the `.vhd`. It shows up in Files (mounted at `/disk1`).
 
 Pictures can be PNG, JPEG or BMP; right-click one → *Set as Wallpaper*.
-Videos must be Motion-JPEG AVI; convert anything else with
+Videos play as MP4, MOV, M4V, MKV or AVI with H.264 video (the format
+phones, cameras and most downloads use) and AAC, MP3 or PCM sound; music
+as MP3, M4A/AAC or WAV. HEVC/H.265, VP9 and AV1 video are not supported
+yet; convert such files with
 ```
-ffmpeg -i input.mp4 -vf scale=854:-2 -c:v mjpeg -q:v 4 -c:a pcm_s16le -ar 44100 output.avi
+ffmpeg -i input.mkv -c:v libx264 -crf 20 -preset slow -c:a aac output.mp4
 ```
 
 ## Building (Linux or WSL)

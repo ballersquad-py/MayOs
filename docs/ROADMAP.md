@@ -20,10 +20,13 @@ working reliably.
 | Phase 2: animated compositor, wallpapers, accent colours, resolution switching (virtio-gpu) | Done |
 | Phase 2: in-OS TrueType rasterizer, user-space compositor, GPU (virgl) | Next |
 | Phase 3b: audio (AC'97 driver, mixer, system sounds, WAV playback) | Done |
-| Phase 3a: image decoders (PNG, JPEG, GIF, WebP) | Not started |
+| Phase 3a: image decoders (PNG, JPEG, BMP; GIF and WebP to do), thumbnails | Mostly done |
+| Phase 3c: media (H.264, AAC, MP3; MP4/MOV, MKV/WebM, AVI; player) | Done |
 | Phase 4a: e1000 driver, Ethernet, ARP, IPv4, ICMP → `ping` | Done |
 | Phase 4b: UDP, DHCP, DNS | Done |
-| Phase 4b/c: TCP, sockets API, HTTP, TLS | Next |
+| Phase 4c: TCP, kernel sockets, HTTP file-sharing server | Done |
+| Phase 4c: HTTP client, TLS | Next |
+| VirtualBox guest integration (auto-resize, mouse integration) | Done |
 | Settings app (display, personalisation, sound, network, input, time, storage) | Done |
 | Phases 5-6: HTML/CSS, JavaScript | Not started |
 

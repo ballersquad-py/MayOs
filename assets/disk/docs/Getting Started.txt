@@ -4,14 +4,19 @@ Getting started with MayOS
 Desktop
   - The bar at the top shows the focused app and the clock. Click "MayOS"
     for the system menu (About, new windows, restart, shut down).
-  - The dock at the bottom starts apps. Clicking an app that is already
-    open brings its window forward; right-click opens a new window.
+  - The dock starts apps. Clicking an app that is already open brings
+    its window forward; right-click opens a new window. Move it to the
+    left or right, change its size or let it hide itself in Settings >
+    Personalization > Dock, or with the terminal: dock left, dock
+    bottom, dock small, dock autohide, dock show.
 
 Keyboard shortcuts
   Ctrl+Alt+T   new terminal          Alt+F4    close window
   Ctrl+Alt+E   new file explorer     Alt+Tab   switch window
 
 Files
+  Pictures, videos and songs show previews. The button left of "New
+  Folder" switches between previews and a detailed list.
   Enter opens, Backspace goes up, F2 renames, Delete deletes,
   Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste, Ctrl+D duplicates,
   Ctrl+N creates a file and Ctrl+Shift+N a folder.
@@ -26,14 +31,30 @@ Pictures and videos
   "Set as Wallpaper" (also on the right-click menu in Files, and under
   Settings > Personalization > Your pictures) puts it on the desktop.
 
-  Double-click a video to play it. Space pauses, Left/Right skip 5
-  seconds, click the bar to seek. MayOS plays Motion-JPEG AVI files with
-  PCM sound. Convert anything else on your PC with ffmpeg:
+Videos and music
+  Double-click a video or song to play it. MayOS plays MP4, MOV, M4V,
+  MKV and AVI videos with H.264 picture and AAC, MP3 or PCM sound, and
+  MP3, M4A/AAC and WAV music.
+    Space or K    play/pause           F or double-click   fullscreen
+    Left/Right    back/forward 5 s     J / L               back/forward 10 s
+    Up/Down       volume               M                   mute
+    N / P         next/previous file   0-9                 jump to 0%-90%
+    Esc           leave fullscreen
+  Videos in other formats (HEVC, VP9, AV1) can be converted on your PC:
+    ffmpeg -i input.mkv -c:v libx264 -crf 20 -c:a aac output.mp4
 
-    ffmpeg -i input.mp4 -vf scale=854:-2 -c:v mjpeg -q:v 4
-           -c:a pcm_s16le -ar 44100 output.avi
+Copying files between your PC and MayOS (easiest)
+  MayOS has a built-in file-sharing web page.
+  1. VirtualBox: Settings > Network > Adapter 1 (NAT, Intel PRO/1000 MT
+     Desktop) > Advanced > Port Forwarding > add a rule:
+     Host Port 8080, Guest Port 80 (leave the IP fields empty).
+  2. With MayOS running, open http://localhost:8080 in your web browser.
+  3. Drag files onto the page to copy them into MayOS, or click a file
+     to download it. You can also make folders, rename and delete.
+  The terminal command `share` shows the address and `share off` turns
+  it off (also in Settings > Network & Internet).
 
-Bringing your own files (VirtualBox on Windows)
+Bringing lots of files at once (a disk made on Windows)
   1. On Windows, open Disk Management (Win+X > Disk Management).
      Action > Create VHD: pick a file, e.g. C:\MayOS\files.vhd, size
      1 GB or more, "Fixed size", VHD. Right-click the new disk >
@@ -53,7 +74,8 @@ Keeping settings and files between restarts
   then Settings > Storage > "Set up for MayOS" (or `setupdisk sata0` in
   the Terminal). After that everything you change is saved on that disk.
 
-Changing resolution in VirtualBox
-  If the VirtualBox window becomes bigger than your screen, the dock at
-  the bottom is cut off. Pick a resolution smaller than your monitor, or
-  press Host+C (right Ctrl+C) for Scaled Mode so the whole desktop fits.
+Screen size in VirtualBox
+  MayOS follows the size of the VirtualBox window: resize or maximise the
+  window and the desktop fits itself to it. The mouse moves in and out of
+  the window freely. You can still pick a resolution in Settings >
+  Display; if the dock is ever out of view, move it (see Desktop above).
