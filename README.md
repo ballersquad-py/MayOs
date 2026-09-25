@@ -23,8 +23,13 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
 - **Audio**: a software mixer, synthesised system sounds (startup chime,
   alerts) and WAV playback (`play`, or double-click a `.wav` file).
 - **File system**: FAT32 read/write with long file names, tested against
-  `mkfs.fat`, `fsck.fat` and mtools. Uses the virtio disk (persistent)
-  when present, otherwise a RAM disk built into the ISO.
+  `mkfs.fat`, `fsck.fat` and mtools, on virtio, SATA (AHCI) and IDE disks
+  with MBR or GPT partitions. Extra disks mount as `/disk1`, `/disk2`, …;
+  any disk can be set up as the main MayOS disk from Settings → Storage.
+- **Pictures and video**: our own PNG (all colour types, interlaced),
+  JPEG (baseline and progressive) and BMP decoders, an image viewer with
+  zoom and pan, picture wallpapers, and a video player for Motion-JPEG
+  AVI with PCM sound.
 - **Desktop**: antialiased rounded windows with soft shadows, a dock,
   top bar with clock, network and volume indicators, a system menu, a
   hardware cursor on virtio-gpu, drag, resize, minimise and maximise.
@@ -32,7 +37,7 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
   opening and closing, fly into the dock when minimised and glide when
   maximised; dock icons bounce on launch; menus, toggles and settings pages
   animate; the desktop fades in at boot. Can be turned off in Settings.
-- **Settings app**: resolution (virtio-gpu, VMware SVGA, Bochs VBE), six wallpapers, eight accent
+- **Settings app**: resolution (virtio-gpu, VMware SVGA, Bochs VBE), six wallpapers or your own pictures, eight accent
   colours, animations; volume, mute, system sounds, test sound; network
   status, DHCP or static IP, ping and DNS tests; pointer speed,
   double-click speed, natural scrolling, key repeat; 12/24-hour clock,
@@ -79,8 +84,34 @@ must be PS/2 or emulated by the firmware ("USB legacy support"); native
 USB drivers are future work. Hyper-V is not supported (it has no PS/2
 devices).
 
-Without a virtio disk, files live in a RAM disk: every change works but is
-lost at power off.
+Without a disk set up for MayOS, files live in a RAM disk: every change
+works but is lost at power off. To keep settings and files in
+VirtualBox, add an empty disk (*Storage → SATA controller → Add hard disk
+→ Create*, VDI, 1 GB or more), boot, and click **Set up for MayOS** in
+Settings → Storage (or run `setupdisk sata0` in the terminal).
+
+If the VirtualBox window gets bigger than your monitor after changing the
+resolution, the dock is cut off: pick a smaller resolution (a 15-second
+dialog lets you undo a change) or press Host+C for scaled mode.
+
+### Your own pictures, videos and files
+
+Make a FAT32 virtual disk on Windows and attach it to the VM:
+
+1. *Disk Management* (Win+X) → *Action → Create VHD*, 1 GB or more,
+   fixed size. Right-click the new disk → *Initialize Disk* (MBR), then
+   *New Simple Volume* formatted as **FAT32**.
+2. Copy files onto the new drive. A `pictures` folder is picked up by
+   Settings → Personalization automatically.
+3. Right-click the disk → *Detach VHD*.
+4. VirtualBox: *Storage → SATA controller → Add hard disk → Add*, choose
+   the `.vhd`. It shows up in Files (mounted at `/disk1`).
+
+Pictures can be PNG, JPEG or BMP; right-click one → *Set as Wallpaper*.
+Videos must be Motion-JPEG AVI; convert anything else with
+```
+ffmpeg -i input.mp4 -vf scale=854:-2 -c:v mjpeg -q:v 4 -c:a pcm_s16le -ar 44100 output.avi
+```
 
 ## Building (Linux or WSL)
 
@@ -104,6 +135,7 @@ kernel/      kernel: boot, memory, scheduler, syscalls, drivers, network,
 libs/fat32   FAT32 driver (no_std, host-tested)
 libs/net     Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS encoding (no_std, host-tested)
 libs/gfx     2D graphics: AA shapes, shadows, text, icons (no_std, host-tested)
+libs/image   PNG/JPEG/BMP decoders and AVI parser (no_std, tested against Pillow)
 userspace/   mstd (user standard library) and programs in src/bin
 tools/       disk builder, font baker, self-test runner
 assets/      fonts and the starter files copied onto the disk

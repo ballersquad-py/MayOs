@@ -13,6 +13,7 @@ bench = false
 fat32 = { path = "../libs/fat32" }
 gfx = { path = "../libs/gfx" }
 net = { path = "../libs/net" }
+image = { path = "../libs/image" }
 
 [profile.dev]
 panic = "abort"

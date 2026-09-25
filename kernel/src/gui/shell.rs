@@ -50,11 +50,14 @@ const HELP: &[(&str, &str)] = &[
     ("ping <host> [count]", "send ICMP echo requests"),
     ("nslookup <name>", "resolve a host name with DNS"),
     ("dhcp", "request a new IP address"),
-    ("play <file.wav>", "play a WAV file"),
+    ("play <file>", "play a WAV sound or an AVI video"),
+    ("wallpaper <picture|N>", "set the desktop wallpaper"),
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
     ("resolution [WxH]", "list or change the screen resolution"),
     ("fps", "desktop frame rate and frame time"),
+    ("disks", "list disks and where they are mounted"),
+    ("setupdisk <disk>", "make a disk MayOS's main disk (see 'disks')"),
     ("dmesg", "kernel log"),
     ("uname", "system name"),
     ("history", "previous commands"),
@@ -573,6 +576,7 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             None => err(out, "usage: nslookup <name>"),
         },
         "play" => match args.first() {
+            Some(p) if super::video::is_video_name(p) => ctx.open(Box::new(super::video::VideoPlayer::open(&abs(p)))),
             Some(p) => match fs::read_file(&abs(p)) {
                 Ok(data) => match crate::audio::wav::decode(&data) {
                     Ok((info, samples)) => {
@@ -620,6 +624,76 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         },
         "settings" => ctx.open(super::settings_app::boxed()),
+        "wallpaper" => match args.first() {
+            Some(n) if n.parse::<usize>().is_ok() => {
+                let i = n.parse::<usize>().unwrap().min(super::wallpaper::WALLPAPERS.len() - 1);
+                crate::settings::update(|s| {
+                    s.wallpaper = i;
+                    s.wallpaper_image.clear();
+                });
+            }
+            Some(p) => {
+                let path = abs(p);
+                if !fs::exists(&path) {
+                    err(out, format!("wallpaper: {}: no such file", p));
+                } else if !super::imageview::is_image_name(&path) {
+                    err(out, "wallpaper: use a PNG, JPEG or BMP picture");
+                } else {
+                    crate::settings::update(|s| s.wallpaper_image = path);
+                }
+            }
+            None => {
+                let s = crate::settings::get();
+                if s.wallpaper_image.is_empty() {
+                    let _ = writeln!(out, "built-in wallpaper {} ({})", s.wallpaper, super::wallpaper::WALLPAPERS[s.wallpaper.min(super::wallpaper::WALLPAPERS.len() - 1)].name);
+                } else {
+                    let _ = writeln!(out, "{}", s.wallpaper_image);
+                }
+                let _ = writeln!(out, "usage: wallpaper <picture> | wallpaper <0-{}>", super::wallpaper::WALLPAPERS.len() - 1);
+            }
+        },
+        "disks" => {
+            let _ = writeln!(out, "{}Mounted{}", C_HEAD, C_OFF);
+            for m in fs::mounts() {
+                let _ = writeln!(
+                    out,
+                    "  {:<8} {:<12} {:>9} free of {:<9} {}",
+                    m.point,
+                    format!("\"{}\"", m.label),
+                    fs::format_size(m.stats.free_bytes()),
+                    fs::format_size(m.stats.total_bytes()),
+                    m.backend
+                );
+            }
+            let blank = crate::storage::blank_disks();
+            if !blank.is_empty() {
+                let _ = writeln!(out, "{}Not formatted (use 'setupdisk <name>'){}", C_HEAD, C_OFF);
+                for d in blank {
+                    let _ = writeln!(out, "  {:<8} {:<24} {}", d.name, d.model, fs::format_size(d.bytes));
+                }
+            }
+        }
+        "setupdisk" => match args.first() {
+            Some(name) => {
+                let target = if name.starts_with('/') {
+                    crate::storage::Target::Mounted(String::from(*name))
+                } else if crate::storage::blank_disks().iter().any(|d| d.name == *name) {
+                    crate::storage::Target::Blank(String::from(*name))
+                } else {
+                    let point = format!("/{}", name);
+                    crate::storage::Target::Mounted(point)
+                };
+                if let crate::storage::Target::Mounted(p) = &target
+                    && !fs::mounts().iter().any(|m| &m.point == p && p != "/")
+                {
+                    err(out, format!("setupdisk: no disk called {} (see 'disks')", name));
+                } else {
+                    crate::storage::start_setup(target);
+                    let _ = writeln!(out, "setting up {}; watch progress in Settings > Storage or run 'disks'", name);
+                }
+            }
+            None => err(out, "usage: setupdisk <name>  (a blank disk like sata0, or a mounted one like disk1)"),
+        },
         "fps" => {
             let fps = super::FPS.load(core::sync::atomic::Ordering::Relaxed);
             let us = super::FRAME_US.load(core::sync::atomic::Ordering::Relaxed);

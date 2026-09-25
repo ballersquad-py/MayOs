@@ -183,8 +183,10 @@ pub fn set_repeat(level: u8) {
 
 pub fn on_keyboard_irq() {
     let code = unsafe { inb(DATA) };
-    // Controller/keyboard responses, not key codes.
-    if matches!(code, 0xfa | 0xfe | 0xaa | 0xee) {
+    // Controller/keyboard responses, not key codes. (0xaa is also the
+    // self-test reply, but it is the left Shift release code too, so it must
+    // go through: a stray release of an unpressed Shift is harmless.)
+    if matches!(code, 0xfa | 0xfe | 0xee) {
         return;
     }
     let mut s = STATE.lock();

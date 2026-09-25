@@ -6,7 +6,7 @@
 //! image with `fsck.fat`.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::fs;
@@ -204,6 +204,30 @@ fn audio_works() -> TestResult {
     Ok(())
 }
 
+fn media_decodes() -> TestResult {
+    let mut pictures = 0;
+    for e in fs::read_dir("/pictures").map_err(|e| e.to_string())? {
+        if crate::gui::imageview::is_image_name(&e.name) {
+            let data = fs::read_file(&fs::join("/pictures", &e.name)).map_err(|e| e.to_string())?;
+            let t = crate::time::uptime_ms();
+            let img = image::decode(&data).map_err(|err| alloc::format!("{}: {}", e.name, err))?;
+            crate::kprintln!("selftest: {} {}x{} in {} ms", e.name, img.width, img.height, crate::time::uptime_ms() - t);
+            let _ = img.cover(1280, 800, 0xff000000);
+            pictures += 1;
+        }
+    }
+    ensure!(pictures > 0, "no sample pictures in /pictures");
+    let data = fs::read_file("/videos/Sample.avi").map_err(|e| e.to_string())?;
+    let avi = image::avi::parse(&data).map_err(|_| "Sample.avi does not parse")?;
+    ensure!(!avi.frames.is_empty() && avi.audio.is_some(), "Sample.avi has no frames or sound");
+    let t = crate::time::uptime_ms();
+    for f in avi.frames.iter().take(10) {
+        image::decode(f).map_err(|e| alloc::format!("video frame: {}", e))?;
+    }
+    crate::kprintln!("selftest: video {}x{}, {} frames, 10 decoded in {} ms", avi.width, avi.height, avi.frames.len(), crate::time::uptime_ms() - t);
+    Ok(())
+}
+
 fn desktop_is_drawing() -> TestResult {
     let start = crate::time::uptime_ms();
     while crate::gui::FRAMES.load(core::sync::atomic::Ordering::Relaxed) < 3 {
@@ -223,6 +247,7 @@ pub extern "C" fn run(_: usize) {
         ("settings_persist", settings_persist),
         ("network_works", network_works),
         ("audio_works", audio_works),
+        ("media_decodes", media_decodes),
         ("desktop_is_drawing", desktop_is_drawing),
     ];
     let mut failed = 0;

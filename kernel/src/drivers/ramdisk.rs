@@ -10,6 +10,7 @@ pub struct RamDisk {
 unsafe impl Send for RamDisk {}
 
 impl RamDisk {
+
     pub fn from_boot_module() -> Option<RamDisk> {
         let m = crate::boot::MODULES.response()?.first()?;
         if m.address.is_null() || m.size < 512 {

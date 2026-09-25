@@ -44,16 +44,26 @@ pub fn decode(b: &[u8]) -> Result<(WavInfo, Vec<i16>), &'static str> {
     if !(info.channels == 1 || info.channels == 2) || !(info.bits == 8 || info.bits == 16) || info.rate == 0 {
         return Err("unsupported WAV format (need 8/16-bit mono or stereo)");
     }
-    let bytes = (info.bits / 8) as usize;
-    let frame = bytes * info.channels as usize;
+    let out = resample_pcm(info.channels, info.rate, info.bits, data);
+    Ok((info, out))
+}
+
+/// Convert interleaved 8/16-bit PCM at any rate to 48 kHz stereo 16-bit
+/// with linear interpolation.
+pub fn resample_pcm(channels: u16, rate: u32, bits: u16, data: &[u8]) -> Vec<i16> {
+    let channels = channels.clamp(1, 2) as usize;
+    let bytes = (bits / 8).max(1) as usize;
+    let frame = bytes * channels;
     let n = data.len() / frame;
+    if n == 0 || rate == 0 {
+        return Vec::new();
+    }
     let sample = |f: usize, ch: usize| -> i32 {
-        let o = f * frame + ch.min(info.channels as usize - 1) * bytes;
+        let o = f * frame + ch.min(channels - 1) * bytes;
         if bytes == 1 { (data[o] as i32 - 128) << 8 } else { i16::from_le_bytes([data[o], data[o + 1]]) as i32 }
     };
-    // Resample to 48 kHz with linear interpolation (16.16 fixed point).
-    let step = ((info.rate as u64) << 16) / 48000;
-    let out_frames = (n as u64 * 48000 / info.rate as u64) as usize;
+    let step = ((rate as u64) << 16) / 48000;
+    let out_frames = (n as u64 * 48000 / rate as u64) as usize;
     let mut out = Vec::with_capacity(out_frames * 2);
     let mut pos: u64 = 0;
     for _ in 0..out_frames {
@@ -66,7 +76,7 @@ pub fn decode(b: &[u8]) -> Result<(WavInfo, Vec<i16>), &'static str> {
         }
         pos += step;
     }
-    Ok((info, out))
+    out
 }
 
 /// Encode 48 kHz stereo samples as a 16-bit WAV file.

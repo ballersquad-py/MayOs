@@ -131,6 +131,22 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
+    /// A directory entry that does not live on a volume (used by the VFS
+    /// to show mount points).
+    pub fn virtual_dir(name: &str) -> DirEntry {
+        DirEntry {
+            name: String::from(name),
+            is_dir: true,
+            size: 0,
+            first_cluster: 0,
+            attr: ATTR_DIRECTORY,
+            created: Timestamp::default(),
+            modified: Timestamp::default(),
+            first_slot: 0,
+            sfn_slot: 0,
+        }
+    }
+
     pub fn is_hidden(&self) -> bool {
         self.attr & ATTR_HIDDEN != 0
     }
@@ -310,27 +326,69 @@ fn names_equal(a: &str, b: &str) -> bool {
 
 const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 
+/// Find the first FAT32 partition in an MBR or GPT partition table.
+fn find_fat32_partition<D: BlockDevice>(dev: &mut D, mbr: &[u8]) -> Result<Option<u64>> {
+    if rd16(mbr, 510) != 0xaa55 {
+        return Ok(None);
+    }
+    let mut sector = [0u8; SECTOR];
+    for i in 0..4 {
+        let e = 446 + i * 16;
+        let kind = mbr[e + 4];
+        let start = rd32(mbr, e + 8) as u64;
+        match kind {
+            // FAT32 (CHS / LBA), and types Windows sometimes leaves on FAT32.
+            0x0b | 0x0c | 0x06 | 0x0e | 0x07 => {
+                dev.read(start, &mut sector).map_err(|_| FsError::Io)?;
+                if looks_like_fat32(&sector) {
+                    return Ok(Some(start));
+                }
+            }
+            0xee => {
+                // GPT: header at LBA 1, then the entry array.
+                dev.read(1, &mut sector).map_err(|_| FsError::Io)?;
+                if &sector[..8] != b"EFI PART" {
+                    return Ok(None);
+                }
+                let entries_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap());
+                let count = rd32(&sector, 80).min(256) as u64;
+                let size = rd32(&sector, 84) as u64;
+                if size < 128 || size > 512 {
+                    return Ok(None);
+                }
+                let per_sector = SECTOR as u64 / size;
+                let mut buf = [0u8; SECTOR];
+                for n in 0..count {
+                    if n % per_sector == 0 {
+                        dev.read(entries_lba + n / per_sector, &mut buf).map_err(|_| FsError::Io)?;
+                    }
+                    let o = ((n % per_sector) * size) as usize;
+                    if buf[o..o + 16].iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    let start = u64::from_le_bytes(buf[o + 32..o + 40].try_into().unwrap());
+                    dev.read(start, &mut sector).map_err(|_| FsError::Io)?;
+                    if looks_like_fat32(&sector) {
+                        return Ok(Some(start));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 impl<D: BlockDevice> FatFs<D> {
     /// Mount a FAT32 volume found either at sector 0 or in the first MBR
     /// partition of a FAT32 type.
-    pub fn mount(mut dev: D) -> Result<FatFs<D>> {
+    #[allow(clippy::type_complexity)]
+    fn read_geometry(dev: &mut D) -> Result<(u64, u32, u32, u32, u32, u32, u32, u32, u32, String)> {
         let mut bs = [0u8; SECTOR];
         dev.read(0, &mut bs).map_err(|_| FsError::Io)?;
         let mut part_lba = 0u64;
         if !looks_like_fat32(&bs) {
-            if rd16(&bs, 510) != 0xaa55 {
-                return Err(FsError::Unsupported);
-            }
-            let mut found = None;
-            for i in 0..4 {
-                let e = 446 + i * 16;
-                let kind = bs[e + 4];
-                if kind == 0x0b || kind == 0x0c {
-                    found = Some(rd32(&bs, e + 8) as u64);
-                    break;
-                }
-            }
-            part_lba = found.ok_or(FsError::Unsupported)?;
+            part_lba = find_fat32_partition(dev, &bs)?.ok_or(FsError::Unsupported)?;
             dev.read(part_lba, &mut bs).map_err(|_| FsError::Io)?;
             if !looks_like_fat32(&bs) {
                 return Err(FsError::Unsupported);
@@ -355,6 +413,21 @@ impl<D: BlockDevice> FatFs<D> {
         let label_bytes = &bs[71..82];
         let volume_label = String::from_utf8_lossy(label_bytes).trim_end().to_string();
 
+        Ok((part_lba, sectors_per_cluster, reserved_sectors, num_fats, fat_size, root_cluster, fsinfo_sector, data_start, total_clusters, volume_label))
+    }
+
+    pub fn mount(dev: D) -> Result<FatFs<D>> {
+        Self::try_mount(dev).map_err(|(e, _)| e)
+    }
+
+    /// Like `mount`, but hands the device back if it holds no usable
+    /// FAT32 volume (so the caller can, for example, format it).
+    pub fn try_mount(mut dev: D) -> core::result::Result<FatFs<D>, (FsError, D)> {
+        let geo = match Self::read_geometry(&mut dev) {
+            Ok(g) => g,
+            Err(e) => return Err((e, dev)),
+        };
+        let (part_lba, sectors_per_cluster, reserved_sectors, num_fats, fat_size, root_cluster, fsinfo_sector, data_start, total_clusters, volume_label) = geo;
         let mut fs = FatFs {
             dev,
             part_lba,
@@ -373,7 +446,9 @@ impl<D: BlockDevice> FatFs<D> {
             stamp: 0,
             clock: None,
         };
-        fs.count_free_clusters()?;
+        if let Err(e) = fs.count_free_clusters() {
+            return Err((e, fs.dev));
+        }
         Ok(fs)
     }
 
@@ -1302,4 +1377,98 @@ mod unit {
         let (d, tm) = t.to_fat();
         assert_eq!(Timestamp::from_fat(d, tm), t);
     }
+}
+
+/// Create an empty FAT32 file system spanning `total_sectors` sectors of
+/// `dev` (no partition table, like `mkfs.fat` on a whole device).
+///
+/// Cluster sizes follow Microsoft's defaults. Volumes smaller than about
+/// 33 MiB cannot hold enough clusters for FAT32 and are rejected.
+pub fn format<D: BlockDevice>(dev: &mut D, total_sectors: u64, label: &str, volume_id: u32) -> Result<()> {
+    let n = total_sectors.min(0xffff_ffff) as u32;
+    let mb = n / 2048;
+    let spc: u32 = match mb {
+        0..=260 => 1,
+        261..=8192 => 8,
+        8193..=16384 => 16,
+        16385..=32768 => 32,
+        _ => 64,
+    };
+    let reserved = 32u32;
+    let num_fats = 2u32;
+    // Microsoft's FAT size formula for FAT32.
+    let tmp1 = n.checked_sub(reserved).ok_or(FsError::NoSpace)?;
+    let tmp2 = (256 * spc + num_fats) / 2;
+    let fat_size = tmp1.div_ceil(tmp2);
+    let data_start = reserved + num_fats * fat_size;
+    let clusters = n.checked_sub(data_start).ok_or(FsError::NoSpace)? / spc;
+    if clusters < 65525 {
+        return Err(FsError::NoSpace);
+    }
+
+    let mut label11 = [b' '; 11];
+    for (i, c) in label.bytes().filter(|c| c.is_ascii_graphic() || *c == b' ').take(11).enumerate() {
+        label11[i] = c.to_ascii_uppercase();
+    }
+
+    let mut bs = [0u8; SECTOR];
+    bs[0..3].copy_from_slice(&[0xeb, 0x58, 0x90]);
+    bs[3..11].copy_from_slice(b"MAYOS   ");
+    wr16(&mut bs, 11, 512);
+    bs[13] = spc as u8;
+    wr16(&mut bs, 14, reserved as u16);
+    bs[16] = num_fats as u8;
+    bs[21] = 0xf8;
+    wr16(&mut bs, 24, 63);
+    wr16(&mut bs, 26, 255);
+    wr32(&mut bs, 32, n);
+    wr32(&mut bs, 36, fat_size);
+    wr32(&mut bs, 44, 2); // root directory cluster
+    wr16(&mut bs, 48, 1); // FSInfo sector
+    wr16(&mut bs, 50, 6); // backup boot sector
+    bs[64] = 0x80;
+    bs[66] = 0x29;
+    wr32(&mut bs, 67, volume_id);
+    bs[71..82].copy_from_slice(&label11);
+    bs[82..90].copy_from_slice(b"FAT32   ");
+    // Boot code: print nothing, just halt if someone tries to boot this.
+    bs[90..94].copy_from_slice(&[0xfa, 0xf4, 0xeb, 0xfd]);
+    wr16(&mut bs, 510, 0xaa55);
+
+    let mut info = [0u8; SECTOR];
+    wr32(&mut info, 0, 0x4161_5252);
+    wr32(&mut info, 484, 0x6141_7272);
+    wr32(&mut info, 488, clusters - 1); // cluster 2 holds the root directory
+    wr32(&mut info, 492, 3);
+    wr32(&mut info, 508, 0xaa55_0000);
+
+    let io = |r: core::result::Result<(), ()>| r.map_err(|_| FsError::Io);
+
+    // Clear the reserved area and both FATs.
+    let zeros = vec![0u8; 64 * SECTOR];
+    let mut s = 0u32;
+    while s < data_start {
+        let count = (data_start - s).min(64);
+        io(dev.write(s as u64, &zeros[..count as usize * SECTOR]))?;
+        s += count;
+    }
+    io(dev.write(0, &bs))?;
+    io(dev.write(1, &info))?;
+    io(dev.write(6, &bs))?;
+    io(dev.write(7, &info))?;
+
+    let mut fat0 = [0u8; SECTOR];
+    wr32(&mut fat0, 0, 0x0fff_fff8);
+    wr32(&mut fat0, 4, 0x0fff_ffff);
+    wr32(&mut fat0, 8, 0x0fff_ffff); // root directory: end of chain
+    for f in 0..num_fats {
+        io(dev.write((reserved + f * fat_size) as u64, &fat0))?;
+    }
+
+    // Empty root directory holding just the volume label.
+    let mut root = vec![0u8; spc as usize * SECTOR];
+    root[..11].copy_from_slice(&label11);
+    root[11] = ATTR_VOLUME_ID;
+    io(dev.write(data_start as u64, &root))?;
+    io(dev.flush())
 }

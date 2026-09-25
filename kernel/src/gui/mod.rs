@@ -10,11 +10,14 @@ pub mod dialog;
 pub mod display;
 pub mod editor;
 pub mod explorer;
+pub mod imageview;
+pub mod keep_resolution;
 pub mod settings_app;
 pub mod shell;
 pub mod terminal;
 pub mod theme;
 pub mod widgets;
+pub mod video;
 pub mod wallpaper;
 pub mod wm;
 
@@ -91,6 +94,15 @@ pub fn open_path(path: &str, ctx: &mut Ctx) -> Result<(), crate::fs::FsError> {
     if let Ok(data) = crate::fs::read_file(path) {
         let n = data.len().min(4);
         head[..n].copy_from_slice(&data[..n]);
+    }
+    let name = crate::fs::file_name(path);
+    if imageview::is_image_name(name) {
+        ctx.open(Box::new(imageview::ImageViewer::open(path)));
+        return Ok(());
+    }
+    if video::is_video_name(name) {
+        ctx.open(Box::new(video::VideoPlayer::open(path)));
+        return Ok(());
     }
     if &head == b"RIFF" && crate::fs::extension(path).as_deref() == Some("wav") {
         let data = crate::fs::read_file(path)?;

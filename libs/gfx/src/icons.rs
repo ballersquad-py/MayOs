@@ -17,6 +17,8 @@ pub enum Icon {
     Drive,
     Home,
     Settings,
+    Video,
+    Music,
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
@@ -51,6 +53,33 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
             c.fill_rounded_rect(r, s / 10, rgb(0x6b, 0x77, 0x8c));
             c.fill_rounded_rect(r.inset(1), s / 10, rgb(0x9a, 0xa5, 0xb8));
             c.fill_circle(x + s * 3 / 4, y + s / 2, (s / 16).max(1), rgb(0x4c, 0xd9, 0x64));
+        }
+        Icon::Video => {
+            let r = Rect::new(x + s / 8, y + s / 5, s * 3 / 4, s * 3 / 5);
+            c.fill_rounded_rect(r.offset(0, 1), s / 10, with_alpha(0x000000, 50));
+            c.fill_rounded_rect(r, s / 10, rgb(0x2b, 0x2f, 0x3a));
+            // Sprocket holes.
+            let hole = (s / 14).max(2);
+            let mut hx = r.x + hole;
+            while hx + hole < r.right() - hole / 2 {
+                c.fill_rect(Rect::new(hx, r.y + hole / 2 + 1, hole, hole), rgb(0xe8, 0xec, 0xf2));
+                c.fill_rect(Rect::new(hx, r.bottom() - hole * 3 / 2 - 1, hole, hole), rgb(0xe8, 0xec, 0xf2));
+                hx += hole * 2;
+            }
+            // Play triangle.
+            let (cx, cy, t) = (x + s / 2, y + s / 2, (s / 7).max(2));
+            for i in 0..t * 2 {
+                let len = if i < t { i } else { 2 * t - i };
+                c.fill_rect(Rect::new(cx - t / 2, cy - t + i, len.max(1), 1), rgb(0xff, 0x5a, 0x5f));
+            }
+        }
+        Icon::Music => {
+            page(c, x, y, s, rgb(0xfd, 0xf1, 0xf6), None);
+            let col = rgb(0xe0, 0x4f, 0x92);
+            let (cx, cy) = (x + s / 2 - s / 12, y + s * 2 / 3);
+            c.fill_circle(cx, cy, (s / 10).max(2), col);
+            c.fill_rect(Rect::new(cx + s / 12, y + s / 3, (s / 20).max(1), cy - y - s / 3), col);
+            c.fill_rect(Rect::new(cx + s / 12, y + s / 3, s / 6, (s / 14).max(1)), col);
         }
         Icon::Settings => {
             app_tile(c, x, y, s, rgb(0x9a, 0xa3, 0xb2), rgb(0x5f, 0x68, 0x78));

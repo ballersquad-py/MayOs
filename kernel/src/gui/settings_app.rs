@@ -8,6 +8,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use gfx::icons::{self, Icon};
@@ -18,6 +19,7 @@ use super::theme::{self, fonts};
 use super::wallpaper::{self, WALLPAPERS};
 use super::widgets::{button, ButtonStyle, TextInput};
 use crate::audio::{self, SystemSound};
+use crate::fs;
 use crate::input::Key;
 use crate::settings::{self, Settings};
 use crate::sync::Spin;
@@ -26,6 +28,7 @@ use crate::time::uptime_ms;
 const SIDEBAR_W: i32 = 214;
 const ROW_H: i32 = 52;
 const TOGGLE_MS: u64 = 160;
+const TAG_SETUP_DISK: u32 = 40;
 const PAGE_MS: u64 = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,6 +80,7 @@ enum Action {
     Slider(Slider),
     Resolution(u32, u32),
     Wallpaper(usize),
+    Picture(usize),
     Accent(usize),
     TzMinus,
     TzPlus,
@@ -88,6 +92,7 @@ enum Action {
     LookupName,
     Input(usize),
     ResetSettings,
+    SetupDisk(usize),
 }
 
 fn toggle_value(s: &Settings, t: Toggle) -> bool {
@@ -192,9 +197,14 @@ pub struct SettingsApp {
     message: Option<(String, bool, u64)>,
     net_test_running: bool,
     thumbs: Vec<Surface>,
+    pictures: Option<Arc<Spin<PictureScan>>>,
+    picture_thumbs: Vec<(String, Option<Surface>)>,
     last_refresh: u64,
     scroll: i32,
     bottom: core::cell::Cell<i32>,
+    /// Disks offered on the Storage page: (target, description, erases data).
+    disk_targets: Vec<(crate::storage::Target, String, bool)>,
+    pending_setup: Option<crate::storage::Target>,
 }
 
 impl SettingsApp {
@@ -221,9 +231,13 @@ impl SettingsApp {
             message: None,
             net_test_running: false,
             thumbs: Vec::new(),
+            pictures: None,
+            picture_thumbs: Vec::new(),
             last_refresh: 0,
             scroll: 0,
             bottom: core::cell::Cell::new(0),
+            disk_targets: Vec::new(),
+            pending_setup: None,
         }
     }
 
@@ -491,7 +505,7 @@ impl SettingsApp {
         for (i, wp) in WALLPAPERS.iter().enumerate() {
             let (col, rowi) = (i as i32 % cols, i as i32 / cols);
             let r = Rect::new(x + col * (tw + 16), y + rowi * (th + 34), tw, th);
-            let selected = self.cfg.wallpaper == i;
+            let selected = self.cfg.wallpaper == i && self.cfg.wallpaper_image.is_empty();
             if selected {
                 c.fill_rounded_rect(r.inset(-4), 14, theme::accent());
             } else if self.hovered(Action::Wallpaper(i)) {
@@ -504,6 +518,7 @@ impl SettingsApp {
         }
         let rows = (WALLPAPERS.len() as i32 + cols - 1) / cols;
         y += rows * (th + 34) + 18;
+        y = self.pictures_section(c, x, y, w, cols, tw, th);
         c.draw_text(&f.bold, x + 4, y, "Accent colour", theme::TEXT);
         y += 14;
         let card = Rect::new(x, y, w, 64);
@@ -531,6 +546,54 @@ impl SettingsApp {
         self.card(c, card);
         let r = self.row(c, card, 0, "Animations", Some("Window, dock and menu motion"), true);
         self.toggle(c, r, Toggle::Animations);
+    }
+
+    /// "Your pictures": every PNG/JPEG/BMP in /pictures, /home and the top
+    /// level (and /pictures folder) of other disks, as wallpaper choices.
+    fn pictures_section(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32, cols: i32, tw: i32, th: i32) -> i32 {
+        let f = fonts();
+        c.draw_text(&f.bold, x + 4, y, "Your pictures", theme::TEXT);
+        y += 14;
+        if self.pictures.is_none() {
+            self.pictures = Some(start_picture_scan());
+            self.picture_thumbs.clear();
+        }
+        let scanning = self.pictures.as_ref().map(|p| !p.lock().done).unwrap_or(false);
+        for (i, (path, thumb)) in self.picture_thumbs.iter().enumerate() {
+            let (col, rowi) = (i as i32 % cols, i as i32 / cols);
+            let r = Rect::new(x + col * (tw + 16), y + rowi * (th + 34), tw, th);
+            let selected = self.cfg.wallpaper_image == *path;
+            if selected {
+                c.fill_rounded_rect(r.inset(-4), 14, theme::accent());
+            } else if self.hovered(Action::Picture(i)) {
+                c.fill_rounded_rect(r.inset(-4), 14, with_alpha(0x000000, 30));
+            }
+            match thumb {
+                Some(t) => c.blit_scaled(t, r, 255, 10),
+                None => {
+                    c.fill_rounded_rect(r, 10, with_alpha(0x000000, 25));
+                    c.draw_text_centered(&f.ui, r, "Can't open", theme::TEXT_DIM);
+                }
+            }
+            let name = fs::file_name(path);
+            let name = if name.chars().count() > 22 { format!("{}\u{2026}", name.chars().take(21).collect::<String>()) } else { String::from(name) };
+            c.draw_text_centered(&f.ui, Rect::new(r.x, r.bottom() + 4, r.w, 20), &name, if selected { theme::TEXT } else { theme::TEXT_DIM });
+            self.hits.push((r, Action::Picture(i)));
+        }
+        let n = self.picture_thumbs.len() as i32;
+        y += (n + cols - 1) / cols * (th + 34);
+        let msg = if scanning {
+            "Looking for pictures\u{2026}"
+        } else if n == 0 {
+            "No pictures yet. Copy PNG, JPEG or BMP files into /pictures, or attach a disk with your pictures in \
+             VirtualBox (see Getting Started), then reopen this page. You can also right-click a picture in Files \
+             and choose \u{201c}Set as Wallpaper\u{201d}."
+        } else {
+            "Pictures from /pictures and other attached disks. Right-click any picture in Files to use it too."
+        };
+        let bottom = self.note(c, x + 4, y + 4, w - 8, msg);
+        self.extend(bottom + 16);
+        bottom + 18
     }
 
     fn page_sound(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
@@ -711,41 +774,78 @@ impl SettingsApp {
     fn page_storage(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
         let f = fonts();
         y = self.page_title(c, x, y, "Storage");
-        match crate::fs::stats() {
-            Ok(s) => {
-                let card = Rect::new(x, y, w, 110);
-                self.card(c, card);
-                icons::draw(c, Icon::Drive, x + 16, y + 18, 44);
-                c.draw_text(&f.bold, x + 74, y + 34, "MayOS Disk", theme::TEXT);
-                c.draw_text_clipped(&f.ui, x + 74, y + 52, crate::fs::backend(), w - 90, theme::TEXT_DIM);
-                let bar = Rect::new(x + 18, y + 70, w - 36, 12);
-                c.fill_rounded_rect(bar, 6, rgb(0xe4, 0xe7, 0xec));
-                let total = s.total_bytes().max(1);
-                let used = total - s.free_bytes();
-                let uw = ((bar.w as u64 * used / total) as i32).max(12);
-                c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 6, theme::accent());
-                let text = format!(
-                    "{} used \u{00b7} {} free \u{00b7} {} total",
-                    crate::fs::format_size(used),
-                    crate::fs::format_size(s.free_bytes()),
-                    crate::fs::format_size(total)
-                );
-                c.draw_text(&f.ui, x + 18, y + 100, &text, theme::TEXT_DIM);
-                y = card.bottom() + 18;
-                let card = Rect::new(x, y, w, ROW_H * 3);
-                self.card(c, card);
-                let r = self.row(c, card, 0, "File system", None, false);
-                self.value(c, r, &format!("FAT32 \"{}\"", crate::fs::volume_label()));
-                let r = self.row(c, card, 1, "Cluster size", None, false);
-                self.value(c, r, &format!("{} bytes", s.cluster_size));
-                let r = self.row(c, card, 2, "Settings file", None, true);
-                self.value(c, r, settings::PATH);
-                y = card.bottom() + 16;
+        self.disk_targets.clear();
+
+        // Status of a running or finished disk setup.
+        match crate::storage::setup_state() {
+            crate::storage::SetupState::Running(m) => {
+                y = self.note(c, x + 4, y + 4, w - 8, &format!("Setting up disk: {}", m)) + 8;
             }
-            Err(_) => {
-                y = self.note(c, x + 4, y + 4, w - 8, "No disk is mounted.") + 10;
+            crate::storage::SetupState::Done(m) => {
+                let r = Rect::new(x, y, w, 44);
+                c.fill_rounded_rect(r, 10, rgb(0xe3, 0xf5, 0xe8));
+                c.draw_text_clipped(&f.ui, x + 14, y + 27, &m, w - 28, rgb(0x1f, 0x6f, 0x3a));
+                y += 58;
             }
+            crate::storage::SetupState::Failed(m) => {
+                let r = Rect::new(x, y, w, 44);
+                c.fill_rounded_rect(r, 10, rgb(0xfd, 0xe7, 0xe8));
+                c.draw_text_clipped(&f.ui, x + 14, y + 27, &m, w - 28, theme::DANGER);
+                y += 58;
+            }
+            crate::storage::SetupState::Idle => {}
         }
+
+        for m in crate::fs::mounts() {
+            let card = Rect::new(x, y, w, 104);
+            self.card(c, card);
+            icons::draw(c, Icon::Drive, x + 16, y + 16, 40);
+            let title = if m.point == "/" { String::from("MayOS Disk") } else { format!("{}  \u{2014}  {}", m.point, m.label) };
+            c.draw_text(&f.bold, x + 70, y + 30, &title, theme::TEXT);
+            let sub = if m.persistent { String::from(m.backend) } else { format!("{} \u{2014} set up a disk below to keep your files", m.backend) };
+            c.draw_text_clipped(&f.ui, x + 70, y + 48, &sub, w - 250, if m.persistent { theme::TEXT_DIM } else { theme::DANGER });
+            let bar = Rect::new(x + 18, y + 66, w - 36, 10);
+            c.fill_rounded_rect(bar, 5, rgb(0xe4, 0xe7, 0xec));
+            let total = m.stats.total_bytes().max(1);
+            let used = total - m.stats.free_bytes();
+            let uw = ((bar.w as u64 * used / total) as i32).max(10);
+            c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 5, theme::accent());
+            let text = format!("{} used \u{00b7} {} free \u{00b7} {} total", crate::fs::format_size(used), crate::fs::format_size(m.stats.free_bytes()), crate::fs::format_size(total));
+            c.draw_text(&f.ui, x + 18, y + 94, &text, theme::TEXT_DIM);
+            if m.point != "/" && m.persistent && !crate::fs::root_is_persistent() {
+                let i = self.disk_targets.len();
+                self.disk_targets.push((crate::storage::Target::Mounted(m.point.clone()), format!("{} (\u{201c}{}\u{201d})", m.point, m.label), false));
+                self.action_button(c, Rect::new(card.right() - 184, y + 20, 168, 32), "Use for MayOS", ButtonStyle::Primary, Action::SetupDisk(i));
+            }
+            y = card.bottom() + 14;
+        }
+        for d in crate::storage::blank_disks() {
+            let card = Rect::new(x, y, w, 70);
+            self.card(c, card);
+            icons::draw(c, Icon::Drive, x + 16, y + 14, 40);
+            c.draw_text(&f.bold, x + 70, y + 30, &format!("{} \u{2014} {}", d.name, d.model), theme::TEXT);
+            c.draw_text(&f.ui, x + 70, y + 50, &format!("{} \u{00b7} not formatted", crate::fs::format_size(d.bytes)), theme::TEXT_DIM);
+            let i = self.disk_targets.len();
+            self.disk_targets.push((crate::storage::Target::Blank(d.name.clone()), format!("{} ({}, {})", d.name, d.model, crate::fs::format_size(d.bytes)), true));
+            self.action_button(c, Rect::new(card.right() - 184, y + 19, 168, 32), "Set up for MayOS", ButtonStyle::Primary, Action::SetupDisk(i));
+            y = card.bottom() + 14;
+        }
+        if !crate::fs::root_is_persistent() && self.disk_targets.is_empty() {
+            y = self.note(
+                c,
+                x + 4,
+                y + 4,
+                w - 8,
+                "To keep your files, add a hard disk to the virtual machine (VirtualBox: Settings > Storage > add a \
+                 hard disk to the SATA or IDE controller), start MayOS again and set it up here.",
+            ) + 8;
+        }
+        y += 6;
+        let card = Rect::new(x, y, w, ROW_H);
+        self.card(c, card);
+        let r = self.row(c, card, 0, "Settings file", None, true);
+        self.value(c, r, settings::PATH);
+        y = card.bottom() + 16;
         self.action_button(c, Rect::new(x, y, 190, 32), "Reset all settings", ButtonStyle::Danger, Action::ResetSettings);
     }
 
@@ -781,7 +881,16 @@ impl SettingsApp {
                 }
             }
             Action::Resolution(w, h) => ctx.commands.push(Command::SetResolution(w, h)),
-            Action::Wallpaper(i) => settings::update(|s| s.wallpaper = i),
+            Action::Wallpaper(i) => settings::update(|s| {
+                s.wallpaper = i;
+                s.wallpaper_image.clear();
+            }),
+            Action::Picture(i) => {
+                if let Some((p, _)) = self.picture_thumbs.get(i) {
+                    let p = p.clone();
+                    settings::update(|s| s.wallpaper_image = p);
+                }
+            }
             Action::Accent(i) => settings::update(|s| s.accent = i),
             Action::TzMinus => settings::update(|s| s.tz_offset_min = (s.tz_offset_min - 30).max(-12 * 60)),
             Action::TzPlus => settings::update(|s| s.tz_offset_min = (s.tz_offset_min + 30).min(14 * 60)),
@@ -827,6 +936,24 @@ impl SettingsApp {
                 settings::update(|s| *s = Settings::default());
                 self.cfg = settings::get();
                 self.flash(String::from("All settings were reset to their defaults"), true);
+            }
+            Action::SetupDisk(i) => {
+                if let Some((target, desc, erases)) = self.disk_targets.get(i).cloned() {
+                    self.pending_setup = Some(target);
+                    let msg = if erases {
+                        format!("Erase {} and install MayOS's files on it?", desc)
+                    } else {
+                        format!("Copy MayOS's files to {} and use it as the main disk? Existing files are kept.", desc)
+                    };
+                    ctx.open_child(Box::new(super::dialog::Dialog::confirm(
+                        "Set Up Disk",
+                        &msg,
+                        if erases { "Erase and Set Up" } else { "Set Up" },
+                        erases,
+                        TAG_SETUP_DISK,
+                        ctx.window,
+                    )));
+                }
             }
             Action::Slider(_) => {}
         }
@@ -1004,10 +1131,15 @@ impl App for SettingsApp {
                 }
                 ctx.redraw();
             }
+            AppEvent::Message(Msg::DialogResult { tag: TAG_SETUP_DISK, value }) => {
+                if let (Some(_), Some(target)) = (value, self.pending_setup.take()) {
+                    crate::storage::start_setup(target);
+                }
+                ctx.redraw();
+            }
             AppEvent::Message(Msg::ResolutionResult(ok)) => {
                 if *ok {
                     let mode = super::display_mode();
-                    settings::update(|s| s.resolution = Some(mode));
                     self.flash(format!("Resolution changed to {} \u{00d7} {}", mode.0, mode.1), true);
                 } else {
                     self.flash(String::from("That resolution is not available on this display"), false);
@@ -1021,6 +1153,26 @@ impl App for SettingsApp {
 
     fn tick(&mut self, ctx: &mut Ctx) {
         let now = uptime_ms();
+        if let Some(scan) = &self.pictures {
+            let mut sc = scan.lock();
+            if !sc.found.is_empty() {
+                for (p, img) in sc.found.drain(..) {
+                    let thumb = img.map(|img| {
+                        let mut s = Surface::new(img.width as i32, img.height as i32, 0);
+                        for (d, px) in s.data.iter_mut().zip(img.pixels.iter()) {
+                            *d = *px | 0xff00_0000;
+                        }
+                        s
+                    });
+                    self.picture_thumbs.push((p, thumb));
+                }
+                ctx.redraw();
+            }
+            if sc.done && !sc.reported {
+                sc.reported = true;
+                ctx.redraw();
+            }
+        }
         if settings::generation() != self.cfg_gen {
             self.cfg_gen = settings::generation();
             self.cfg = settings::get();
@@ -1046,7 +1198,8 @@ impl App for SettingsApp {
             ctx.redraw();
         }
         // Live pages refresh once a second.
-        if matches!(self.page, Page::Network | Page::DateTime | Page::About | Page::Storage) && now - self.last_refresh >= 1000 {
+        let refresh_ms = if matches!(crate::storage::setup_state(), crate::storage::SetupState::Running(_)) { 250 } else { 1000 };
+        if matches!(self.page, Page::Network | Page::DateTime | Page::About | Page::Storage) && now - self.last_refresh >= refresh_ms {
             self.last_refresh = now;
             ctx.redraw();
         }
@@ -1055,4 +1208,48 @@ impl App for SettingsApp {
 
 pub fn boxed() -> Box<dyn App> {
     Box::new(SettingsApp::new())
+}
+
+pub struct PictureScan {
+    /// (path, thumbnail) found since the app last collected them.
+    found: Vec<(String, Option<image::Image>)>,
+    done: bool,
+    reported: bool,
+}
+
+const THUMB_W: u32 = 192;
+const THUMB_H: u32 = 120;
+const MAX_PICTURES: usize = 30;
+
+fn start_picture_scan() -> Arc<Spin<PictureScan>> {
+    let scan = Arc::new(Spin::new(PictureScan { found: Vec::new(), done: false, reported: false }));
+    let raw = Arc::into_raw(scan.clone()) as usize;
+    crate::proc::sched::spawn_kernel("picture-scan", picture_scan_thread, raw);
+    scan
+}
+
+extern "C" fn picture_scan_thread(arg: usize) {
+    let scan = unsafe { Arc::from_raw(arg as *const Spin<PictureScan>) };
+    let mut dirs: Vec<String> = alloc::vec![String::from("/pictures"), String::from("/home")];
+    for m in fs::mounts() {
+        if m.point != "/" {
+            dirs.push(m.point.clone());
+            dirs.push(format!("{}/pictures", m.point));
+            dirs.push(format!("{}/Pictures", m.point));
+        }
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for d in dirs {
+        let Ok(entries) = fs::read_dir(&d) else { continue };
+        for e in entries {
+            if !e.is_dir && super::imageview::is_image_name(&e.name) && paths.len() < MAX_PICTURES {
+                paths.push(fs::join(&d, &e.name));
+            }
+        }
+    }
+    for p in paths {
+        let thumb = fs::read_file(&p).ok().and_then(|d| image::decode(&d).ok()).map(|img| img.cover(THUMB_W, THUMB_H, 0xff20_2020));
+        scan.lock().found.push((p, thumb));
+    }
+    scan.lock().done = true;
 }

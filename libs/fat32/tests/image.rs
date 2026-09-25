@@ -294,3 +294,83 @@ fn invalid_names_are_rejected() {
     drop(fs);
     fs::remove_file(&img).unwrap();
 }
+
+#[test]
+fn format_creates_a_valid_volume() {
+    if !have("fsck.fat") {
+        return;
+    }
+    let dir = std::env::temp_dir().join("mayos-fat32-tests");
+    fs::create_dir_all(&dir).unwrap();
+    for (mb, label) in [(40u64, "SMALL"), (600, "MAYOS DATA")] {
+        let path = dir.join(format!("fmt-{}-{}.img", std::process::id(), mb));
+        let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        f.set_len(mb * 1024 * 1024).unwrap();
+        let mut disk = FileDisk(f);
+        fat32::format(&mut disk, mb * 2048, label, 0x1234_5678).unwrap();
+        drop(disk);
+        fsck(&path);
+        {
+            let mut fs = mount(&path);
+            assert_eq!(fs.volume_label(), label);
+            assert!(fs.read_dir("/").unwrap().is_empty(), "label entry must not show as a file");
+            fs.create_dir("/config").unwrap();
+            fs.write_file("/config/settings.ini", b"volume = 50\n").unwrap();
+        }
+        fsck(&path);
+        assert_eq!(mtype(&path, "/config/settings.ini"), b"volume = 50\n");
+        fs::remove_file(&path).unwrap();
+    }
+    // Too small for FAT32.
+    let path = dir.join(format!("fmt-tiny-{}.img", std::process::id()));
+    let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    f.set_len(8 * 1024 * 1024).unwrap();
+    assert_eq!(fat32::format(&mut FileDisk(f), 8 * 2048, "X", 1), Err(FsError::NoSpace));
+    fs::remove_file(&path).unwrap();
+}
+
+/// Wrap a FAT32 volume in a partition table (like a Windows-made VHD).
+fn partitioned(kind: &str) -> Option<PathBuf> {
+    let vol = new_image(64)?;
+    let data = fs::read(&vol).unwrap();
+    fs::remove_file(&vol).unwrap();
+    let start = 2048usize;
+    let mut disk = vec![0u8; start * 512 + data.len() + 34 * 512];
+    disk[start * 512..start * 512 + data.len()].copy_from_slice(&data);
+    let sectors = (data.len() / 512) as u32;
+    if kind == "mbr" {
+        disk[446 + 4] = 0x0c;
+        disk[446 + 8..446 + 12].copy_from_slice(&(start as u32).to_le_bytes());
+        disk[446 + 12..446 + 16].copy_from_slice(&sectors.to_le_bytes());
+    } else {
+        disk[446 + 4] = 0xee;
+        disk[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        let h = 512;
+        disk[h..h + 8].copy_from_slice(b"EFI PART");
+        disk[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes());
+        disk[h + 80..h + 84].copy_from_slice(&128u32.to_le_bytes());
+        disk[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes());
+        // Entry 1 (entry 0 left empty): basic data partition.
+        let e = 1024 + 128;
+        disk[e..e + 16].copy_from_slice(&[0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7]);
+        disk[e + 32..e + 40].copy_from_slice(&(start as u64).to_le_bytes());
+        disk[e + 40..e + 48].copy_from_slice(&((start + sectors as usize - 1) as u64).to_le_bytes());
+    }
+    disk[510] = 0x55;
+    disk[511] = 0xaa;
+    let path = vol.with_extension(kind);
+    fs::write(&path, disk).unwrap();
+    Some(path)
+}
+
+#[test]
+fn mounts_mbr_and_gpt_partitions() {
+    for kind in ["mbr", "gpt"] {
+        let Some(path) = partitioned(kind) else { return };
+        let mut fs = mount(&path);
+        fs.write_file("/from windows.txt", kind.as_bytes()).unwrap();
+        assert_eq!(fs.read_file("/FROM WINDOWS.TXT").unwrap(), kind.as_bytes());
+        drop(fs);
+        fs::remove_file(&path).unwrap();
+    }
+}

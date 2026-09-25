@@ -13,6 +13,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use gfx::icons::{self, Icon};
@@ -217,6 +218,9 @@ pub struct Wm {
     width: i32,
     height: i32,
     background: Surface,
+    /// Decoded picture wallpaper (path, image), kept to re-fit on resize.
+    wall_image: Option<(String, Arc<image::Image>)>,
+    wall_loading: Option<(String, super::imageview::Slot)>,
     windows: Vec<Window>,
     focused: Option<WindowId>,
     next_id: WindowId,
@@ -290,6 +294,8 @@ impl Wm {
             width,
             height,
             background: super::wallpaper::render(cfg.wallpaper, width, height),
+            wall_image: None,
+            wall_loading: None,
             windows: Vec::new(),
             focused: None,
             next_id: 1,
@@ -322,6 +328,9 @@ impl Wm {
             wm.boot_at = 0;
         }
         wm.update_clock();
+        if !wm.cfg.wallpaper_image.is_empty() {
+            wm.refresh_background();
+        }
         wm.damage_all();
         wm
     }
@@ -402,6 +411,17 @@ impl Wm {
         self.focus(Some(id));
         self.damage(shadow_bounds(rect));
         id
+    }
+
+    /// Open a window in the middle of the screen.
+    fn open_centered(&mut self, app: Box<dyn App>) {
+        let id = self.open(app, None);
+        if let Some(i) = self.index_of(id) {
+            let r = self.windows[i].rect;
+            let c = Rect::new((self.width - r.w) / 2, (self.height - r.h) / 3, r.w, r.h);
+            self.set_rect(i, c);
+            self.windows[i].last_paint = self.windows[i].paint_bounds();
+        }
     }
 
     pub fn open_kind(&mut self, kind: AppKind) {
@@ -589,12 +609,18 @@ impl Wm {
                 Command::Close => self.close(id),
                 Command::Send(to, msg) => self.send(to, msg),
                 Command::SetResolution(w, h) => {
+                    let old = (self.width as u32, self.height as u32);
                     let ok = self.set_resolution(w, h);
-                    if ok {
-                        let mode = (self.width as u32, self.height as u32);
-                        settings::update(|s| s.resolution = Some(mode));
-                    }
                     self.send(id, Msg::ResolutionResult(ok));
+                    if ok && old != (w, h) {
+                        // Centred on the screen, so it is visible even if
+                        // the new mode doesn't fit the host window.
+                        let keep = Box::new(super::keep_resolution::KeepResolution::new(old, (w, h)));
+                        self.open_centered(keep);
+                    }
+                }
+                Command::RevertResolution(w, h) => {
+                    self.set_resolution(w, h);
                 }
                 Command::Shutdown => crate::power::shutdown(),
                 Command::Reboot => crate::power::reboot(),
@@ -620,7 +646,7 @@ impl Wm {
         self.width = width;
         self.height = height;
         super::update_display_description(&self.display);
-        self.background = super::wallpaper::render(self.cfg.wallpaper, width, height);
+        self.refresh_background();
         let full = Rect::new(0, theme::TOPBAR_H, width, height - theme::TOPBAR_H);
         for i in 0..self.windows.len() {
             let r = self.windows[i].rect;
@@ -1064,10 +1090,7 @@ impl Wm {
 
     fn settings_changed(&mut self) {
         let new = settings::get();
-        if new.wallpaper != self.cfg.wallpaper {
-            self.background = super::wallpaper::render(new.wallpaper, self.width, self.height);
-            self.damage_all();
-        }
+        let wall_changed = new.wallpaper != self.cfg.wallpaper || new.wallpaper_image != self.cfg.wallpaper_image;
         if new.accent != self.cfg.accent {
             for w in self.windows.iter_mut() {
                 w.needs_render = true;
@@ -1075,11 +1098,58 @@ impl Wm {
             self.damage_all();
         }
         self.cfg = new;
+        if wall_changed {
+            self.refresh_background();
+        }
         self.clock.clear();
+    }
+
+    /// Rebuild the desktop background for the current size and settings.
+    /// A picture wallpaper is decoded on a background thread the first
+    /// time; until it's ready the built-in one is shown.
+    fn refresh_background(&mut self) {
+        let path = self.cfg.wallpaper_image.clone();
+        if !path.is_empty() {
+            if let Some((p, img)) = &self.wall_image {
+                if *p == path {
+                    let fitted = img.cover(self.width as u32, self.height as u32, 0xff00_0000);
+                    let mut s = Surface::new(self.width, self.height, 0);
+                    for (d, px) in s.data.iter_mut().zip(fitted.pixels.iter()) {
+                        *d = *px | 0xff00_0000;
+                    }
+                    self.background = s;
+                    self.damage_all();
+                    return;
+                }
+            }
+            if self.wall_loading.as_ref().map(|(p, _)| *p != path).unwrap_or(true) {
+                self.wall_loading = Some((path.clone(), super::imageview::decode_async(&path)));
+            }
+        } else {
+            self.wall_image = None;
+            self.wall_loading = None;
+        }
+        self.background = super::wallpaper::render(self.cfg.wallpaper, self.width, self.height);
+        self.damage_all();
+    }
+
+    fn poll_wallpaper(&mut self) {
+        let Some((path, slot)) = &self.wall_loading else { return };
+        let Some(result) = slot.lock().take() else { return };
+        let path = path.clone();
+        self.wall_loading = None;
+        match result {
+            Ok(img) => {
+                self.wall_image = Some((path, Arc::new(img)));
+                self.refresh_background();
+            }
+            Err(e) => crate::kprintln!("wallpaper: {}: {}", path, e),
+        }
     }
 
     /// Tick apps, advance animations, re-render dirty windows and composite.
     pub fn frame(&mut self) {
+        self.poll_wallpaper();
         if settings::generation() != self.cfg_gen {
             self.cfg_gen = settings::generation();
             self.settings_changed();

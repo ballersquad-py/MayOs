@@ -19,3 +19,41 @@ Files
 Text editor
   Ctrl+S saves, Ctrl+Shift+S saves under a new name, Ctrl+A/C/X/V select
   all, copy, cut and paste. Shift+arrows select text.
+
+Pictures and videos
+  Double-click a picture (PNG, JPEG or BMP) to view it: the mouse wheel
+  or +/- zooms, drag to pan, Left/Right shows the previous/next picture.
+  "Set as Wallpaper" (also on the right-click menu in Files, and under
+  Settings > Personalization > Your pictures) puts it on the desktop.
+
+  Double-click a video to play it. Space pauses, Left/Right skip 5
+  seconds, click the bar to seek. MayOS plays Motion-JPEG AVI files with
+  PCM sound. Convert anything else on your PC with ffmpeg:
+
+    ffmpeg -i input.mp4 -vf scale=854:-2 -c:v mjpeg -q:v 4
+           -c:a pcm_s16le -ar 44100 output.avi
+
+Bringing your own files (VirtualBox on Windows)
+  1. On Windows, open Disk Management (Win+X > Disk Management).
+     Action > Create VHD: pick a file, e.g. C:\MayOS\files.vhd, size
+     1 GB or more, "Fixed size", VHD. Right-click the new disk >
+     Initialize Disk (MBR), then right-click its space > New Simple
+     Volume, file system FAT32. (Windows only offers FAT32 up to 32 GB.)
+  2. Copy your pictures, videos and documents onto the new drive letter.
+     Folders named "pictures" show up in Settings automatically.
+  3. Right-click the disk in Disk Management > Detach VHD.
+  4. VirtualBox: Settings > Storage > SATA controller > Add hard disk >
+     Add > choose files.vhd. Start MayOS.
+  The disk shows up in Files under its label (mounted at /disk1). To
+  change it again, shut MayOS down and attach the VHD in Windows again.
+
+Keeping settings and files between restarts
+  When MayOS runs from the ISO its own disk lives in memory. Add an empty
+  VirtualBox disk (Storage > SATA > Add hard disk > Create, VDI, 1 GB+),
+  then Settings > Storage > "Set up for MayOS" (or `setupdisk sata0` in
+  the Terminal). After that everything you change is saved on that disk.
+
+Changing resolution in VirtualBox
+  If the VirtualBox window becomes bigger than your screen, the dock at
+  the bottom is cut off. Pick a resolution smaller than your monitor, or
+  press Host+C (right Ctrl+C) for Scaled Mode so the whole desktop fits.

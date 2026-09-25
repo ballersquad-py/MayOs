@@ -10,11 +10,13 @@ if [ ! -f "$IMG" ]; then
     echo "mkdisk: creating $IMG ($SIZE MiB FAT32)"
     mkdir -p "$(dirname "$IMG")"
     mkfs.fat -F 32 -s "${CLUSTER:-2}" -n MAYOS -C "$IMG" $((SIZE * 1024)) >/dev/null
-    mmd -i "$IMG" ::/bin ::/docs ::/docs/notes ::/pictures ::/home ::/music ::/config
+    mmd -i "$IMG" ::/bin ::/docs ::/docs/notes ::/pictures ::/videos ::/home ::/music ::/config
     mcopy -i "$IMG" "$ROOT/assets/disk/Welcome.txt" ::/Welcome.txt
     mcopy -i "$IMG" "$ROOT/assets/disk/docs/Getting Started.txt" "::/docs/Getting Started.txt"
     mcopy -i "$IMG" "$ROOT/assets/disk/docs/notes/todo.txt" ::/docs/notes/todo.txt
     mcopy -i "$IMG" "$ROOT/docs/ROADMAP.md" ::/docs/Roadmap.md
+    mcopy -i "$IMG" "$ROOT"/assets/disk/pictures/* ::/pictures/
+    mcopy -i "$IMG" "$ROOT"/assets/disk/videos/* ::/videos/
     if command -v python3 >/dev/null; then
         TMPWAV=$(mktemp)
         python3 "$ROOT/tools/mkwav.py" "$TMPWAV" && mcopy -i "$IMG" "$TMPWAV" "::/music/Welcome Tune.wav"

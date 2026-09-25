@@ -12,6 +12,8 @@ pub const PATH: &str = "/config/settings.ini";
 pub struct Settings {
     pub resolution: Option<(u32, u32)>,
     pub wallpaper: usize,
+    /// Path of a picture used as the wallpaper; empty = built-in one.
+    pub wallpaper_image: String,
     pub accent: usize,
     pub animations: bool,
     pub volume: u8,
@@ -37,6 +39,7 @@ impl Default for Settings {
         Settings {
             resolution: None,
             wallpaper: 0,
+            wallpaper_image: String::new(),
             accent: 0,
             animations: true,
             volume: 70,
@@ -94,6 +97,7 @@ pub fn parse(text: &str) -> Settings {
                 s.resolution = v.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
             }
             "wallpaper" => s.wallpaper = num(0) as usize,
+            "wallpaper_image" => s.wallpaper_image = v.to_string(),
             "accent" => s.accent = num(0) as usize,
             "animations" => s.animations = parse_bool(v).unwrap_or(true),
             "volume" => s.volume = num(70).min(100) as u8,
@@ -125,13 +129,14 @@ pub fn serialize(s: &Settings) -> String {
     };
     format!(
         "# MayOS settings (edited by the Settings app)\n\
-         resolution = {}\nwallpaper = {}\naccent = {}\nanimations = {}\n\
+         resolution = {}\nwallpaper = {}\nwallpaper_image = {}\naccent = {}\nanimations = {}\n\
          volume = {}\nmuted = {}\nsystem_sounds = {}\n\
          pointer_speed = {}\ndouble_click_ms = {}\nnatural_scroll = {}\nkey_repeat = {}\n\
          clock_24h = {}\nshow_seconds = {}\ntz_offset_min = {}\n\
          dhcp = {}\nstatic_ip = {}\nstatic_mask = {}\nstatic_gateway = {}\nstatic_dns = {}\nhostname = {}\n",
         res,
         s.wallpaper,
+        s.wallpaper_image,
         s.accent,
         s.animations,
         s.volume,

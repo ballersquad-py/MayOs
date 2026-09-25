@@ -11,11 +11,16 @@ name = "gfx"
 version = "0.1.0"
 
 [[package]]
+name = "image"
+version = "0.1.0"
+
+[[package]]
 name = "mayos-kernel"
 version = "0.1.0"
 dependencies = [
  "fat32",
  "gfx",
+ "image",
  "net",
 ]
 

@@ -1,8 +1,9 @@
 //! Virtual file system front-end.
 //!
-//! Today there is one mounted volume: the FAT32 data disk at `/`. All paths
-//! handed to this module are absolute; `normalize` resolves relative paths
-//! against a working directory.
+//! Volumes are FAT32 file systems on block devices. The main volume is
+//! mounted at `/`; extra disks appear as top-level folders (`/disk1`, ...).
+//! All paths handed to this module are absolute; `normalize` resolves
+//! relative paths against a working directory.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -11,6 +12,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub use fat32::{DirEntry, FsError, FsStats, Timestamp};
 
+use crate::drivers::ahci::AhciDisk;
+use crate::drivers::ide::IdeDisk;
 use crate::drivers::ramdisk::RamDisk;
 use crate::drivers::virtio_blk::VirtioBlk;
 use crate::sync::Mutex;
@@ -19,6 +22,32 @@ use crate::sync::Mutex;
 pub enum Disk {
     Virtio(VirtioBlk),
     Ram(RamDisk),
+    Ahci(AhciDisk),
+    Ide(IdeDisk),
+}
+
+impl Disk {
+    pub fn persistent(&self) -> bool {
+        !matches!(self, Disk::Ram(_))
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Disk::Virtio(_) => "virtio disk",
+            Disk::Ram(_) => "RAM disk (changes are lost at power off)",
+            Disk::Ahci(_) => "SATA disk",
+            Disk::Ide(_) => "IDE disk",
+        }
+    }
+
+    pub fn sectors(&self) -> u64 {
+        match self {
+            Disk::Virtio(d) => d.capacity,
+            Disk::Ram(d) => d.sectors,
+            Disk::Ahci(d) => d.sectors,
+            Disk::Ide(d) => d.sectors,
+        }
+    }
 }
 
 impl fat32::BlockDevice for Disk {
@@ -26,25 +55,37 @@ impl fat32::BlockDevice for Disk {
         match self {
             Disk::Virtio(d) => d.read(lba, buf),
             Disk::Ram(d) => d.read(lba, buf),
+            Disk::Ahci(d) => d.read(lba, buf),
+            Disk::Ide(d) => d.read(lba, buf),
         }
     }
     fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), ()> {
         match self {
             Disk::Virtio(d) => d.write(lba, buf),
             Disk::Ram(d) => d.write(lba, buf),
+            Disk::Ahci(d) => d.write(lba, buf),
+            Disk::Ide(d) => d.write(lba, buf),
         }
     }
     fn flush(&mut self) -> core::result::Result<(), ()> {
         match self {
             Disk::Virtio(d) => d.flush(),
             Disk::Ram(d) => d.flush(),
+            Disk::Ahci(d) => d.flush(),
+            Disk::Ide(d) => d.flush(),
         }
     }
 }
 
-type Volume = fat32::FatFs<Disk>;
+pub type Volume = fat32::FatFs<Disk>;
 
-static VOLUME: Mutex<Option<Volume>> = Mutex::new(None);
+struct Mount {
+    /// "/" for the main volume, otherwise "/name".
+    point: String,
+    vol: Volume,
+}
+
+static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 /// Bumped on every modification so views (e.g. the explorer) can refresh.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -55,47 +96,126 @@ fn clock() -> Timestamp {
     Timestamp { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second }
 }
 
-/// Human-readable description of where `/` lives.
-pub fn backend() -> &'static str {
-    let mut g = VOLUME.lock();
-    match g.as_mut().map(|v| v.device()) {
-        Some(Disk::Virtio(_)) => "virtio-blk (persistent)",
-        Some(Disk::Ram(_)) => "RAM disk (changes are lost at power off)",
-        None => "none",
+pub fn open_volume(dev: Disk) -> core::result::Result<Volume, (FsError, Disk)> {
+    match fat32::FatFs::try_mount(dev) {
+        Ok(mut v) => {
+            v.set_clock(clock);
+            Ok(v)
+        }
+        Err(e) => Err(e),
     }
 }
 
+/// Mount `vol` at `point` ("/" replaces the main volume).
+pub fn mount_volume(point: &str, vol: Volume) {
+    let mut m = MOUNTS.lock();
+    m.retain(|x| x.point != point);
+    m.push(Mount { point: String::from(point), vol });
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn mount(dev: Disk) -> Result<()> {
-    let mut v = fat32::FatFs::mount(dev)?;
-    v.set_clock(clock);
-    *VOLUME.lock() = Some(v);
-    Ok(())
+    match open_volume(dev) {
+        Ok(v) => {
+            mount_volume("/", v);
+            Ok(())
+        }
+        Err((e, _)) => Err(e),
+    }
+}
+
+/// Remove a mount and give its volume back (used when promoting a disk
+/// to be the main volume).
+pub fn take_mount(point: &str) -> Option<Volume> {
+    let mut m = MOUNTS.lock();
+    let i = m.iter().position(|x| x.point == point)?;
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    Some(m.remove(i).vol)
+}
+
+pub struct MountInfo {
+    pub point: String,
+    pub label: String,
+    pub backend: &'static str,
+    pub persistent: bool,
+    pub stats: FsStats,
+}
+
+pub fn mounts() -> Vec<MountInfo> {
+    let mut m = MOUNTS.lock();
+    let mut out: Vec<MountInfo> = m
+        .iter_mut()
+        .map(|x| {
+            let stats = x.vol.stats();
+            let label = x.vol.volume_label().to_string();
+            let dev = x.vol.device();
+            MountInfo { point: x.point.clone(), label, backend: dev.describe(), persistent: dev.persistent(), stats }
+        })
+        .collect();
+    out.sort_by(|a, b| a.point.cmp(&b.point));
+    out
+}
+
+/// Human-readable description of where `/` lives.
+pub fn backend() -> &'static str {
+    mounts().into_iter().find(|m| m.point == "/").map(|m| m.backend).unwrap_or("none")
+}
+
+pub fn root_is_persistent() -> bool {
+    mounts().into_iter().find(|m| m.point == "/").map(|m| m.persistent).unwrap_or(false)
 }
 
 pub fn is_mounted() -> bool {
-    VOLUME.lock().is_some()
+    MOUNTS.lock().iter().any(|m| m.point == "/")
 }
 
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
-fn with<R>(f: impl FnOnce(&mut Volume) -> Result<R>) -> Result<R> {
-    let mut g = VOLUME.lock();
-    match g.as_mut() {
-        Some(v) => f(v),
-        None => Err(FsError::Io),
+/// Find the volume for `path` and the path inside it.
+fn with<R>(path: &str, f: impl FnOnce(&mut Volume, &str) -> Result<R>) -> Result<R> {
+    let path = normalize("/", path);
+    let mut g = MOUNTS.lock();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, m) in g.iter().enumerate() {
+        let p = m.point.as_str();
+        let matches = p == "/" || path == p || path.starts_with(&format!("{}/", p));
+        if matches && best.map(|(_, len)| p.len() > len).unwrap_or(true) {
+            best = Some((i, p.len()));
+        }
     }
+    let Some((i, len)) = best else { return Err(FsError::Io) };
+    let inner = if len <= 1 { path.clone() } else { String::from(&path[len..]) };
+    let inner = if inner.is_empty() { String::from("/") } else { inner };
+    f(&mut g[i].vol, &inner)
 }
 
-fn modify<R>(f: impl FnOnce(&mut Volume) -> Result<R>) -> Result<R> {
-    let r = with(f);
+fn modify<R>(path: &str, f: impl FnOnce(&mut Volume, &str) -> Result<R>) -> Result<R> {
+    let r = with(path, f);
     GENERATION.fetch_add(1, Ordering::Relaxed);
     r
 }
 
+/// Mount points directly under `dir` (only "/" has any).
+fn mount_points_in(dir: &str) -> Vec<String> {
+    if normalize("/", dir) != "/" {
+        return Vec::new();
+    }
+    MOUNTS.lock().iter().filter(|m| m.point != "/").map(|m| String::from(&m.point[1..])).collect()
+}
+
+pub fn is_mount_point(path: &str) -> bool {
+    let p = normalize("/", path);
+    p != "/" && MOUNTS.lock().iter().any(|m| m.point == p)
+}
+
 pub fn stat(path: &str) -> Result<DirEntry> {
-    with(|v| v.stat(path))
+    let p = normalize("/", path);
+    if is_mount_point(&p) {
+        return Ok(DirEntry::virtual_dir(file_name(&p)));
+    }
+    with(&p, |v, inner| v.stat(inner))
 }
 
 pub fn exists(path: &str) -> bool {
@@ -108,7 +228,11 @@ pub fn is_dir(path: &str) -> bool {
 
 /// Directory listing sorted with folders first, then by name.
 pub fn read_dir(path: &str) -> Result<Vec<DirEntry>> {
-    let mut entries = with(|v| v.read_dir(path))?;
+    let mut entries = with(path, |v, inner| v.read_dir(inner))?;
+    for m in mount_points_in(path) {
+        entries.retain(|e| !e.name.eq_ignore_ascii_case(&m));
+        entries.push(DirEntry::virtual_dir(&m));
+    }
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| cmp_names(&a.name, &b.name)));
     Ok(entries)
 }
@@ -120,34 +244,67 @@ fn cmp_names(a: &str, b: &str) -> core::cmp::Ordering {
 }
 
 pub fn read_file(path: &str) -> Result<Vec<u8>> {
-    with(|v| v.read_file(path))
+    with(path, |v, inner| v.read_file(inner))
 }
 
 pub fn write_file(path: &str, data: &[u8]) -> Result<()> {
-    modify(|v| v.write_file(path, data))
+    modify(path, |v, inner| v.write_file(inner, data))
 }
 
 pub fn create_file(path: &str) -> Result<()> {
-    modify(|v| v.create_file(path))
+    modify(path, |v, inner| v.create_file(inner))
 }
 
 pub fn create_dir(path: &str) -> Result<()> {
-    modify(|v| v.create_dir(path))
+    if is_mount_point(path) {
+        return Err(FsError::AlreadyExists);
+    }
+    modify(path, |v, inner| v.create_dir(inner))
 }
 
 pub fn remove(path: &str) -> Result<()> {
-    modify(|v| v.remove(path))
+    if is_mount_point(path) {
+        return Err(FsError::InvalidPath);
+    }
+    modify(path, |v, inner| v.remove(inner))
 }
 
 pub fn remove_all(path: &str) -> Result<()> {
-    modify(|v| v.remove_all(path))
+    if is_mount_point(path) || normalize("/", path) == "/" {
+        return Err(FsError::InvalidPath);
+    }
+    modify(path, |v, inner| v.remove_all(inner))
+}
+
+/// Which mount a path belongs to.
+fn mount_of(path: &str) -> String {
+    let p = normalize("/", path);
+    let m = MOUNTS.lock();
+    m.iter()
+        .filter(|x| x.point == "/" || p == x.point || p.starts_with(&format!("{}/", x.point)))
+        .max_by_key(|x| x.point.len())
+        .map(|x| x.point.clone())
+        .unwrap_or_else(|| String::from("/"))
 }
 
 pub fn rename(from: &str, to: &str) -> Result<()> {
-    modify(|v| v.rename(from, to))
+    if is_mount_point(from) {
+        return Err(FsError::InvalidPath);
+    }
+    if mount_of(from) != mount_of(to) {
+        // Different disks: copy, then delete the original.
+        copy(from, to)?;
+        return if is_dir(from) { remove_all(from) } else { remove(from) };
+    }
+    let to_inner = {
+        let point = mount_of(to);
+        let p = normalize("/", to);
+        if point == "/" { p } else { String::from(&p[point.len()..]) }
+    };
+    modify(from, |v, inner| v.rename(inner, &to_inner))
 }
 
-/// Copy a file or a whole directory tree.
+/// Copy a file or a whole directory tree (also between disks).
 pub fn copy(from: &str, to: &str) -> Result<()> {
     let src = stat(from)?;
     if exists(to) {
@@ -161,20 +318,24 @@ pub fn copy(from: &str, to: &str) -> Result<()> {
         }
         create_dir(to)?;
         for child in read_dir(from)? {
+            if is_mount_point(&join(from, &child.name)) {
+                continue;
+            }
             copy(&join(from, &child.name), &join(to, &child.name))?;
         }
         Ok(())
     } else {
-        modify(|v| v.copy_file(from, to))
+        let data = read_file(from)?;
+        write_file(to, &data)
     }
 }
 
 pub fn stats() -> Result<FsStats> {
-    with(|v| Ok(v.stats()))
+    with("/", |v, _| Ok(v.stats()))
 }
 
 pub fn volume_label() -> String {
-    with(|v| Ok(v.volume_label().to_string())).unwrap_or_default()
+    with("/", |v, _| Ok(v.volume_label().to_string())).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

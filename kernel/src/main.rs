@@ -22,6 +22,7 @@ mod proc;
 mod selftest;
 mod serial;
 mod settings;
+mod storage;
 mod sync;
 mod time;
 
@@ -63,6 +64,7 @@ extern "C" fn kmain() -> ! {
     proc::sched::init();
     // Drivers that start their own threads come after the scheduler.
     init_threaded_devices();
+    storage::init();
     settings::load();
     let selftest = boot::cmdline().contains("selftest");
     if selftest {

@@ -77,6 +77,12 @@ pub fn play(samples: Arc<Vec<i16>>) -> Option<u64> {
     Some(id)
 }
 
+pub fn stop(id: u64) {
+    if let Some(m) = MIXER.lock().as_mut() {
+        m.voices.retain(|v| v.id != id);
+    }
+}
+
 pub fn is_playing(id: u64) -> bool {
     MIXER.lock().as_ref().map(|m| m.voices.iter().any(|v| v.id == id)).unwrap_or(false)
 }

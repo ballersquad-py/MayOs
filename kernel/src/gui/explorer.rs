@@ -54,6 +54,7 @@ enum Action {
     NewFile,
     Refresh,
     TerminalHere,
+    SetWallpaper,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,7 +125,10 @@ fn kind_of(e: &DirEntry, dir: &str) -> (Icon, String) {
     match ext.as_deref() {
         Some("txt" | "md" | "log" | "cfg" | "ini" | "conf" | "rs" | "c" | "h" | "json" | "toml" | "sh" | "html"
         | "css" | "js") => (Icon::TextFile, String::from("Text Document")),
-        Some("png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp") => (Icon::Image, String::from("Image")),
+        Some("png" | "jpg" | "jpeg" | "jfif" | "bmp" | "gif" | "webp") => (Icon::Image, String::from("Image")),
+        Some("avi" | "mjpg" | "mjpeg") => (Icon::Video, String::from("Video")),
+        Some("mp4" | "mkv" | "webm" | "mov") => (Icon::Video, String::from("Video (convert to AVI)")),
+        Some("wav") => (Icon::Music, String::from("Sound")),
         Some("elf") => (Icon::Program, String::from("Program")),
         _ if dir == "/bin" => (Icon::Program, String::from("Program")),
         Some(x) => (Icon::File, format!("{} File", x.to_ascii_uppercase())),
@@ -276,16 +280,24 @@ impl Explorer {
         out
     }
 
-    fn places(&self) -> Vec<(&'static str, &'static str, Icon)> {
-        let mut v = alloc::vec![("MayOS Disk", "/", Icon::Drive)];
+    fn places(&self) -> Vec<(String, String, Icon)> {
+        let mut v = alloc::vec![(String::from("MayOS Disk"), String::from("/"), Icon::Drive)];
         for (label, path, icon) in [
             ("Documents", "/docs", Icon::Folder),
-            ("Programs", "/bin", Icon::Folder),
             ("Pictures", "/pictures", Icon::Folder),
+            ("Videos", "/videos", Icon::Folder),
+            ("Programs", "/bin", Icon::Folder),
             ("Home", "/home", Icon::Home),
         ] {
             if fs::is_dir(path) {
-                v.push((label, path, icon));
+                v.push((String::from(label), String::from(path), icon));
+            }
+        }
+        // Other disks (e.g. a VHD with your own files attached in VirtualBox).
+        for m in fs::mounts() {
+            if m.point != "/" {
+                let label = if m.label.is_empty() { m.point.trim_start_matches('/').to_string() } else { m.label.clone() };
+                v.push((label, m.point, Icon::Drive));
             }
         }
         v
@@ -387,6 +399,11 @@ impl Explorer {
     fn run(&mut self, a: Action, ctx: &mut Ctx) {
         let me = ctx.window;
         match a {
+            Action::SetWallpaper => {
+                if let Some(p) = self.selected_path() {
+                    crate::settings::update(|s| s.wallpaper_image = p);
+                }
+            }
             Action::Open => {
                 if let Some(i) = self.selected {
                     self.open_entry(i, ctx);
@@ -539,6 +556,10 @@ impl Explorer {
         }
         items.push(Some((Action::NewFolder, "New Folder\u{2026}")));
         items.push(Some((Action::NewFile, "New File\u{2026}")));
+        if on_item && self.selected_path().map(|p| super::imageview::is_image_name(&p)).unwrap_or(false) {
+            items.push(Some((Action::SetWallpaper, "Set as Wallpaper")));
+            items.push(None);
+        }
         if has_clip {
             items.push(Some((Action::Paste, "Paste")));
         }

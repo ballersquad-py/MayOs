@@ -41,6 +41,8 @@ pub enum Command {
     Close,
     Send(WindowId, Msg),
     SetResolution(u32, u32),
+    /// Go back to a previous mode without asking again.
+    RevertResolution(u32, u32),
     Shutdown,
     Reboot,
 }
