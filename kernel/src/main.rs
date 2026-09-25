@@ -105,6 +105,9 @@ fn init_devices() {
     pci::scan();
     let devices = pci::devices();
     kprintln!("pci: {} devices", devices.len());
+    if let Some(d) = devices.iter().find(|d| d.vendor == 0x80ee && d.device == 0xcafe) {
+        drivers::vmmdev::init(d);
+    }
     for d in devices.iter().filter(|d| d.vendor == virtio::VENDOR) {
         match d.device {
             virtio::DEVICE_BLOCK | virtio::DEVICE_BLOCK_TRANSITIONAL => match drivers::virtio_blk::VirtioBlk::new(d) {

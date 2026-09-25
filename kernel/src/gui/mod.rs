@@ -132,9 +132,22 @@ pub extern "C" fn desktop_main(_: usize) {
     wm.open_kind(AppKind::Terminal);
 
     let (mut stat_frames, mut stat_us, mut stat_since) = (0u64, 0u64, 0u64);
+    let mut vbox_checked = 0u64;
     loop {
         for dev in INPUTS.lock().iter_mut() {
             dev.poll();
+        }
+        crate::drivers::vmmdev::poll_mouse();
+        let now = crate::time::uptime_ms();
+        if now - vbox_checked >= 500 {
+            vbox_checked = now;
+            // Follow the VirtualBox window size.
+            if let Some((w, h)) = crate::drivers::vmmdev::display_change() {
+                let (w, h) = (w.max(640), h.max(480));
+                if !wm.set_resolution(w, h) {
+                    crate::kprintln!("vbox: cannot switch to {}x{}", w, h);
+                }
+            }
         }
         let mut handled = 0;
         while let Some(ev) = crate::input::pop() {
