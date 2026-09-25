@@ -64,7 +64,15 @@ impl VideoDecoder {
             VInner::H264(d) => {
                 let i = self.pts.partition_point(|&x| x < p.pts);
                 self.pts.insert(i, p.pts);
+                let skipped = d.skipped_pictures;
                 let _ = d.decode(&p.data);
+                if d.skipped_pictures != skipped {
+                    // No picture will come out for this packet: forget its
+                    // time, or every later frame would be shown too early.
+                    if let Some(k) = self.pts.iter().position(|&x| x == p.pts) {
+                        self.pts.remove(k);
+                    }
+                }
                 if self.annexb {
                     // AVI chunks hold whole access units.
                     d.flush_picture();

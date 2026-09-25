@@ -140,6 +140,11 @@ pub struct Decoder {
     active_sps: Option<u32>,
     /// Skip pictures with nal_ref_idc == 0 (used when playback runs late).
     pub skip_nonref: bool,
+    /// Access units dropped by `skip_nonref` (so callers can drop their
+    /// timestamps too).
+    pub skipped_pictures: u64,
+    skipped_in_au: bool,
+    decoded_in_au: bool,
     /// Number of slices that failed to decode (for diagnostics).
     pub errors: u32,
     pub last_error: Option<Error>,
@@ -171,6 +176,9 @@ impl Decoder {
             next_id: 1,
             need_key: true,
             skip_nonref: false,
+            skipped_pictures: 0,
+            skipped_in_au: false,
+            decoded_in_au: false,
             active_sps: None,
             errors: 0,
             last_error: None,
@@ -217,6 +225,16 @@ impl Decoder {
 
     /// Decode one access unit (MP4 sample) or a chunk of an Annex B stream.
     pub fn decode(&mut self, data: &[u8]) -> Result<()> {
+        self.skipped_in_au = false;
+        self.decoded_in_au = false;
+        let r = self.decode_au(data);
+        if self.skipped_in_au && !self.decoded_in_au {
+            self.skipped_pictures += 1;
+        }
+        r
+    }
+
+    fn decode_au(&mut self, data: &[u8]) -> Result<()> {
         if self.length_size > 0 && !starts_with_start_code(data) {
             let mut p = 0;
             while p + self.length_size <= data.len() {
@@ -300,8 +318,10 @@ impl Decoder {
         match t {
             1 | 5 => {
                 if self.skip_nonref && nal_ref_idc == 0 {
+                    self.skipped_in_au = true;
                     return Ok(());
                 }
+                self.decoded_in_au = true;
                 let rbsp = unescape(&nal[1..]);
                 self.slice(&rbsp, t, nal_ref_idc)
             }
