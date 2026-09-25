@@ -35,6 +35,10 @@ pub struct VideoDecoder {
     pts: Vec<i64>,
     ready: VecDeque<VideoFrame>,
     annexb: bool,
+    /// After a reset (seek, skip), pictures before the first keyframe's
+    /// time may reference pictures we never decoded ("open GOP"): drop them.
+    min_pts: Option<i64>,
+    resync: bool,
 }
 
 pub fn unsupported_message(codec: &Codec) -> String {
@@ -56,10 +60,14 @@ impl VideoDecoder {
             Codec::Mjpeg => (VInner::Mjpeg, false),
             other => return Err(unsupported_message(other)),
         };
-        Ok(VideoDecoder { inner, pts: Vec::new(), ready: VecDeque::new(), annexb })
+        Ok(VideoDecoder { inner, pts: Vec::new(), ready: VecDeque::new(), annexb, min_pts: None, resync: true })
     }
 
     pub fn decode(&mut self, p: &Packet) {
+        if self.resync && p.key {
+            self.resync = false;
+            self.min_pts = Some(p.pts);
+        }
         match &mut self.inner {
             VInner::H264(d) => {
                 let i = self.pts.partition_point(|&x| x < p.pts);
@@ -92,6 +100,9 @@ impl VideoDecoder {
         if let VInner::H264(d) = &mut self.inner {
             while let Some(f) = d.next_frame() {
                 let pts = if self.pts.is_empty() { 0 } else { self.pts.remove(0) };
+                if self.min_pts.map(|m| pts < m).unwrap_or(false) {
+                    continue;
+                }
                 let (w, h) = (f.width, f.height);
                 self.ready.push_back(VideoFrame { pts, width: w, height: h, data: FrameData::Yuv(f) });
             }
@@ -112,6 +123,8 @@ impl VideoDecoder {
         }
         self.pts.clear();
         self.ready.clear();
+        self.resync = true;
+        self.min_pts = None;
     }
 
     /// Skip decoding pictures that nothing references (when running late).
