@@ -7,6 +7,7 @@ ISO        := $(BUILD)/mayos.iso
 TEST_ISO   := $(BUILD)/mayos-test.iso
 DISK       := $(BUILD)/disk.img
 DISK_MB    := 128
+RAMDISK    := $(BUILD)/ramdisk.img
 OVMF       ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /opt/homebrew/share/qemu/edk2-x86_64-code.fd))
 USER_BINS  := hello count cat write ls guess sysinfo
 USER_DIR   := userspace/target/x86_64-unknown-none/release
@@ -21,7 +22,7 @@ QEMU_BASE  := -M q35 -m 512M -cpu max -smp 1 \
               -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
               -no-reboot
 
-.PHONY: all kernel userspace iso disk disk-reset run run-headless test test-libs clean
+.PHONY: all kernel userspace ramdisk iso disk disk-reset run run-headless test test-libs clean
 
 all: iso disk
 
@@ -40,6 +41,7 @@ define make_iso
 	rm -rf $(BUILD)/iso_root
 	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/kernel
+	cp $(RAMDISK) $(BUILD)/iso_root/boot/disk.img
 	cp $(1) $(BUILD)/iso_root/boot/limine/limine.conf
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(BUILD)/iso_root/EFI/BOOT/
@@ -51,10 +53,16 @@ define make_iso
 	$(LIMINE)/limine bios-install $(2) 2>/dev/null
 endef
 
-iso: $(LIMINE)/limine kernel
+# The ISO carries its own FAT32 image as a RAM disk, so it works on
+# machines without a virtio disk (VirtualBox, VMware, real PCs).
+ramdisk: userspace
+	rm -f $(RAMDISK)
+	CLUSTER=1 ./tools/mkdisk.sh $(RAMDISK) 40 $(USER_DIR) $(USER_BINS)
+
+iso: $(LIMINE)/limine kernel ramdisk
 	$(call make_iso,limine.conf,$(ISO))
 
-$(TEST_ISO): $(LIMINE)/limine kernel
+$(TEST_ISO): $(LIMINE)/limine kernel ramdisk
 	$(call make_iso,tools/limine-test.conf,$(TEST_ISO))
 
 # The data disk persists between runs; only the programs in /bin are refreshed.

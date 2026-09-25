@@ -1,0 +1,14 @@
+Welcome to MayOS!
+
+This file lives on a real FAT32 disk (a virtio block device). Anything you
+create, edit, rename or delete here is written to disk and is still there
+after a reboot.
+
+Things to try:
+  * Double-click folders in the Files window to browse; right-click for
+    New Folder, Rename, Duplicate, Copy/Cut/Paste and Delete.
+  * Double-click a text file to edit it; press Ctrl+S to save.
+  * In the Terminal, type `help`, or run programs from /bin such as
+    `hello`, `count 5`, `guess` or `sysinfo`.
+  * Drag windows by their title bar, resize them from the edges, and use
+    the coloured buttons to close, minimise or maximise.

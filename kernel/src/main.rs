@@ -10,19 +10,27 @@ mod acpi;
 mod arch;
 mod boot;
 mod drivers;
+mod fs;
+mod gui;
+mod input;
 mod interrupts;
 mod mem;
+mod power;
 mod proc;
+mod selftest;
 mod serial;
 mod sync;
 mod time;
 
 use arch::{apic, cpu, gdt, idt};
+use drivers::{pci, ps2, virtio};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     serial::init();
-    kprintln!("MayOS booting...");
+    kprintln!("MayOS {} booting", VERSION);
     if !boot::BASE_REVISION.is_supported() {
         kprintln!("Limine base revision 3 not supported by bootloader");
         cpu::halt_forever();
@@ -34,28 +42,85 @@ extern "C" fn kmain() -> ! {
     kprintln!("memory: {} MiB free of {} MiB", free * 4 / 1024, total * 4 / 1024);
 
     let rsdp = boot::RSDP.response().expect("no RSDP").address;
-    let acpi = acpi::parse(rsdp);
+    let acpi = acpi::store(acpi::parse(rsdp));
     kprintln!("acpi: {} cpu(s), {} io-apic(s)", acpi.cpu_count, acpi.ioapics.len());
-    apic::init(&acpi);
+    apic::init(acpi);
     let tsc_per_ms = apic::start_timer(100);
     time::init(tsc_per_ms);
-    kprintln!("timer: tsc {} kHz", tsc_per_ms);
     idt::init_syscall();
 
+    let wheel = ps2::init();
+    apic::route_irq(acpi, 1, idt::VEC_KEYBOARD);
+    apic::route_irq(acpi, 12, idt::VEC_MOUSE);
+    kprintln!("ps2: keyboard + mouse{}", if wheel { " (wheel)" } else { "" });
+
+    gui::theme::init();
+    init_devices();
+
     proc::sched::init();
-    proc::sched::spawn_kernel("test-a", test_thread, 1);
-    proc::sched::spawn_kernel("test-b", test_thread, 2);
+    let selftest = boot::cmdline().contains("selftest");
+    if selftest {
+        proc::sched::spawn_kernel("selftest", selftest::run, 0);
+    }
+    proc::sched::spawn_kernel("desktop", gui::desktop_main, 0);
     proc::sched::start();
-    cpu::sti();
+    kprintln!("boot complete in {} ms", time::uptime_ms());
     loop {
         cpu::sti_hlt();
     }
 }
 
-extern "C" fn test_thread(n: usize) {
-    for i in 0..3 {
-        kprintln!("thread {} tick {} t={}ms", n, i, time::uptime_ms());
-        proc::sched::sleep_ms(100);
+fn init_devices() {
+    pci::scan();
+    let devices = pci::devices();
+    kprintln!("pci: {} devices", devices.len());
+    for d in devices.iter().filter(|d| d.vendor == virtio::VENDOR) {
+        match d.device {
+            virtio::DEVICE_BLOCK | virtio::DEVICE_BLOCK_TRANSITIONAL => match drivers::virtio_blk::VirtioBlk::new(d) {
+                Some(blk) if !fs::is_mounted() => {
+                    let mb = blk.capacity / 2048;
+                    match fs::mount(fs::Disk::Virtio(blk)) {
+                        Ok(()) => kprintln!("disk: virtio-blk {} MiB, FAT32 \"{}\" mounted at /", mb, fs::volume_label()),
+                        Err(e) => kprintln!("disk: virtio-blk {} MiB: cannot mount: {}", mb, e),
+                    }
+                }
+                Some(_) => kprintln!("disk: ignoring additional virtio-blk device"),
+                None => kprintln!("disk: virtio-blk init failed"),
+            },
+            virtio::DEVICE_GPU => match drivers::virtio_gpu::VirtioGpu::new(d) {
+                Some(gpu) => {
+                    kprintln!("gpu: virtio-gpu {}x{}", gpu.width, gpu.height);
+                    gui::set_display(gui::display::Display::Virtio(gpu));
+                }
+                None => kprintln!("gpu: virtio-gpu init failed"),
+            },
+            virtio::DEVICE_INPUT => match drivers::virtio_input::VirtioInput::new(d) {
+                Some(inp) => {
+                    kprintln!("input: virtio \"{}\"", inp.name);
+                    gui::add_input(inp);
+                }
+                None => kprintln!("input: virtio-input init failed"),
+            },
+            _ => {}
+        }
+    }
+    if !fs::is_mounted()
+        && let Some(ram) = drivers::ramdisk::RamDisk::from_boot_module()
+    {
+        let mb = ram.sectors / 2048;
+        match fs::mount(fs::Disk::Ram(ram)) {
+            Ok(()) => kprintln!("disk: no virtio disk, using the {} MiB RAM disk from the boot image", mb),
+            Err(e) => kprintln!("disk: RAM disk cannot be mounted: {}", e),
+        }
+    }
+    if gui::display_description() == "none" {
+        match gui::display::Display::from_boot_framebuffer() {
+            Some(d) => {
+                kprintln!("gpu: no virtio-gpu, using the boot framebuffer");
+                gui::set_display(d);
+            }
+            None => kprintln!("gpu: no display found"),
+        }
     }
 }
 
@@ -63,5 +128,54 @@ extern "C" fn test_thread(n: usize) {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     cpu::cli();
     serial::write_fmt_unlocked(format_args!("\n*** KERNEL PANIC ***\n{}\n", info));
+    panic_screen(info);
+    if boot::cmdline().contains("selftest") {
+        power::qemu_exit(false);
+    }
     cpu::halt_forever();
+}
+
+/// Draw the panic message on the boot framebuffer (visible when the
+/// desktop uses it, e.g. in VirtualBox or VMware where there is no serial
+/// console to read).
+fn panic_screen(info: &core::panic::PanicInfo) {
+    use core::fmt::Write;
+    let Some(fb) = boot::FRAMEBUFFER.response().and_then(|r| r.first()) else { return };
+    let Some(fonts) = gui::theme::try_fonts() else { return };
+    if fb.bpp != 32 {
+        return;
+    }
+    let (w, h) = (fb.width as i32, fb.height as i32);
+    let stride = fb.pitch as usize / 4;
+    let buf = unsafe { core::slice::from_raw_parts_mut(fb.address as *mut u32, stride * h as usize) };
+    let mut c = gfx::Canvas::new(buf, w, h, stride);
+    let box_r = gfx::Rect::new(w / 2 - 360, h / 2 - 150, 720, 300);
+    c.fill_rounded_rect(box_r, 14, gfx::rgb(0xb3, 0x26, 0x2d));
+    c.draw_text(&fonts.large, box_r.x + 24, box_r.y + 44, "MayOS has stopped", gfx::rgb(255, 255, 255));
+    struct Buf([u8; 1024], usize);
+    impl Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if self.1 < self.0.len() {
+                    self.0[self.1] = b;
+                    self.1 += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut msg = Buf([0; 1024], 0);
+    let _ = write!(msg, "{}", info);
+    let text = core::str::from_utf8(&msg.0[..msg.1]).unwrap_or("panic");
+    let mut y = box_r.y + 80;
+    for line in text.lines() {
+        let mut rest = line;
+        while !rest.is_empty() && y < box_r.bottom() - 40 {
+            let n = rest.char_indices().nth(90).map(|(i, _)| i).unwrap_or(rest.len());
+            c.draw_text(&fonts.mono, box_r.x + 24, y, &rest[..n], gfx::rgb(255, 235, 235));
+            rest = &rest[n..];
+            y += 18;
+        }
+    }
+    c.draw_text(&fonts.ui, box_r.x + 24, box_r.bottom() - 20, "Please restart the computer.", gfx::rgb(255, 220, 220));
 }

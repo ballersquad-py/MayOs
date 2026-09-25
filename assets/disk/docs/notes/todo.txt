@@ -1,0 +1,6 @@
+- [x] Boot on real UEFI firmware
+- [x] Read and write FAT32
+- [x] Rounded, antialiased windows
+- [ ] TrueType font rendering in the OS
+- [ ] PNG and JPEG decoders
+- [ ] ping

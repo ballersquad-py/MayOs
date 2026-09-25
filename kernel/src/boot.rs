@@ -155,6 +155,30 @@ impl CmdlineResponse {
     }
 }
 
+#[repr(C)]
+pub struct LimineFile {
+    pub revision: u64,
+    pub address: *mut u8,
+    pub size: u64,
+    pub path: *const u8,
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub count: u64,
+    pub modules: *const *const LimineFile,
+}
+
+impl ModuleResponse {
+    pub fn first(&self) -> Option<&'static LimineFile> {
+        if self.count == 0 {
+            return None;
+        }
+        unsafe { (*self.modules).as_ref() }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Requests
 // ---------------------------------------------------------------------------
@@ -179,6 +203,10 @@ pub static RSDP: Request<RsdpResponse> = Request::new(0xc5e77b6b397e7b43, 0x2763
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static CMDLINE: Request<CmdlineResponse> = Request::new(0x4b161536e598651e, 0xb390ad4a2f1f303a);
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MODULES: Request<ModuleResponse> = Request::new(0x3e7e279702be32af, 0xca1c4f3bd1280cee);
 
 pub fn cmdline() -> &'static str {
     CMDLINE.response().map(|r| r.as_str()).unwrap_or("")

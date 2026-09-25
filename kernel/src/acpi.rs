@@ -4,6 +4,18 @@
 use alloc::vec::Vec;
 
 use crate::mem::paging;
+use crate::sync::Once;
+
+static INFO: Once<AcpiInfo> = Once::new();
+
+pub fn info() -> Option<&'static AcpiInfo> {
+    INFO.get()
+}
+
+pub fn store(info: AcpiInfo) -> &'static AcpiInfo {
+    INFO.set(info);
+    INFO.get().unwrap()
+}
 
 pub struct IoApic {
     pub phys: u64,

@@ -1,0 +1,21 @@
+Getting started with MayOS
+==========================
+
+Desktop
+  - The bar at the top shows the focused app and the clock. Click "MayOS"
+    for the system menu (About, new windows, restart, shut down).
+  - The dock at the bottom starts apps. Clicking an app that is already
+    open brings its window forward; right-click opens a new window.
+
+Keyboard shortcuts
+  Ctrl+Alt+T   new terminal          Alt+F4    close window
+  Ctrl+Alt+E   new file explorer     Alt+Tab   switch window
+
+Files
+  Enter opens, Backspace goes up, F2 renames, Delete deletes,
+  Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste, Ctrl+D duplicates,
+  Ctrl+N creates a file and Ctrl+Shift+N a folder.
+
+Text editor
+  Ctrl+S saves, Ctrl+Shift+S saves under a new name, Ctrl+A/C/X/V select
+  all, copy, cut and paste. Shift+arrows select text.
