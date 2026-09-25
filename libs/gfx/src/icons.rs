@@ -19,6 +19,7 @@ pub enum Icon {
     Settings,
     Video,
     Music,
+    Browser,
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
@@ -80,6 +81,17 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
             c.fill_circle(cx, cy, (s / 10).max(2), col);
             c.fill_rect(Rect::new(cx + s / 12, y + s / 3, (s / 20).max(1), cy - y - s / 3), col);
             c.fill_rect(Rect::new(cx + s / 12, y + s / 3, s / 6, (s / 14).max(1)), col);
+        }
+        Icon::Browser => {
+            app_tile(c, x, y, s, rgb(0x4f, 0x9d, 0xf5), rgb(0x1f, 0x5f, 0xd0));
+            let (cx, cy, r) = (x + s / 2, y + s / 2, s * 3 / 10);
+            let white = rgb(255, 255, 255);
+            c.stroke_rounded_rect(Rect::new(cx - r, cy - r, 2 * r, 2 * r), r, (s / 24).max(1), white);
+            c.stroke_rounded_rect(Rect::new(cx - r / 2, cy - r, r, 2 * r), r / 2, (s / 32).max(1), white);
+            c.fill_rect(Rect::new(cx - r, cy, 2 * r, (s / 32).max(1)), white);
+            c.fill_rect(Rect::new(cx, cy - r, (s / 32).max(1), 2 * r), white);
+            c.fill_rect(Rect::new(cx - r * 9 / 10, cy - r / 2, r * 18 / 10, (s / 40).max(1)), white);
+            c.fill_rect(Rect::new(cx - r * 9 / 10, cy + r / 2, r * 18 / 10, (s / 40).max(1)), white);
         }
         Icon::Settings => {
             app_tile(c, x, y, s, rgb(0x9a, 0xa3, 0xb2), rgb(0x5f, 0x68, 0x78));

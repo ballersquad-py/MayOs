@@ -5,6 +5,7 @@
 
 pub mod about;
 pub mod app;
+pub mod browser;
 pub mod cursor;
 pub mod dialog;
 pub mod display;
@@ -79,6 +80,7 @@ pub fn launch(kind: AppKind) -> Option<Box<dyn App>> {
         AppKind::Editor => Box::new(editor::Editor::new_empty()),
         AppKind::Settings => settings_app::boxed(),
         AppKind::About => Box::new(about::About::new()),
+        AppKind::Browser => Box::new(browser::Browser::new(None)),
         AppKind::Other => return None,
     })
 }
@@ -99,6 +101,10 @@ pub fn open_path(path: &str, ctx: &mut Ctx) -> Result<(), crate::fs::FsError> {
     let name = crate::fs::file_name(path);
     if imageview::is_image_name(name) {
         ctx.open(Box::new(imageview::ImageViewer::open(path)));
+        return Ok(());
+    }
+    if matches!(crate::fs::extension(name).as_deref(), Some("html" | "htm")) {
+        ctx.open(Box::new(browser::Browser::new(Some(path))));
         return Ok(());
     }
     if player::is_media_name(name) {

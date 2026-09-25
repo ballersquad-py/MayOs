@@ -24,3 +24,7 @@ dependencies = [
 [[package]]
 name = "net"
 version = "0.1.0"
+
+[[package]]
+name = "web"
+version = "0.1.0"

@@ -15,6 +15,11 @@ gfx = { path = "../libs/gfx" }
 net = { path = "../libs/net" }
 image = { path = "../libs/image" }
 media = { path = "../libs/media" }
+embedded-tls = { version = "0.19", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = "0.6"
+embedded-io = { version = "0.7", default-features = false }
+web = { version = "0.1.0", path = "../libs/web" }
 
 [profile.dev]
 panic = "abort"

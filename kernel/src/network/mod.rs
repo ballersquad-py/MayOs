@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use net::{dhcp, dns, Arp, EthFrame, Icmp, Ipv4, Ipv4Packet, Mac, Udp};
 
+pub mod http;
 pub mod httpd;
 pub mod tcp;
 

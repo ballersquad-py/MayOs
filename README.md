@@ -22,6 +22,11 @@ Settings app are done.
   (the desktop follows the window size; the mouse moves in and out freely).
 - **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP client and DNS
   resolver (`ping`, `nslookup`, `ifconfig`, `dhcp` in the terminal).
+- **Web browser**: HTTP and HTTPS (TLS 1.3 via the `embedded-tls` crate),
+  HTML and CSS (engine in `libs/web`, built from Matt Brubeck's
+  [robinson](https://github.com/mbrubeck/robinson), MIT) with text layout,
+  links, pictures, lists and tables, back/forward, search from the address
+  bar. No JavaScript yet, and certificates are not checked yet.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).

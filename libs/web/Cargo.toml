@@ -1,0 +1,7 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2024"
+description = "MayOS web engine: HTML, CSS, style and layout (DOM, CSS parser and style matching adapted from robinson by Matt Brubeck, MIT)"
+
+[dependencies]

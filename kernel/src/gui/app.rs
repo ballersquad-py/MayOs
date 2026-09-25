@@ -144,5 +144,6 @@ pub enum AppKind {
     Editor,
     Settings,
     About,
+    Browser,
     Other,
 }

@@ -51,6 +51,7 @@ const HELP: &[(&str, &str)] = &[
     ("ping <host> [count]", "send ICMP echo requests"),
     ("nslookup <name>", "resolve a host name with DNS"),
     ("dhcp", "request a new IP address"),
+    ("browser [address]", "open the web browser"),
     ("play <file>", "play music or a video (MP4, MOV, MKV, AVI, MP3, AAC, WAV)"),
     ("wallpaper <picture|N>", "set the desktop wallpaper"),
     ("dock [left|right|bottom] [autohide|show]", "move or hide the dock"),
@@ -603,6 +604,10 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             Some(name) => term.start_job("nslookup", String::from(*name), job_nslookup),
             None => err(out, "usage: nslookup <name>"),
         },
+        "browser" | "web" => {
+            let target = joined(args).map(|a| if a.starts_with('/') || (!a.contains("://") && fs::exists(&abs(&a))) { abs(&a) } else { a });
+            ctx.open(Box::new(super::browser::Browser::new(target.as_deref())));
+        }
         "play" => match joined(args).as_deref() {
             Some(p) if super::player::is_media_name(p) && !p.ends_with(".wav") => ctx.open(Box::new(super::player::Player::open(&abs(p)))),
             Some(p) => match fs::read_file(&abs(p)) {

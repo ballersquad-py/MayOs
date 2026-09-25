@@ -224,6 +224,7 @@ const DOCK: &[(AppKind, Icon, &str)] = &[
     (AppKind::Explorer, Icon::Explorer, "Files"),
     (AppKind::Terminal, Icon::Terminal, "Terminal"),
     (AppKind::Editor, Icon::Editor, "Text Editor"),
+    (AppKind::Browser, Icon::Browser, "Browser"),
     (AppKind::Settings, Icon::Settings, "Settings"),
     (AppKind::About, Icon::Info, "About MayOS"),
 ];
