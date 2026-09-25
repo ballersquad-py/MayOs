@@ -142,6 +142,32 @@ fn init_devices() {
             Err(e) => kprintln!("disk: RAM disk cannot be mounted: {}", e),
         }
     }
+    // Display adapters we can drive ourselves (resolution switching).
+    // "safegraphics" on the kernel command line keeps the firmware screen.
+    if gui::display_description() == "none" && !boot::cmdline().contains("safegraphics") {
+        for d in devices.iter() {
+            let is_svga = (d.vendor == 0x15ad && d.device == 0x0405)
+                || (d.vendor == 0x80ee && d.device == 0xbeef && d.read32(0x10) & 1 != 0);
+            let is_bochs = (d.vendor == 0x1234 && d.device == 0x1111)
+                || (d.vendor == 0x80ee && d.device == 0xbeef && d.read32(0x10) & 1 == 0);
+            let display = if is_svga {
+                drivers::vmware_svga::VmwareSvga::new(d).and_then(gui::display::Display::from_svga)
+            } else if is_bochs {
+                drivers::bochs_vga::BochsVga::new(d).and_then(gui::display::Display::from_bochs)
+            } else {
+                continue;
+            };
+            match display {
+                Some(disp) => {
+                    let (w, h) = disp.size();
+                    kprintln!("gpu: {} {}x{}", disp.name(), w, h);
+                    gui::set_display(disp);
+                    break;
+                }
+                None => kprintln!("gpu: {:04x}:{:04x} could not be initialised", d.vendor, d.device),
+            }
+        }
+    }
     if gui::display_description() == "none" {
         match gui::display::Display::from_boot_framebuffer() {
             Some(d) => {

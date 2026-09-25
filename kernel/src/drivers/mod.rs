@@ -6,3 +6,5 @@ pub mod virtio_gpu;
 pub mod virtio_input;
 pub mod ramdisk;
 pub mod e1000;
+pub mod bochs_vga;
+pub mod vmware_svga;

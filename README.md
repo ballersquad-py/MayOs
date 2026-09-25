@@ -14,8 +14,9 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
 - **Kernel**: GDT/TSS/IDT, physical and virtual memory, kernel heap,
   ACPI + APIC timer, preemptive scheduler, `syscall`-based user programs
   loaded from ELF files, shutdown/reboot.
-- **Drivers**: PCI, virtio block / GPU / tablet, PS/2 keyboard and mouse
-  (with wheel), boot framebuffer fallback, CMOS clock, Intel e1000-family
+- **Drivers**: PCI, virtio block / GPU / tablet, VMware SVGA II
+  (VirtualBox VMSVGA/VBoxSVGA), Bochs VBE (VirtualBox VBoxVGA, QEMU std VGA),
+  PS/2 keyboard and mouse (with wheel), boot framebuffer fallback, CMOS clock, Intel e1000-family
   network adapters, Intel AC'97 audio.
 - **Networking**: Ethernet, ARP, IPv4, ICMP, UDP, DHCP client and DNS
   resolver (`ping`, `nslookup`, `ifconfig`, `dhcp` in the terminal).
@@ -31,7 +32,7 @@ networking up to `ping`/DNS, audio output and the Settings app are done.
   opening and closing, fly into the dock when minimised and glide when
   maximised; dock icons bounce on launch; menus, toggles and settings pages
   animate; the desktop fades in at boot. Can be turned off in Settings.
-- **Settings app**: resolution (virtio-gpu), six wallpapers, eight accent
+- **Settings app**: resolution (virtio-gpu, VMware SVGA, Bochs VBE), six wallpapers, eight accent
   colours, animations; volume, mute, system sounds, test sound; network
   status, DHCP or static IP, ping and DNS tests; pointer speed,
   double-click speed, natural scrolling, key repeat; 12/24-hour clock,
@@ -51,7 +52,11 @@ Use `mayos.iso` with any of these:
 **VirtualBox**: New VM → Type *Other*, Version *Other/Unknown (64-bit)*,
 1024 MB of RAM. Under *Storage*, attach `mayos.iso` to the optical drive.
 Under *System → Motherboard*, set **Pointing Device: PS/2 Mouse**. EFI can
-be on or off. For sound, set *Audio → Audio Controller* to **ICH AC97**.
+be on or off. Under *Display*, keep the **VMSVGA** controller, give it
+**64 MB or more** of video memory, and leave **3D acceleration off**
+(MayOS renders in software). The resolution can then be changed in
+Settings → Display or with the `resolution` terminal command. If the
+screen stays black, pick *MayOS (safe graphics)* in the boot menu. For sound, set *Audio → Audio Controller* to **ICH AC97**.
 For internet, set *Network → Adapter 1* to **NAT** with adapter type
 **Intel PRO/1000 MT Desktop**. Start the VM, then click inside it to
 capture the mouse (the right Ctrl key releases it).

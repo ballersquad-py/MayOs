@@ -470,9 +470,9 @@ impl SettingsApp {
                 x + 4,
                 y + 4,
                 w - 8,
-                "This display uses the firmware framebuffer, so its resolution is chosen before MayOS starts. \
-                 In VirtualBox run: VBoxManage setextradata \"<vm>\" VBoxInternal2/EfiGraphicsResolution 1920x1080. \
-                 With QEMU's virtio GPU the resolution can be changed here.",
+                "This screen is the firmware's boot framebuffer, which cannot change resolution. MayOS can switch \
+                 resolution on VirtualBox's VMSVGA, VBoxSVGA and VBoxVGA controllers and on QEMU's virtio, VMware \
+                 and standard VGA adapters. If you started MayOS in safe graphics mode, restart normally.",
             );
         }
     }
@@ -919,7 +919,7 @@ impl App for SettingsApp {
         // Toast message.
         if let Some((m, ok, _)) = &self.message {
             let tw = f.ui.measure(m) + 32;
-            let r = Rect::new(SIDEBAR_W + (w - SIDEBAR_W - tw) / 2, h - 52, tw, 34);
+            let r = Rect::new(SIDEBAR_W + (w - SIDEBAR_W - tw) / 2, 14, tw, 34);
             c.draw_shadow(r, 10, 12, with_alpha(0x000000, 60));
             c.fill_rounded_rect(r, 10, if *ok { rgb(0x2b, 0x2f, 0x38) } else { theme::DANGER });
             c.draw_text_centered(&f.ui, r, m, rgb(255, 255, 255));

@@ -1,19 +1,57 @@
-//! Output devices for the compositor: the virtio GPU (preferred, with a
-//! hardware cursor) or the boot framebuffer from Limine.
+//! Output devices for the compositor:
+//! - virtio GPU (QEMU), with a hardware cursor
+//! - VMware SVGA II (VirtualBox "VMSVGA"/"VBoxSVGA", QEMU `-vga vmware`)
+//! - Bochs VBE (VirtualBox "VBoxVGA", QEMU `-vga std`)
+//! - the boot framebuffer from the firmware (fixed resolution)
+//!
+//! Except for virtio-gpu (whose backing store is ordinary RAM), the
+//! compositor draws into a back buffer in RAM and `present` copies changed
+//! rectangles to video memory.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use gfx::Rect;
 
+use crate::drivers::bochs_vga::BochsVga;
 use crate::drivers::virtio_gpu::{VirtioGpu, CURSOR_SIZE};
+use crate::drivers::vmware_svga::VmwareSvga;
 
 pub enum Display {
     Virtio(VirtioGpu),
+    Svga { dev: VmwareSvga, back: Vec<u32> },
+    Bochs { dev: BochsVga, back: Vec<u32> },
     Framebuffer { back: Vec<u32>, fb: *mut u8, pitch: usize, width: u32, height: u32 },
 }
 
 unsafe impl Send for Display {}
+
+/// Resolutions offered in Settings (filtered by what the adapter supports).
+const COMMON_MODES: &[(u32, u32)] = &[
+    (800, 600),
+    (1024, 768),
+    (1152, 864),
+    (1280, 720),
+    (1280, 800),
+    (1280, 1024),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1680, 1050),
+    (1920, 1080),
+    (1920, 1200),
+    (2560, 1440),
+];
+
+fn copy_rect(back: &[u32], width: u32, fb: *mut u8, pitch: usize, r: Rect) {
+    for y in r.y..r.bottom() {
+        let src = &back[(y as u32 * width + r.x as u32) as usize..][..r.w as usize];
+        unsafe {
+            let dst = fb.add(y as usize * pitch + r.x as usize * 4) as *mut u32;
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst, r.w as usize);
+        }
+    }
+}
 
 impl Display {
     pub fn from_boot_framebuffer() -> Option<Display> {
@@ -25,9 +63,39 @@ impl Display {
         Some(Display::Framebuffer { back: vec![0; (w * h) as usize], fb: fb.address, pitch: fb.pitch as usize, width: w, height: h })
     }
 
+    /// Size of the firmware framebuffer, used as the starting mode for
+    /// adapters we drive ourselves (so the screen doesn't jump at boot).
+    pub fn boot_size() -> (u32, u32) {
+        crate::boot::FRAMEBUFFER
+            .response()
+            .and_then(|r| r.first())
+            .map(|f| (f.width as u32, f.height as u32))
+            .unwrap_or((1280, 800))
+    }
+
+    pub fn from_svga(mut dev: VmwareSvga) -> Option<Display> {
+        let (w, h) = Self::boot_size();
+        if !dev.set_mode(w, h) && !dev.set_mode(1024, 768) {
+            return None;
+        }
+        let back = vec![0; (dev.width * dev.height) as usize];
+        Some(Display::Svga { dev, back })
+    }
+
+    pub fn from_bochs(mut dev: BochsVga) -> Option<Display> {
+        let (w, h) = Self::boot_size();
+        if !dev.set_mode(w, h) && !dev.set_mode(1024, 768) {
+            return None;
+        }
+        let back = vec![0; (dev.width * dev.height) as usize];
+        Some(Display::Bochs { dev, back })
+    }
+
     pub fn size(&self) -> (i32, i32) {
         match self {
             Display::Virtio(g) => (g.width as i32, g.height as i32),
+            Display::Svga { dev, .. } => (dev.width as i32, dev.height as i32),
+            Display::Bochs { dev, .. } => (dev.width as i32, dev.height as i32),
             Display::Framebuffer { width, height, .. } => (*width as i32, *height as i32),
         }
     }
@@ -35,6 +103,8 @@ impl Display {
     pub fn name(&self) -> &'static str {
         match self {
             Display::Virtio(_) => "virtio-gpu",
+            Display::Svga { .. } => "VMware SVGA II",
+            Display::Bochs { .. } => "Bochs VBE",
             Display::Framebuffer { .. } => "boot framebuffer",
         }
     }
@@ -43,7 +113,7 @@ impl Display {
     pub fn buffer(&mut self) -> &mut [u32] {
         match self {
             Display::Virtio(g) => g.framebuffer(),
-            Display::Framebuffer { back, .. } => back,
+            Display::Svga { back, .. } | Display::Bochs { back, .. } | Display::Framebuffer { back, .. } => back,
         }
     }
 
@@ -56,39 +126,53 @@ impl Display {
         }
         match self {
             Display::Virtio(g) => g.flush(r.x as u32, r.y as u32, r.w as u32, r.h as u32),
-            Display::Framebuffer { back, fb, pitch, width, .. } => {
-                for y in r.y..r.bottom() {
-                    let src = &back[(y as u32 * *width + r.x as u32) as usize..][..r.w as usize];
-                    unsafe {
-                        let dst = fb.add(y as usize * *pitch + r.x as usize * 4) as *mut u32;
-                        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, r.w as usize);
-                    }
-                }
+            Display::Svga { dev, back } => {
+                let (fb, pitch) = dev.framebuffer();
+                copy_rect(back, dev.width, fb, pitch, r);
+                dev.update(r.x as u32, r.y as u32, r.w as u32, r.h as u32);
             }
+            Display::Bochs { dev, back } => {
+                let (fb, pitch) = dev.framebuffer();
+                copy_rect(back, dev.width, fb, pitch, r);
+            }
+            Display::Framebuffer { back, fb, pitch, width, .. } => copy_rect(back, *width, *fb, *pitch, r),
         }
     }
 
     /// Resolutions the user may pick. The boot framebuffer is fixed by the
     /// firmware, so it only offers its current mode.
-    pub fn modes(&self) -> alloc::vec::Vec<(u32, u32)> {
-        match self {
-            Display::Virtio(_) => alloc::vec![
-                (1024, 768),
-                (1280, 720),
-                (1280, 800),
-                (1366, 768),
-                (1440, 900),
-                (1600, 900),
-                (1680, 1050),
-                (1920, 1080),
-            ],
-            Display::Framebuffer { width, height, .. } => alloc::vec![(*width, *height)],
+    pub fn modes(&self) -> Vec<(u32, u32)> {
+        let (cw, ch) = self.size();
+        let mut v: Vec<(u32, u32)> = match self {
+            Display::Virtio(_) => COMMON_MODES.iter().copied().filter(|&(w, h)| w <= 1920 && h <= 1200).collect(),
+            Display::Svga { dev, .. } => COMMON_MODES.iter().copied().filter(|&(w, h)| dev.supports(w, h)).collect(),
+            Display::Bochs { dev, .. } => COMMON_MODES.iter().copied().filter(|&(w, h)| dev.supports(w, h)).collect(),
+            Display::Framebuffer { .. } => Vec::new(),
+        };
+        if !v.contains(&(cw as u32, ch as u32)) {
+            v.push((cw as u32, ch as u32));
+            v.sort();
         }
+        v
     }
 
     pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
         match self {
             Display::Virtio(g) => g.set_mode(w, h),
+            Display::Svga { dev, back } => {
+                if !dev.set_mode(w, h) {
+                    return false;
+                }
+                *back = vec![0; (w * h) as usize];
+                true
+            }
+            Display::Bochs { dev, back } => {
+                if !dev.set_mode(w, h) {
+                    return false;
+                }
+                *back = vec![0; (w * h) as usize];
+                true
+            }
             Display::Framebuffer { width, height, .. } => (*width, *height) == (w, h),
         }
     }

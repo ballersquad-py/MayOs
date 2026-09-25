@@ -53,6 +53,7 @@ const HELP: &[(&str, &str)] = &[
     ("play <file.wav>", "play a WAV file"),
     ("beep / volume [0-100]", "test sound / get or set the volume"),
     ("settings", "open the Settings app"),
+    ("resolution [WxH]", "list or change the screen resolution"),
     ("dmesg", "kernel log"),
     ("uname", "system name"),
     ("history", "previous commands"),
@@ -618,6 +619,26 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         },
         "settings" => ctx.open(super::settings_app::boxed()),
+        "resolution" | "res" => {
+            let (cw, ch) = super::display_mode();
+            match args.first().and_then(|a| a.split_once('x')).and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
+                Some((w, h)) => {
+                    if super::display_modes().contains(&(w, h)) {
+                        ctx.commands.push(Command::SetResolution(w, h));
+                        let _ = writeln!(out, "switching to {}x{}", w, h);
+                    } else {
+                        err(out, format!("{}x{} is not available; run 'resolution' for the list", w, h));
+                    }
+                }
+                None => {
+                    let _ = writeln!(out, "{} (current {}x{})", super::display_description(), cw, ch);
+                    for (w, h) in super::display_modes() {
+                        let mark = if (w, h) == (cw, ch) { "*" } else { " " };
+                        let _ = writeln!(out, " {} {}x{}", mark, w, h);
+                    }
+                }
+            }
+        }
         "shutdown" | "poweroff" => ctx.commands.push(Command::Shutdown),
         "reboot" | "restart" => ctx.commands.push(Command::Reboot),
         "exit" => ctx.close(),

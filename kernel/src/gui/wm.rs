@@ -583,6 +583,10 @@ impl Wm {
                 Command::Send(to, msg) => self.send(to, msg),
                 Command::SetResolution(w, h) => {
                     let ok = self.set_resolution(w, h);
+                    if ok {
+                        let mode = (self.width as u32, self.height as u32);
+                        settings::update(|s| s.resolution = Some(mode));
+                    }
                     self.send(id, Msg::ResolutionResult(ok));
                 }
                 Command::Shutdown => crate::power::shutdown(),

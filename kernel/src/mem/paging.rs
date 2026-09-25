@@ -130,6 +130,54 @@ pub fn map_mmio(phys: u64, len: usize) -> u64 {
     phys_to_virt(phys)
 }
 
+/// PTE flags selecting a write-combining memory type through the PAT.
+/// Uses an existing WC entry if the bootloader set one up, otherwise
+/// reprograms PAT entry 7 (normally UC, unused by us) as WC.
+fn wc_flags() -> u64 {
+    static FLAGS: Spin<Option<u64>> = Spin::new(None);
+    let mut g = FLAGS.lock();
+    if let Some(f) = *g {
+        return f;
+    }
+    const IA32_PAT: u32 = 0x277;
+    let pat = unsafe { cpu::rdmsr(IA32_PAT) };
+    let idx = match (0..8).find(|i| (pat >> (i * 8)) & 0x7 == 0x01) {
+        Some(i) => i,
+        None => {
+            let new = (pat & !(0xffu64 << 56)) | (0x01u64 << 56);
+            unsafe {
+                cpu::wrmsr(IA32_PAT, new);
+                core::arch::asm!("wbinvd");
+                cpu::write_cr3(cpu::read_cr3());
+            }
+            7
+        }
+    };
+    let f = (if idx & 1 != 0 { WRITE_THROUGH } else { 0 })
+        | (if idx & 2 != 0 { NO_CACHE } else { 0 })
+        | (if idx & 4 != 0 { HUGE } else { 0 }); // bit 7 is the PAT bit in a 4 KiB PTE
+    *g = Some(f);
+    f
+}
+
+/// Map a framebuffer write-combining (fast sequential writes) into the
+/// direct map. Pages that are already mapped keep their attributes.
+pub fn map_framebuffer(phys: u64, len: usize) -> u64 {
+    let flags = wc_flags();
+    let start = phys & !(PAGE_SIZE - 1);
+    let end = (phys + len as u64).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let pml4 = kernel_pml4();
+    let mut p = start;
+    while p < end {
+        let v = phys_to_virt(p);
+        if translate(pml4, v).is_none() {
+            map(pml4, v, p, WRITABLE | NO_EXECUTE | flags).expect("map_framebuffer failed");
+        }
+        p += PAGE_SIZE;
+    }
+    phys_to_virt(phys)
+}
+
 /// A fresh address space sharing the kernel half.
 pub fn new_address_space() -> Option<u64> {
     let pml4 = pmm::alloc_frame_zeroed()?;
