@@ -374,3 +374,35 @@ fn mounts_mbr_and_gpt_partitions() {
         fs::remove_file(&path).unwrap();
     }
 }
+
+#[test]
+fn file_handles_read_at_and_append() {
+    let Some(img) = new_image(64) else { return };
+    let data: Vec<u8> = (0..2_345_678u32).map(|i| (i * 31 + i / 7) as u8).collect();
+    {
+        let mut fs = mount(&img);
+        fs.create_dir("/up").unwrap();
+        let mut w = fs.create_writer("/up/streamed file.bin").unwrap();
+        // Uneven chunk sizes cross sector and cluster boundaries.
+        let mut p = 0;
+        let mut k = 0;
+        while p < data.len() {
+            let n = [1, 511, 512, 513, 4096, 70_000, 3][k % 7].min(data.len() - p);
+            fs.append(&mut w, &data[p..p + n]).unwrap();
+            p += n;
+            k += 1;
+        }
+        fs.finish_writer(&w).unwrap();
+        let h = fs.open_file("/up/streamed file.bin").unwrap();
+        assert_eq!(h.size, data.len() as u64);
+        for (off, len) in [(0usize, 10usize), (511, 2), (4000, 100_000), (2_345_000, 5000), (1_000_001, 1)] {
+            let mut buf = vec![0u8; len];
+            let n = fs.read_at(&h, off as u64, &mut buf).unwrap();
+            let want = &data[off..(off + len).min(data.len())];
+            assert_eq!(&buf[..n], want, "read_at {off} {len}");
+        }
+    }
+    fsck(&img);
+    assert_eq!(mtype(&img, "/up/streamed file.bin"), data);
+    fs::remove_file(&img).unwrap();
+}

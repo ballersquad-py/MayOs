@@ -41,7 +41,13 @@ struct Src<'a> {
 /// Luma prediction of a w x h block whose integer position is (x, y) with
 /// quarter-sample fraction (fx, fy); result in `out` (stride 16).
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn luma(src: &[u8], stride: usize, pw: usize, ph: usize, x: i32, y: i32, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], oo: usize, os: usize) {
+    luma_impl(src, stride, pw, ph, x, y, fx, fy, w, h, out, oo, os)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn luma_impl(src: &[u8], stride: usize, pw: usize, ph: usize, x: i32, y: i32, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], oo: usize, os: usize) {
     let mut win = [0u8; WS * WS];
     let inside = x >= 2 && y >= 2 && x as usize + w + 3 <= pw && y as usize + h + 3 <= ph;
     let v = if inside {
@@ -164,7 +170,13 @@ pub fn luma(src: &[u8], stride: usize, pw: usize, ph: usize, x: i32, y: i32, fx:
 
 /// Chroma prediction (4:2:0, eighth-sample accuracy) of a w x h block.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn chroma(src: &[u8], stride: usize, pw: usize, ph: usize, x: i32, y: i32, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], oo: usize, os: usize) {
+    chroma_impl(src, stride, pw, ph, x, y, fx, fy, w, h, out, oo, os)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chroma_impl(src: &[u8], stride: usize, pw: usize, ph: usize, x: i32, y: i32, fx: u32, fy: u32, w: usize, h: usize, out: &mut [u8], oo: usize, os: usize) {
     let mut win = [0u8; 9 * 9];
     let inside = x >= 0 && y >= 0 && x as usize + w < pw && y as usize + h < ph;
     let (s, st, o) = if inside {

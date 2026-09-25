@@ -15,6 +15,24 @@ pub fn to_argb(
     full: bool,
     out: &mut [u32],
 ) {
+    to_argb_impl(y, u, v, ys, cs, cx, cy, w, h, bt709, full, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_argb_impl(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    ys: usize,
+    cs: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    bt709: bool,
+    full: bool,
+    out: &mut [u32],
+) {
     // Coefficients in 1/1024 units.
     let (cr_r, cb_g, cr_g, cb_b) = match (bt709, full) {
         (false, false) => (1634, 401, 832, 2066),
@@ -59,6 +77,27 @@ pub fn scale_to_argb(
     dh: usize,
     ds: usize,
 ) {
+    scale_to_argb_impl(y, u, v, ys, cs, cx, cy, w, h, bt709, full, dst, dw, dh, ds)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scale_to_argb_impl(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    ys: usize,
+    cs: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    bt709: bool,
+    full: bool,
+    dst: &mut [u32],
+    dw: usize,
+    dh: usize,
+    ds: usize,
+) {
     if dw == 0 || dh == 0 || w == 0 || h == 0 {
         return;
     }
@@ -74,8 +113,11 @@ pub fn scale_to_argb(
     let step_y = ((h as u64) << 16) / dh as u64;
     let mut lx = alloc::vec::Vec::with_capacity(dw);
     let mut cxs = alloc::vec::Vec::with_capacity(dw);
-    for i in 0..dw {
-        let sx = ((i as u64 * 2 + 1) * step_x / 2).saturating_sub(1 << 15) as usize;
+    // Sample centres: (i + 0.5) * step - 0.5, stepped incrementally.
+    let mut acc = step_x / 2;
+    for _ in 0..dw {
+        let sx = if acc > (1 << 15) { (acc - (1 << 15)) as usize } else { 0 };
+        acc += step_x;
         let x0 = (sx >> 16).min(w - 1);
         let x1 = (x0 + 1).min(w - 1);
         lx.push((cx + x0, cx + x1, ((sx >> 8) & 0xff) as i32));
@@ -83,8 +125,10 @@ pub fn scale_to_argb(
         let c0 = ((csx >> 16) + cx / 2).min((cx + w) / 2 - 1);
         cxs.push(c0);
     }
+    let mut accy = step_y / 2;
     for j in 0..dh {
-        let sy = ((j as u64 * 2 + 1) * step_y / 2).saturating_sub(1 << 15) as usize;
+        let sy = if accy > (1 << 15) { (accy - (1 << 15)) as usize } else { 0 };
+        accy += step_y;
         let y0 = (sy >> 16).min(h - 1);
         let y1 = (y0 + 1).min(h - 1);
         let fy = ((sy >> 8) & 0xff) as i32;
@@ -110,22 +154,35 @@ pub fn scale_to_argb(
 }
 
 /// Bilinear scale of 0xAARRGGBB pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn scale_argb(src: &[u32], w: usize, h: usize, dst: &mut [u32], dw: usize, dh: usize, ds: usize) {
+    scale_argb_impl(src, w, h, dst, dw, dh, ds)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scale_argb_impl(src: &[u32], w: usize, h: usize, dst: &mut [u32], dw: usize, dh: usize, ds: usize) {
     if dw == 0 || dh == 0 || w == 0 || h == 0 {
         return;
     }
     let step_x = ((w as u64) << 16) / dw as u64;
     let step_y = ((h as u64) << 16) / dh as u64;
+    let mut cols = alloc::vec::Vec::with_capacity(dw);
+    let mut acc = step_x / 2;
+    for _ in 0..dw {
+        let sx = if acc > (1 << 15) { (acc - (1 << 15)) as usize } else { 0 };
+        acc += step_x;
+        let x0 = (sx >> 16).min(w - 1);
+        cols.push((x0, (x0 + 1).min(w - 1), ((sx >> 8) & 0xff) as u32));
+    }
+    let mut accy = step_y / 2;
     for j in 0..dh {
-        let sy = ((j as u64 * 2 + 1) * step_y / 2).saturating_sub(1 << 15) as usize;
+        let sy = if accy > (1 << 15) { (accy - (1 << 15)) as usize } else { 0 };
+        accy += step_y;
         let y0 = (sy >> 16).min(h - 1);
         let y1 = (y0 + 1).min(h - 1);
         let fy = ((sy >> 8) & 0xff) as u32;
         for i in 0..dw {
-            let sx = ((i as u64 * 2 + 1) * step_x / 2).saturating_sub(1 << 15) as usize;
-            let x0 = (sx >> 16).min(w - 1);
-            let x1 = (x0 + 1).min(w - 1);
-            let fx = ((sx >> 8) & 0xff) as u32;
+            let (x0, x1, fx) = cols[i];
             let (p00, p01, p10, p11) = (src[y0 * w + x0], src[y0 * w + x1], src[y1 * w + x0], src[y1 * w + x1]);
             let mut out = 0xff00_0000u32;
             for sh in [0u32, 8, 16] {

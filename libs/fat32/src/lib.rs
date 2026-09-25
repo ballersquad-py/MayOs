@@ -76,6 +76,16 @@ impl core::fmt::Display for FsError {
 pub type Result<T> = core::result::Result<T, FsError>;
 
 /// A disk made of 512-byte sectors. `buf.len()` is always a multiple of 512.
+/// An open file: random-access reads, or appending writes when created
+/// with `FatFs::create_writer`.
+#[derive(Clone, Debug)]
+pub struct FileHandle {
+    pub size: u64,
+    chain: Vec<u32>,
+    parent: u32,
+    entry: Option<DirEntry>,
+}
+
 pub trait BlockDevice {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> core::result::Result<(), ()>;
     fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), ()>;
@@ -1109,6 +1119,134 @@ impl<D: BlockDevice> FatFs<D> {
             self.read_chain(&chain, &mut data)?;
         }
         Ok(data)
+    }
+
+    /// Open a file for reading with `read_at`.
+    pub fn open_file(&mut self, path: &str) -> Result<FileHandle> {
+        let e = self.stat(path)?;
+        if e.is_dir {
+            return Err(FsError::IsADirectory);
+        }
+        let chain = if e.size > 0 { self.chain(e.first_cluster)? } else { Vec::new() };
+        if (chain.len() * self.cluster_size()) < e.size as usize {
+            return Err(FsError::Corrupt);
+        }
+        Ok(FileHandle { size: e.size as u64, chain, parent: 0, entry: None })
+    }
+
+    /// Read up to `out.len()` bytes at `off`; returns the number read.
+    pub fn read_at(&mut self, h: &FileHandle, off: u64, out: &mut [u8]) -> Result<usize> {
+        if off >= h.size {
+            return Ok(0);
+        }
+        let n = (out.len() as u64).min(h.size - off) as usize;
+        let cs = self.cluster_size();
+        let mut done = 0;
+        while done < n {
+            let pos = off as usize + done;
+            let ci = pos / cs;
+            let within = pos % cs;
+            let mut run = 1;
+            while ci + run < h.chain.len() && h.chain[ci + run] == h.chain[ci] + run as u32 && run < 256 {
+                run += 1;
+            }
+            let take = (run * cs - within).min(n - done);
+            let lba = self.cluster_lba(h.chain[ci]) + (within / SECTOR) as u64;
+            let sec_off = within % SECTOR;
+            if sec_off == 0 && take >= SECTOR {
+                let whole = take / SECTOR * SECTOR;
+                self.dev.read(lba, &mut out[done..done + whole]).map_err(|_| FsError::Io)?;
+                done += whole;
+            } else {
+                let mut tmp = [0u8; SECTOR];
+                self.dev.read(lba, &mut tmp).map_err(|_| FsError::Io)?;
+                let k = (SECTOR - sec_off).min(take);
+                out[done..done + k].copy_from_slice(&tmp[sec_off..sec_off + k]);
+                done += k;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Create (or truncate) a file for writing with `append`; call
+    /// `finish_writer` at the end to record its size.
+    pub fn create_writer(&mut self, path: &str) -> Result<FileHandle> {
+        self.write_file(path, &[])?;
+        let (parent, name) = self.parent_of(path)?;
+        let e = self.find_in(parent, name)?.ok_or(FsError::NotFound)?;
+        Ok(FileHandle { size: 0, chain: Vec::new(), parent, entry: Some(e) })
+    }
+
+    fn write_bytes_at(&mut self, lba: u64, offset: usize, data: &[u8]) -> Result<()> {
+        let mut lba = lba + (offset / SECTOR) as u64;
+        let mut off = offset % SECTOR;
+        let mut p = 0;
+        while p < data.len() {
+            let k = (SECTOR - off).min(data.len() - p);
+            if off == 0 && k == SECTOR {
+                let whole = (data.len() - p) / SECTOR * SECTOR;
+                self.dev.write(lba, &data[p..p + whole]).map_err(|_| FsError::Io)?;
+                let last = lba + (whole / SECTOR) as u64;
+                let first = lba;
+                self.cache.retain(|c| c.lba < first || c.lba >= last);
+                lba += (whole / SECTOR) as u64;
+                p += whole;
+                continue;
+            }
+            let mut tmp = [0u8; SECTOR];
+            self.dev.read(lba, &mut tmp).map_err(|_| FsError::Io)?;
+            tmp[off..off + k].copy_from_slice(&data[p..p + k]);
+            self.dev.write(lba, &tmp).map_err(|_| FsError::Io)?;
+            let l = lba;
+            self.cache.retain(|c| c.lba != l);
+            p += k;
+            lba += 1;
+            off = 0;
+        }
+        Ok(())
+    }
+
+    /// Append bytes to a file opened with `create_writer`.
+    pub fn append(&mut self, h: &mut FileHandle, data: &[u8]) -> Result<()> {
+        if h.entry.is_none() {
+            return Err(FsError::InvalidPath);
+        }
+        if h.size + data.len() as u64 > u32::MAX as u64 {
+            return Err(FsError::NoSpace);
+        }
+        let cs = self.cluster_size();
+        let mut p = 0;
+        let used = (h.size % cs as u64) as usize;
+        if let (Some(&last), true) = (h.chain.last(), used != 0) {
+            let take = (cs - used).min(data.len());
+            let lba = self.cluster_lba(last);
+            self.write_bytes_at(lba, used, &data[..take])?;
+            p = take;
+        }
+        while p < data.len() {
+            let c = self.alloc_cluster(h.chain.last().copied())?;
+            h.chain.push(c);
+            let take = cs.min(data.len() - p);
+            let lba = self.cluster_lba(c);
+            if take == cs {
+                self.write_bytes_at(lba, 0, &data[p..p + cs])?;
+            } else {
+                let mut tmp = vec![0u8; cs];
+                tmp[..take].copy_from_slice(&data[p..p + take]);
+                self.write_bytes_at(lba, 0, &tmp)?;
+            }
+            p += take;
+        }
+        h.size += data.len() as u64;
+        Ok(())
+    }
+
+    /// Record the final size of a file written with `append`.
+    pub fn finish_writer(&mut self, h: &FileHandle) -> Result<()> {
+        let e = h.entry.as_ref().ok_or(FsError::InvalidPath)?;
+        let first = h.chain.first().copied().unwrap_or(0);
+        self.update_entry(h.parent, e, first, h.size as u32)?;
+        self.flush()
     }
 
     /// Create or replace a file with `data`.

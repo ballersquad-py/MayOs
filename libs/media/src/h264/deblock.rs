@@ -18,6 +18,7 @@ fn mv_far(a: [i16; 2], b: [i16; 2]) -> bool {
     (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4
 }
 
+#[inline(always)]
 fn strength(p: &MbInfo, pb: usize, q: &MbInfo, qb: usize, mb_edge: bool) -> u8 {
     if p.is_intra() || q.is_intra() {
         return if mb_edge { 4 } else { 3 };
@@ -64,7 +65,7 @@ fn strength(p: &MbInfo, pb: usize, q: &MbInfo, qb: usize, mb_edge: bool) -> u8 {
 
 /// Filter one line of samples across an edge. `o` is the index of q0,
 /// `d` the step from q0 to q1.
-#[inline]
+#[inline(always)]
 fn filter_line(s: &mut [u8], o: usize, d: isize, bs: u8, alpha: i32, beta: i32, tc0: i32, chroma: bool) {
     let at = |k: isize| (o as isize + k * d) as usize;
     let p0 = s[at(-1)] as i32;
@@ -161,6 +162,10 @@ fn uniform(i: &MbInfo) -> bool {
 }
 
 pub fn deblock_picture(pic: &mut CurPic) {
+    deblock_all(pic)
+}
+
+fn deblock_all(pic: &mut CurPic) {
     let (mb_w, mb_h) = (pic.mb_w, pic.mb_h);
     let ys = mb_w * 16;
     let cs = mb_w * 8;
