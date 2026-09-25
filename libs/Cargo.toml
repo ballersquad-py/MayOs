@@ -1,4 +1,4 @@
 # Host-testable libraries shared by the kernel (run `cargo test` here).
 [workspace]
 resolver = "3"
-members = ["fat32", "gfx", "net", "image"]
+members = ["fat32", "gfx", "net", "image", "media"]
