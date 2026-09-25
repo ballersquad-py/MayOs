@@ -6,6 +6,9 @@
 pub mod about;
 pub mod app;
 pub mod browser;
+pub mod canvas2d;
+pub mod webfont;
+pub mod js;
 pub mod cursor;
 pub mod dialog;
 pub mod display;

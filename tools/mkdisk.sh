@@ -14,6 +14,7 @@ if [ ! -f "$IMG" ]; then
     mcopy -i "$IMG" "$ROOT/assets/disk/Welcome.txt" ::/Welcome.txt
     mcopy -i "$IMG" "$ROOT/assets/disk/docs/Getting Started.txt" "::/docs/Getting Started.txt"
     mcopy -i "$IMG" "$ROOT/assets/disk/docs/notes/todo.txt" ::/docs/notes/todo.txt
+    mcopy -i "$IMG" "$ROOT/assets/disk/docs/snake.html" ::/docs/snake.html
     mcopy -i "$IMG" "$ROOT/docs/ROADMAP.md" ::/docs/Roadmap.md
     mcopy -i "$IMG" "$ROOT"/assets/disk/pictures/* ::/pictures/
     mcopy -i "$IMG" "$ROOT"/assets/disk/videos/* ::/videos/

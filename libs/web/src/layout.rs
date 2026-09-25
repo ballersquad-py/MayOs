@@ -12,6 +12,8 @@ use crate::style::{Align, Display, ListStyle, Style, StyledNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontSpec {
+    /// Family list id (see `family_id`).
+    pub family: u32,
     pub size: u16,
     pub bold: bool,
     pub italic: bool,
@@ -31,7 +33,7 @@ pub trait Images {
 
 #[derive(Debug, Clone)]
 pub enum Item {
-    Rect { x: i32, y: i32, w: i32, h: i32, color: u32 },
+    Rect { x: i32, y: i32, w: i32, h: i32, color: u32, radius: i32 },
     /// `y` is the top of the line box, `h` its height (text sits on the
     /// shared baseline `y + base`).
     Text { x: i32, y: i32, base: i32, text: String, font: FontSpec, color: u32, underline: bool, strike: bool },
@@ -55,6 +57,9 @@ pub struct Page {
     pub background: Option<u32>,
     /// `src`s of every image on the page (to load).
     pub images: Vec<String>,
+    /// Where each element (by node id) ended up: (id, x, y, w, h), in
+    /// document order; used for clicks and `getBoundingClientRect`.
+    pub boxes: Vec<(u32, i32, i32, i32, i32)>,
 }
 
 pub fn layout(root: &StyledNode, width: i32, fonts: &dyn Fonts, images: &dyn Images) -> Page {
@@ -71,7 +76,42 @@ fn tag<'a>(n: &'a StyledNode) -> Option<&'a str> {
 }
 
 fn font_of(s: &Style) -> FontSpec {
-    FontSpec { size: s.font_size.clamp(6.0, 96.0) as u16, bold: s.bold, italic: s.italic, mono: s.mono }
+    FontSpec { family: family_id(&s.family), size: s.font_size.clamp(6.0, 96.0) as u16, bold: s.bold, italic: s.italic, mono: s.mono }
+}
+
+// Family lists ("Roboto, Arial, sans-serif") are interned to small ids so
+// `FontSpec` stays `Copy`.
+static FAMILY_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut FAMILIES: Vec<String> = Vec::new();
+
+fn with_families<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    while FAMILY_LOCK.compare_exchange(false, true, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    #[allow(static_mut_refs)]
+    let r = f(unsafe { &mut FAMILIES });
+    FAMILY_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    r
+}
+
+pub fn family_id(list: &str) -> u32 {
+    if list.is_empty() {
+        return 0;
+    }
+    with_families(|v| match v.iter().position(|x| x == list) {
+        Some(i) => i as u32 + 1,
+        None => {
+            v.push(list.to_string());
+            v.len() as u32
+        }
+    })
+}
+
+pub fn family_name(id: u32) -> String {
+    if id == 0 {
+        return String::new();
+    }
+    with_families(|v| v.get(id as usize - 1).cloned().unwrap_or_default())
 }
 
 fn is_block_level(d: Display) -> bool {
@@ -80,8 +120,8 @@ fn is_block_level(d: Display) -> bool {
 
 /// A piece of inline content.
 enum Tok<'a> {
-    Word { text: String, space_before: bool, style: &'a Style, link: Option<&'a str> },
-    Image { w: f32, h: f32, src: String, link: Option<&'a str>, space_before: bool },
+    Word { text: String, space_before: bool, style: &'a Style, link: Option<&'a str>, owner: u32 },
+    Image { w: f32, h: f32, src: String, link: Option<&'a str>, space_before: bool, owner: u32 },
     Break,
 }
 
@@ -153,7 +193,7 @@ impl Layout<'_> {
         let content_y = top + b.top + p.top;
         let bg_index = self.page.items.len();
         if s.background.is_some() {
-            self.page.items.push(Item::Rect { x: 0, y: 0, w: 0, h: 0, color: 0 });
+            self.page.items.push(Item::Rect { x: 0, y: 0, w: 0, h: 0, color: 0, radius: 0 });
         }
         if let Some(i) = marker
             && s.list_style != ListStyle::None
@@ -179,8 +219,9 @@ impl Layout<'_> {
         }
         let box_h = h + p.top + p.bottom + b.top + b.bottom;
         if let Some(c) = s.background {
-            self.page.items[bg_index] = Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: box_h as i32, color: c };
+            self.page.items[bg_index] = Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: box_h as i32, color: c, radius: s.radius as i32 };
         }
+        self.page.boxes.push((n.node.id, bx as i32, top as i32, outer as i32, box_h as i32));
         let bc = s.border_color;
         let (xi, yi, wi, hi) = (bx as i32, top as i32, outer as i32, box_h as i32);
         for (on, r) in [
@@ -189,9 +230,13 @@ impl Layout<'_> {
             (b.left, (xi, yi, b.left as i32, hi)),
             (b.right, (xi + wi - b.right as i32, yi, b.right as i32, hi)),
         ] {
-            if on >= 0.5 {
-                self.page.items.push(Item::Rect { x: r.0, y: r.1, w: r.2.max(1), h: r.3.max(1), color: bc });
+            if on >= 0.5 && s.radius < 1.0 {
+                self.page.items.push(Item::Rect { x: r.0, y: r.1, w: r.2.max(1), h: r.3.max(1), color: bc, radius: 0 });
             }
+        }
+        if s.radius >= 1.0 && (b.top >= 0.5 || b.left >= 0.5) {
+            // Rounded border: an outline item (radius negative = stroke).
+            self.page.items.push(Item::Rect { x: xi, y: yi, w: wi, h: hi, color: bc, radius: -(s.radius as i32).max(1) });
         }
         box_h
     }
@@ -237,18 +282,19 @@ impl Layout<'_> {
         let w = (outer - p.left - p.right - b.left - b.right).max(0.0);
         let bg_index = self.page.items.len();
         if s.background.is_some() {
-            self.page.items.push(Item::Rect { x: 0, y: 0, w: 0, h: 0, color: 0 });
+            self.page.items.push(Item::Rect { x: 0, y: 0, w: 0, h: 0, color: 0, radius: 0 });
         }
         let h = self.block_children(n, bx + b.left + p.left, w, top + b.top + p.top);
         let box_h = h.max(s.height.unwrap_or(0.0)) + p.top + p.bottom + b.top + b.bottom;
         if let Some(c) = s.background {
-            self.page.items[bg_index] = Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: box_h as i32, color: c };
+            self.page.items[bg_index] = Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: box_h as i32, color: c, radius: s.radius as i32 };
         }
+        self.page.boxes.push((n.node.id, bx as i32, top as i32, outer as i32, box_h as i32));
         if b.bottom >= 0.5 {
-            self.page.items.push(Item::Rect { x: bx as i32, y: (top + box_h - b.bottom) as i32, w: outer as i32, h: b.bottom as i32, color: s.border_color });
+            self.page.items.push(Item::Rect { x: bx as i32, y: (top + box_h - b.bottom) as i32, w: outer as i32, h: b.bottom as i32, color: s.border_color, radius: 0 });
         }
         if b.top >= 0.5 {
-            self.page.items.push(Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: b.top as i32, color: s.border_color });
+            self.page.items.push(Item::Rect { x: bx as i32, y: top as i32, w: outer as i32, h: b.top as i32, color: s.border_color, radius: 0 });
         }
         box_h
     }
@@ -259,12 +305,12 @@ impl Layout<'_> {
         let mut toks = Vec::new();
         let mut space = false;
         for n in nodes {
-            self.flatten(n, None, &mut toks, &mut space);
+            self.flatten(n, None, 0, &mut toks, &mut space);
         }
         self.lines(&toks, block, x, w, y)
     }
 
-    fn flatten<'a>(&mut self, n: &'a StyledNode<'a>, link: Option<&'a str>, out: &mut Vec<Tok<'a>>, space: &mut bool) {
+    fn flatten<'a>(&mut self, n: &'a StyledNode<'a>, link: Option<&'a str>, owner: u32, out: &mut Vec<Tok<'a>>, space: &mut bool) {
         match &n.node.node_type {
             NodeType::Text(t) => {
                 let s = &n.style;
@@ -275,7 +321,7 @@ impl Layout<'_> {
                         }
                         if !line.is_empty() {
                             let text = line.replace('\t', "    ");
-                            out.push(Tok::Word { text, space_before: false, style: s, link });
+                            out.push(Tok::Word { text, space_before: false, style: s, link, owner });
                         }
                     }
                     *space = false;
@@ -288,12 +334,12 @@ impl Layout<'_> {
                 if s.nowrap {
                     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     if !joined.is_empty() {
-                        out.push(Tok::Word { text: joined, space_before: *space, style: s, link });
+                        out.push(Tok::Word { text: joined, space_before: *space, style: s, link, owner });
                         *space = false;
                     }
                 } else {
                     for word in text.split_whitespace() {
-                        out.push(Tok::Word { text: word.to_string(), space_before: *space, style: s, link });
+                        out.push(Tok::Word { text: word.to_string(), space_before: *space, style: s, link, owner });
                         *space = true;
                     }
                     *space = text.ends_with(char::is_whitespace) || (*space && text.trim().is_empty());
@@ -316,10 +362,17 @@ impl Layout<'_> {
                 if e.tag_name == "li" && !block {
                     *space = true;
                 }
+                let owner = n.node.id;
                 let link = if e.tag_name == "a" { e.attrs.get("href").map(|h| h.as_str()).or(link) } else { link };
                 match e.tag_name.as_str() {
                     "br" => {
                         out.push(Tok::Break);
+                        *space = false;
+                    }
+                    "canvas" => {
+                        let w = n.style.width.map(|l| l.resolve(800.0)).unwrap_or(300.0);
+                        let h = n.style.height.unwrap_or(150.0);
+                        out.push(Tok::Image { w, h, src: alloc::format!("canvas:{}", n.node.id), link, space_before: *space, owner });
                         *space = false;
                     }
                     "img" => {
@@ -337,9 +390,9 @@ impl Layout<'_> {
                             self.page.images.push(src.clone());
                         }
                         if w >= 1.0 && h >= 1.0 {
-                            out.push(Tok::Image { w, h, src, link, space_before: *space });
+                            out.push(Tok::Image { w, h, src, link, space_before: *space, owner });
                         } else if let Some(alt) = e.attrs.get("alt").filter(|a| !a.trim().is_empty()) {
-                            out.push(Tok::Word { text: alloc::format!("[{}]", alt.trim()), space_before: *space, style: &n.style, link });
+                            out.push(Tok::Word { text: alloc::format!("[{}]", alt.trim()), space_before: *space, style: &n.style, link, owner });
                         }
                         *space = false;
                     }
@@ -351,12 +404,12 @@ impl Layout<'_> {
                             "radio" => "\u{25cb}".to_string(),
                             _ => alloc::format!("[ {} ]", text),
                         };
-                        out.push(Tok::Word { text, space_before: *space, style: &n.style, link });
+                        out.push(Tok::Word { text, space_before: *space, style: &n.style, link, owner });
                         *space = true;
                     }
                     _ => {
                         for c in &n.children {
-                            self.flatten(c, link, out, space);
+                            self.flatten(c, link, owner, out, space);
                         }
                     }
                 }
@@ -404,14 +457,14 @@ impl Layout<'_> {
             let mut i = 0;
             while i < line.len() {
                 match line[i].tok {
-                    Tok::Word { style, link, .. } => {
+                    Tok::Word { style, link, owner, .. } => {
                         let start_x = line[i].x;
                         let mut text = String::new();
                         let mut j = i;
                         let mut end_x = start_x;
                         while j < line.len() {
-                            let Tok::Word { text: t, style: s2, link: l2, space_before } = line[j].tok else { break };
-                            if !core::ptr::eq(*s2, *style) || *l2 != *link {
+                            let Tok::Word { text: t, style: s2, link: l2, space_before, owner: o2 } = line[j].tok else { break };
+                            if !core::ptr::eq(*s2, *style) || *l2 != *link || *o2 != *owner {
                                 break;
                             }
                             if j > i && *space_before {
@@ -438,13 +491,15 @@ impl Layout<'_> {
                         if let Some(href) = link {
                             this.page.links.push(Link { x: (x + shift + start_x) as i32, y: top as i32, w: (end_x - start_x) as i32, h: lh as i32, href: href.to_string() });
                         }
+                        this.page.boxes.push((*owner, (x + shift + start_x) as i32, top as i32, (end_x - start_x) as i32, lh as i32));
                         i = j;
                     }
-                    Tok::Image { src, link, .. } => {
+                    Tok::Image { src, link, owner, .. } => {
                         let (iw, ih) = (&line[i].w, &line[i].h);
                         let ix = (x + shift + line[i].x) as i32;
                         let iy = (top + lh - ih) as i32;
                         this.page.items.push(Item::Image { x: ix, y: iy, w: *iw as i32, h: *ih as i32, src: src.clone() });
+                        this.page.boxes.push((*owner, ix, iy, *iw as i32, *ih as i32));
                         if let Some(href) = link {
                             this.page.links.push(Link { x: ix, y: iy, w: *iw as i32, h: *ih as i32, href: href.to_string() });
                         }

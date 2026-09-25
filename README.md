@@ -25,8 +25,12 @@ Settings app are done.
 - **Web browser**: HTTP and HTTPS (TLS 1.3 via the `embedded-tls` crate),
   HTML and CSS (engine in `libs/web`, built from Matt Brubeck's
   [robinson](https://github.com/mbrubeck/robinson), MIT) with text layout,
-  links, pictures, lists and tables, back/forward, search from the address
-  bar. No JavaScript yet, and certificates are not checked yet.
+  links, pictures, lists, tables, rounded corners and web fonts
+  (`@font-face`, TrueType via `ab_glyph`); JavaScript through
+  [QuickJS](https://bellard.org/quickjs/) (MIT) with a DOM, events, timers,
+  `<canvas>` 2D, cookies and `localStorage`. Try `/docs/snake.html`.
+  Certificates are not checked yet; `fetch`/XHR, floats, grid and WOFF2
+  fonts are still missing.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).

@@ -58,12 +58,20 @@ fn get_once(url: &Url) -> Result<Response, String> {
     }
     let ip = super::resolve(&url.host).map_err(|e| format!("{}: {}", url.host, e))?;
     let stream = TcpStream::connect(ip, url.port, TIMEOUT_MS).map_err(|e| format!("{}: {}", url.host, e))?;
+    let cookies = crate::gui::js::cookie_header(url);
+    let cookie_line = if cookies.is_empty() { String::new() } else { format!("Cookie: {}\r\n", cookies) };
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Encoding: identity\r\nAccept-Language: en\r\nConnection: close\r\n\r\n",
-        url.path, url.host, USER_AGENT
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Encoding: identity\r\nAccept-Language: en\r\n{}Connection: close\r\n\r\n",
+        url.path, url.host, USER_AGENT, cookie_line
     );
     let raw = if url.scheme == "https" { tls_exchange(stream, &url.host, request.as_bytes())? } else { plain_exchange(stream, request.as_bytes())? };
-    parse_response(raw, url)
+    let r = parse_response(raw, url)?;
+    for (k, v) in &r.headers {
+        if k.eq_ignore_ascii_case("set-cookie") {
+            crate::gui::js::set_cookie(url, v);
+        }
+    }
+    Ok(r)
 }
 
 fn plain_exchange(mut s: TcpStream, req: &[u8]) -> Result<Vec<u8>, String> {

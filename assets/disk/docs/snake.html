@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+<title>Snake</title>
+<style>
+  body { background: #1b1f2a; color: #e6e8ee; font-family: sans-serif; text-align: center; margin: 0; padding: 20px; }
+  h1 { color: #7ed38f; margin: 10px 0; }
+  #board { border: 2px solid #3a4152; border-radius: 8px; background: #11141b; }
+  .info { color: #9aa3b5; }
+  button { background: #2f7cf6; color: #ffffff; border: none; border-radius: 8px; padding: 6px 16px; }
+</style>
+</head>
+<body>
+<h1>Snake</h1>
+<p class="info">Arrow keys to steer. Eat the red apples.</p>
+<p>Score: <b id="score">0</b> &nbsp; Best: <b id="best">0</b></p>
+<canvas id="board" width="400" height="400"></canvas>
+<p><button id="restart">New game</button></p>
+<script>
+const canvas = document.getElementById("board");
+const ctx = canvas.getContext("2d");
+const N = 20, S = 20;
+let snake, dir, next, apple, score, over;
+const best = document.getElementById("best");
+best.textContent = localStorage.getItem("snake-best") || "0";
+
+function place() {
+  do { apple = { x: Math.floor(Math.random() * N), y: Math.floor(Math.random() * N) }; }
+  while (snake.some(p => p.x === apple.x && p.y === apple.y));
+}
+function reset() {
+  snake = [{ x: 10, y: 10 }, { x: 9, y: 10 }, { x: 8, y: 10 }];
+  dir = next = { x: 1, y: 0 };
+  score = 0; over = false;
+  document.getElementById("score").textContent = score;
+  place();
+}
+function step() {
+  if (over) return;
+  dir = next;
+  const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+  if (head.x < 0 || head.y < 0 || head.x >= N || head.y >= N || snake.some(p => p.x === head.x && p.y === head.y)) {
+    over = true;
+    if (score > +(localStorage.getItem("snake-best") || 0)) { localStorage.setItem("snake-best", score); best.textContent = score; }
+    return;
+  }
+  snake.unshift(head);
+  if (head.x === apple.x && head.y === apple.y) { score++; document.getElementById("score").textContent = score; place(); }
+  else snake.pop();
+}
+function draw() {
+  ctx.fillStyle = "#11141b"; ctx.fillRect(0, 0, 400, 400);
+  ctx.fillStyle = "#e5484d";
+  ctx.beginPath(); ctx.arc(apple.x * S + S / 2, apple.y * S + S / 2, S / 2 - 2, 0, Math.PI * 2); ctx.fill();
+  snake.forEach((p, i) => { ctx.fillStyle = i ? "#4caf50" : "#7ed38f"; ctx.fillRect(p.x * S + 1, p.y * S + 1, S - 2, S - 2); });
+  if (over) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(0, 150, 400, 100);
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("Game over - press Space", 200, 208);
+  }
+}
+document.addEventListener("keydown", e => {
+  const d = { ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 } }[e.key];
+  if (d && (d.x !== -dir.x || d.y !== -dir.y)) next = d;
+  if (e.key === " " && over) reset();
+  if (d || e.key === " ") e.preventDefault();
+});
+document.getElementById("restart").addEventListener("click", reset);
+reset();
+setInterval(() => { step(); draw(); }, 120);
+</script>
+</body>
+</html>

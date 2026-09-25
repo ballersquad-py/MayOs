@@ -9,6 +9,17 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    pub font_faces: Vec<FontFace>,
+}
+
+/// An `@font-face` rule.
+#[derive(Debug, Clone)]
+pub struct FontFace {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// (url, format) in order of preference.
+    pub sources: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +79,9 @@ pub const MEDIA_WIDTH: f32 = 1024.0;
 pub fn parse(source: &str) -> Stylesheet {
     let src = strip_comments(source);
     let mut rules = Vec::new();
-    parse_rules(&src, &mut rules);
-    Stylesheet { rules }
+    let mut faces = Vec::new();
+    parse_rules(&src, &mut rules, &mut faces);
+    Stylesheet { rules, font_faces: faces }
 }
 
 /// Parse `name: value; ...` (a `style` attribute).
@@ -150,7 +162,7 @@ fn block_end(s: &str, from: usize) -> usize {
     s.len()
 }
 
-fn parse_rules(s: &str, out: &mut Vec<Rule>) {
+fn parse_rules(s: &str, out: &mut Vec<Rule>, faces: &mut Vec<FontFace>) {
     let mut i = 0;
     while i < s.len() {
         let rest = &s[i..];
@@ -169,10 +181,30 @@ fn parse_rules(s: &str, out: &mut Vec<Rule>) {
             let lower = at.to_ascii_lowercase();
             if lower.starts_with("media") {
                 if media_matches(&lower[5..]) {
-                    parse_rules(body, out);
+                    parse_rules(body, out, faces);
                 }
             } else if lower.starts_with("supports") || lower.starts_with("layer") || lower.starts_with("document") {
-                parse_rules(body, out);
+                parse_rules(body, out, faces);
+            } else if lower.starts_with("font-face") {
+                let d = parse_declarations(body);
+                let get = |n: &str| d.iter().rev().find(|x| x.name == n).map(|x| x.value.clone()).unwrap_or_default();
+                let family = get("font-family").trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+                let weight = get("font-weight").to_ascii_lowercase();
+                let bold = weight.contains("bold") || weight.split_whitespace().next().and_then(|w| w.parse::<u32>().ok()).map(|w| w >= 600).unwrap_or(false);
+                let italic = get("font-style").to_ascii_lowercase().contains("italic");
+                let mut sources = Vec::new();
+                for part in split_top(&get("src"), ',') {
+                    let part = part.trim();
+                    let Some(start) = part.find("url(") else { continue };
+                    let rest = &part[start + 4..];
+                    let Some(end) = rest.find(')') else { continue };
+                    let url = rest[..end].trim().trim_matches(['"', '\'']).to_string();
+                    let format = part.find("format(").map(|f| part[f + 7..].split(')').next().unwrap_or("").trim_matches(['"', '\'', ' ']).to_ascii_lowercase()).unwrap_or_default();
+                    sources.push((url, format));
+                }
+                if !family.is_empty() && !sources.is_empty() {
+                    faces.push(FontFace { family, bold, italic, sources });
+                }
             }
             // @font-face, @keyframes, @page ...: skipped.
             continue;
@@ -211,6 +243,17 @@ fn media_matches(q: &str) -> bool {
 
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii()
+}
+
+/// Parse a comma-separated selector list (for `querySelector`).
+pub fn parse_selector_list(s: &str) -> Vec<Selector> {
+    split_top(s, ',').iter().filter_map(|s| parse_selector(s)).map(|mut s| {
+        // Pseudo-classes that only matter for styling don't stop a match.
+        for (_, c) in s.parts.iter_mut() {
+            c.never = false;
+        }
+        s
+    }).collect()
 }
 
 fn parse_selector(s: &str) -> Option<Selector> {

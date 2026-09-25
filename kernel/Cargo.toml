@@ -20,6 +20,9 @@ rand_chacha = { version = "0.3", default-features = false }
 rand_core = "0.6"
 embedded-io = { version = "0.7", default-features = false }
 web = { version = "0.1.0", path = "../libs/web" }
+libm = "0.2.16"
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
 
 [profile.dev]
 panic = "abort"

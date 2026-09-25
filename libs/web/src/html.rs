@@ -17,6 +17,15 @@ const CLOSES_P: &[&str] = &[
     "header", "hr", "main", "nav", "ol", "p", "pre", "section", "table", "ul", "figure",
 ];
 
+pub fn is_void(tag: &str) -> bool {
+    VOID.contains(&tag)
+}
+
+/// Parse an HTML fragment (for `innerHTML`): returns the top-level nodes.
+pub fn parse_fragment(source: &str) -> Vec<Node> {
+    parse(source).children
+}
+
 pub fn parse(source: &str) -> Node {
     let mut b = Builder { stack: vec![dom::elem("html".into(), AttrMap::new(), Vec::new())] };
     let s = source.as_bytes();

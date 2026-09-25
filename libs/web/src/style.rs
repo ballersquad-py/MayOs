@@ -46,6 +46,8 @@ pub struct Style {
     pub bold: bool,
     pub italic: bool,
     pub mono: bool,
+    /// `font-family` list, lower case.
+    pub family: String,
     pub underline: bool,
     pub strike: bool,
     pub align: Align,
@@ -64,6 +66,9 @@ pub struct Style {
     pub list_style: ListStyle,
     pub hidden: bool,
     pub flex_row: bool,
+    /// Corner radius (px).
+    pub radius: f32,
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +103,7 @@ impl Style {
             bold: false,
             italic: false,
             mono: false,
+            family: String::new(),
             underline: false,
             strike: false,
             align: Align::Left,
@@ -115,6 +121,8 @@ impl Style {
             list_style: ListStyle::Disc,
             hidden: false,
             flex_row: false,
+            radius: 0.0,
+            opacity: 1.0,
         }
     }
 
@@ -131,6 +139,8 @@ impl Style {
             max_width: None,
             height: None,
             flex_row: false,
+            radius: 0.0,
+            opacity: 1.0,
             border_color: parent.color,
             ..parent.clone()
         }
@@ -142,7 +152,7 @@ pub const USER_AGENT_CSS: &str = r#"
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, dl, dt, dd, pre, blockquote, form, fieldset,
 header, footer, nav, main, section, article, aside, figure, figcaption, address, hr, center, details, summary, legend, menu
   { display: block; }
-head, script, style, link, meta, title, noscript, template, base, iframe, svg, canvas, video, audio, object, embed,
+head, script, style, link, meta, title, noscript, template, base, iframe, svg, video, audio, object, embed,
 input[type=hidden], datalist, dialog { display: none; }
 li { display: list-item; }
 table { display: table; }
@@ -378,7 +388,10 @@ fn apply(s: &mut Style, d: &Declaration, parent: &Style) {
         }
         "font-weight" => s.bold = lower == "bold" || lower == "bolder" || lower.parse::<u32>().map(|w| w >= 600).unwrap_or(false),
         "font-style" => s.italic = lower == "italic" || lower == "oblique",
-        "font-family" => s.mono = lower.contains("mono") || lower.contains("courier") || lower.contains("consolas"),
+        "font-family" => {
+            s.mono = lower.starts_with("monospace") || lower.contains("mono") || lower.contains("courier") || lower.contains("consolas");
+            s.family = lower.clone();
+        }
         "font" => {
             s.bold = lower.contains("bold");
             s.italic = lower.contains("italic");
@@ -453,6 +466,11 @@ fn apply(s: &mut Style, d: &Declaration, parent: &Style) {
                 ListStyle::Disc
             }
         }
+        "border-radius" => {
+            let first = css::tokens(&lower).first().copied().unwrap_or("0");
+            s.radius = css::parse_px(first.split('/').next().unwrap_or("0"), em, 100.0).unwrap_or(0.0).min(9999.0);
+        }
+        "opacity" => s.opacity = lower.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0),
         "flex-direction" => s.flex_row = !lower.starts_with("column"),
         "float" if lower == "left" || lower == "right" => {
             if s.display == Display::Inline {
@@ -531,6 +549,35 @@ fn matches_compound(e: &ElementData, c: &Compound) -> bool {
         (Some(have), Some(want)) => have.eq_ignore_ascii_case(want),
         _ => false,
     })
+}
+
+/// `querySelector(All)`: ids of elements inside `root` (a node of `doc`)
+/// matching the selector list `sel`.
+pub fn query(doc: &Node, root: u32, sel: &str, all: bool) -> Vec<u32> {
+    let sels: Vec<Selector> = css::parse_selector_list(sel);
+    let mut out = Vec::new();
+    let mut anc: Vec<&ElementData> = Vec::new();
+    fn walk<'a>(n: &'a Node, root: u32, inside: bool, sels: &[Selector], anc: &mut Vec<&'a ElementData>, all: bool, out: &mut Vec<u32>) -> bool {
+        let NodeType::Element(e) = &n.node_type else { return false };
+        if inside && sels.iter().any(|s| matches(e, anc, s)) {
+            out.push(n.id);
+            if !all {
+                return true;
+            }
+        }
+        let inside = inside || n.id == root;
+        anc.push(e);
+        for c in &n.children {
+            if walk(c, root, inside, sels, anc, all, out) {
+                anc.pop();
+                return true;
+            }
+        }
+        anc.pop();
+        false
+    }
+    walk(doc, root, false, &sels, &mut anc, all, &mut out);
+    out
 }
 
 /// Collect the author stylesheets of a document: `<style>` blocks, and
