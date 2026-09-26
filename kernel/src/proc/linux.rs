@@ -2414,6 +2414,54 @@ fn timespec_ms(p: &Process, ptr: u64) -> Option<u64> {
     Some((s.max(0) as u64).saturating_mul(1000).saturating_add((ns.max(0) as u64).div_ceil(1_000_000)))
 }
 
+/// The futex word as an atomic, through the kernel's map of physical
+/// memory (the page is brought in first).
+fn futex_word(p: &Process, addr: u64) -> Option<&'static core::sync::atomic::AtomicU32> {
+    if addr & 3 != 0 || usermem::read_bytes(p.pml4(), addr, 4).is_none() {
+        return None;
+    }
+    let (phys, _) = paging::translate(p.pml4(), addr)?;
+    Some(unsafe { &*(crate::mem::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
+}
+
+/// Priority-inheritance futex lock (no priorities here: a plain lock whose
+/// word holds the owner's thread id, with the waiters bit set while
+/// others wait).
+fn futex_pi(p: &Process, addr: u64, tptr: u64, try_only: bool) -> i64 {
+    const WAITERS: u32 = 0x8000_0000;
+    let tid = sched::current_id() as u32;
+    let deadline = match timespec_us(p, tptr) {
+        // LOCK_PI timeouts are absolute CLOCK_REALTIME.
+        Some(us) => crate::time::uptime_us() + us.saturating_sub(unix_us()),
+        None => u64::MAX,
+    };
+    loop {
+        let Some(w) = futex_word(p, addr) else { return -EFAULT };
+        let v = w.load(Ordering::Acquire);
+        if v & 0x3fff_ffff == 0 {
+            if w.compare_exchange(v, tid | (v & WAITERS), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return 0;
+            }
+            continue;
+        }
+        if v & 0x3fff_ffff == tid {
+            return -35; // EDEADLK
+        }
+        if try_only {
+            return -EAGAIN;
+        }
+        let _ = w.compare_exchange(v, v | WAITERS, Ordering::AcqRel, Ordering::Acquire);
+        if crate::time::uptime_us() >= deadline {
+            return -ETIMEDOUT;
+        }
+        if signal::interrupted(p) {
+            return -EINTR;
+        }
+        let seen = sched::events();
+        sched::wait_event(seen, 2);
+    }
+}
+
 fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
     let cmd = op & 0x7f;
     match cmd {
@@ -2463,6 +2511,19 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
             }
         }
         1 | 10 => futex_wake(p.pml4(), addr, val),
+        6 => futex_pi(p, addr, tptr, false),  // FUTEX_LOCK_PI
+        8 => futex_pi(p, addr, 0, true),      // FUTEX_TRYLOCK_PI
+        7 => {
+            // FUTEX_UNLOCK_PI: only the owner may unlock; waiters poll.
+            let Some(w) = futex_word(p, addr) else { return -EFAULT };
+            let tid = sched::current_id() as u32;
+            if w.load(Ordering::Acquire) & 0x3fff_ffff != tid {
+                return -1; // EPERM
+            }
+            w.store(0, Ordering::Release);
+            futex_wake(p.pml4(), addr, 1);
+            0
+        }
         3 | 4 => futex_wake(p.pml4(), addr, u64::MAX),
         _ => -ENOSYS,
     }

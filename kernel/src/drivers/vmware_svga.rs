@@ -143,12 +143,20 @@ pub fn report() -> alloc::string::String {
 }
 
 impl VmwareSvga {
+    // The display path uses the ports directly, as before the 3D work
+    // (drivers::svga3d only touches them in `gpu3d test` and GPU use).
     fn read(&self, reg: u32) -> u32 {
-        reg_read(self.io, reg)
+        unsafe {
+            outl(self.io, reg);
+            inl(self.io + 1)
+        }
     }
 
     fn write(&self, reg: u32, v: u32) {
-        reg_write(self.io, reg, v)
+        unsafe {
+            outl(self.io, reg);
+            outl(self.io + 1, v);
+        }
     }
 
     pub fn new(pci: &PciDevice) -> Option<VmwareSvga> {
