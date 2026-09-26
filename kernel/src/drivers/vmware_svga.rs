@@ -186,7 +186,8 @@ impl VmwareSvga {
             f.add(FIFO_NEXT_CMD).write_volatile(min);
             f.add(FIFO_STOP).write_volatile(min);
         }
-        dev.write(REG_GUEST_ID, 0x500a); // "other 64-bit"        *REPORT.lock() = dev.gpu_report(caps);
+        dev.write(REG_GUEST_ID, 0x500a); // "other 64-bit"
+        *REPORT.lock() = dev.gpu_report(caps);
 
         dev.write(REG_CONFIG_DONE, 1);
         crate::kprintln!(

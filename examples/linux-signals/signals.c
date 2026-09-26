@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -23,6 +24,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 static int failures;
 #define CHECK(c, name) do { if (c) printf("ok   %s\n", name); else { printf("FAIL %s (errno %d)\n", name, errno); failures++; } } while (0)
@@ -258,6 +260,20 @@ int main(int argc, char **argv) {
     }
     PART(7) {
     sockets();
+    }
+    PART(8) {
+    // vDSO clock_gettime: present, monotonic, matches the system call.
+    CHECK(getauxval(AT_SYSINFO_EHDR) != 0, "vDSO mapped");
+    struct timespec a, b, r;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < 100000; i++)
+        clock_gettime(CLOCK_MONOTONIC, &b);
+    CHECK(b.tv_sec > a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec >= a.tv_nsec), "monotonic clock does not go back");
+    syscall(228, CLOCK_MONOTONIC, &r);
+    long diff = (r.tv_sec - b.tv_sec) * 1000000000L + (r.tv_nsec - b.tv_nsec);
+    CHECK(diff >= 0 && diff < 50000000L, "vDSO and syscall monotonic agree");
+    clock_gettime(CLOCK_REALTIME, &a);
+    CHECK(a.tv_sec > 1600000000L, "realtime clock");
     }
     // nanosleep interrupted by a signal from another process
     printf("%s\n", failures ? "SIGNALS FAILED" : "SIGNALS PASSED");

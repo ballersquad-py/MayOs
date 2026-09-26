@@ -339,6 +339,29 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
     Ok((state, rsp, entry))
 }
 
+/// Where the vDSO data page and image live (just below the mmap area;
+/// vdso/vdso.c hard-codes VDSO_DATA).
+const VDSO_DATA: u64 = 0x0000_6fff_fffe_0000;
+const VDSO_CODE: u64 = VDSO_DATA + PAGE_SIZE;
+static VDSO_IMAGE: &[u8] = include_bytes!("../../vdso/vdso.so");
+
+fn map_vdso(pml4: u64) -> Result<(), String> {
+    let data = pmm::alloc_frame_zeroed().ok_or("out of memory")?;
+    let code = pmm::alloc_frame_zeroed().ok_or("out of memory")?;
+    let (tsc_boot, tsc_per_ms) = crate::time::tsc_calibration();
+    unsafe {
+        let d = crate::mem::phys_to_virt(data) as *mut u64;
+        d.write(tsc_boot);
+        d.add(1).write(tsc_per_ms);
+        d.add(2).write(unix_us() - crate::time::uptime_us());
+        let n = VDSO_IMAGE.len().min(PAGE_SIZE as usize);
+        core::ptr::copy_nonoverlapping(VDSO_IMAGE.as_ptr(), crate::mem::phys_to_virt(code) as *mut u8, n);
+    }
+    paging::map(pml4, VDSO_DATA, data, USER | NO_EXECUTE).map_err(|_| "map failed")?;
+    paging::map(pml4, VDSO_CODE, code, USER).map_err(|_| "map failed")?;
+    Ok(())
+}
+
 /// Build the initial stack (argc, argv, envp, auxv) in `pml4`; returns the
 /// stack pointer and the stack's demand-paged region.
 fn build_stack(pml4: u64, image: &super::elf::LoadedImage, at_base: u64, argv: &[String], env: &[String], path: &str) -> Result<(u64, Region), String> {
@@ -374,6 +397,8 @@ fn build_stack(pml4: u64, image: &super::elf::LoadedImage, at_base: u64, argv: &
     let env_ptrs: Vec<u64> = env.iter().map(|e| put_str(e)).collect();
     let execfn = put_str(path);
     let platform = put_str("x86_64");
+    // The vDSO (clock_gettime without a system call) and its data page.
+    map_vdso(pml4)?;
     // 16 random bytes for AT_RANDOM.
     sp -= 16;
     let random = sp;
@@ -381,7 +406,8 @@ fn build_stack(pml4: u64, image: &super::elf::LoadedImage, at_base: u64, argv: &
     fill_random(&mut rnd);
     poke(random, &rnd);
     sp &= !15;
-    let auxv: [(u64, u64); 17] = [
+    let auxv: [(u64, u64); 18] = [
+        (33, VDSO_CODE),   // AT_SYSINFO_EHDR
         (3, image.phdr),   // AT_PHDR
         (4, image.phent),  // AT_PHENT
         (5, image.phnum),  // AT_PHNUM
@@ -483,19 +509,46 @@ fn fault_in_inner(addr: u64, write: bool) -> bool {
     if paging::translate(p.pml4(), page).is_some() {
         return true;
     }
-    let Some(f) = pmm::alloc_frame_zeroed() else { return false };
+    // Fault-around: bring in the neighbouring pages too (like Linux), so a
+    // library or heap is not paged in one 4 KiB fault at a time.
+    let span = if r.file != 0 { 16 } else { 4 } * PAGE_SIZE;
+    let lo = (page & !(span - 1)).max(r.start);
+    let hi = ((page & !(span - 1)) + span).min(r.end);
+    let mut frames: Vec<(u64, u64)> = Vec::new();
+    for pg in (lo..hi).step_by(PAGE_SIZE as usize) {
+        if pg == page || paging::translate(p.pml4(), pg).is_none() {
+            match pmm::alloc_frame_zeroed() {
+                Some(f) => frames.push((pg, f)),
+                None if pg == page => {
+                    for (_, f) in frames {
+                        pmm::free_frame(f);
+                    }
+                    return false;
+                }
+                None => {}
+            }
+        }
+    }
     if r.file != 0 {
         let d = l.mapped.lock().get(r.file as usize - 1).cloned();
         if let Some(d) = d {
-            let buf = unsafe { core::slice::from_raw_parts_mut(crate::mem::phys_to_virt(f) as *mut u8, PAGE_SIZE as usize) };
+            let len = (hi - lo) as usize;
+            let mut tmp = alloc::vec![0u8; len];
             let mut g = d.lock();
             let mut n = 0usize;
-            while n < buf.len() {
-                let got = read_at(&mut g, r.foff + (page - r.start) + n as u64, &mut buf[n..]);
+            while n < len {
+                let got = read_at(&mut g, r.foff + (lo - r.start) + n as u64, &mut tmp[n..]);
                 if got <= 0 {
                     break;
                 }
                 n += got as usize;
+            }
+            drop(g);
+            for &(pg, f) in &frames {
+                let o = (pg - lo) as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(tmp[o..].as_ptr(), crate::mem::phys_to_virt(f) as *mut u8, PAGE_SIZE as usize);
+                }
             }
         }
     }
@@ -511,15 +564,18 @@ fn fault_in_inner(addr: u64, write: bool) -> bool {
     // as one step, or its data would be replaced by our fresh page.
     static FAULT_LOCK: Spin<()> = Spin::new(());
     let _g = FAULT_LOCK.lock();
-    if paging::translate(p.pml4(), page).is_some() {
-        pmm::free_frame(f);
-        return true;
+    let mut ok = false;
+    for (pg, f) in frames {
+        if paging::translate(p.pml4(), pg).is_some() || paging::map(p.pml4(), pg, f, flags).is_err() {
+            pmm::free_frame(f);
+            if pg == page {
+                ok = paging::translate(p.pml4(), pg).is_some();
+            }
+        } else if pg == page {
+            ok = true;
+        }
     }
-    if paging::map(p.pml4(), page, f, flags).is_err() {
-        pmm::free_frame(f);
-        return false;
-    }
-    true
+    ok
 }
 
 /// Page fault from a Linux program: true if it was handled.
@@ -2441,10 +2497,23 @@ fn sleep_interruptible(p: &Process, ms: u64) -> bool {
     }
 }
 
+/// Wall-clock microseconds at boot, read from the RTC once; later reads
+/// add the TSC uptime (cheap, and never goes backwards).
+static BOOT_UNIX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn unix_us() -> u64 {
+    let mut b = BOOT_UNIX_US.load(Ordering::Relaxed);
+    if b == 0 {
+        let t = crate::arch::rtc::now();
+        let ts = fs::Timestamp { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second };
+        b = (unix_time(&ts).max(0) as u64 * 1_000_000).saturating_sub(crate::time::uptime_us()).max(1);
+        BOOT_UNIX_US.store(b, Ordering::Relaxed);
+    }
+    b + crate::time::uptime_us()
+}
+
 pub fn unix_ms() -> u64 {
-    let t = crate::arch::rtc::now();
-    let ts = fs::Timestamp { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second };
-    unix_time(&ts).max(0) as u64 * 1000 + crate::time::uptime_ms() % 1000
+    unix_us() / 1000
 }
 
 fn write_timespec(p: &Process, ptr: u64, us: u64) -> bool {
@@ -3002,7 +3071,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         228 => {
             // clock_gettime
-            let us = if a0 == 0 || a0 == 5 || a0 == 8 { unix_ms() * 1000 + crate::time::uptime_us() % 1000 } else { crate::time::uptime_us() };
+            let us = if a0 == 0 || a0 == 5 || a0 == 8 { unix_us() } else { crate::time::uptime_us() };
             if write_timespec(p, a1, us) { 0 } else { -EFAULT }
         }
         229 => {

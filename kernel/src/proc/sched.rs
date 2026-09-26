@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::process::Process;
 use crate::arch::percpu::{self, MAX_CPUS, MSR_KERNEL_GS_BASE};
@@ -482,6 +482,11 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         // left its stack.
         percpu::this().prev_on_cpu = &s.threads[cur].on_cpu as *const AtomicBool as u64;
     }
+    if next == s.idle[c] {
+        IDLE_CPUS.fetch_or(1u64 << c, Ordering::AcqRel);
+    } else {
+        IDLE_CPUS.fetch_and(!(1u64 << c), Ordering::AcqRel);
+    }
     s.current[c] = next;
     s.slice_start[c] = now;
     percpu::this().current_thread = &*s.threads[next] as *const Thread as u64;
@@ -552,6 +557,7 @@ pub fn wait_event(seen: u64, ms: u64) {
 /// scheduling point of any CPU. Lock-free (called very often).
 pub fn notify() {
     EVENTS.fetch_add(1, Ordering::AcqRel);
+    kick_idle();
 }
 
 /// Sleep up to `ms` unless `flag` is set; setting it and calling `wake`
@@ -576,7 +582,35 @@ pub fn wait_flag(flag: &core::sync::atomic::AtomicBool, ms: u64) {
 
 /// A `wait_flag` flag was set: get sleepers looked at.
 pub fn wake(_id: u64) {
-    EVENTS.fetch_add(1, Ordering::AcqRel);
+    notify();
+}
+
+/// CPUs sitting in their idle thread (bit per CPU index).
+static IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Kick one idle CPU so a woken thread runs now rather than at the next
+/// timer tick.
+fn kick_idle() {
+    let mask = IDLE_CPUS.load(Ordering::Acquire);
+    if mask == 0 {
+        return;
+    }
+    let me = percpu::index();
+    let others = mask & !(1u64 << me);
+    if others == 0 {
+        return;
+    }
+    let c = others.trailing_zeros() as usize;
+    if IDLE_CPUS.fetch_and(!(1u64 << c), Ordering::AcqRel) & (1u64 << c) != 0 {
+        if let Some(pc) = percpu::get(c) {
+            let on = cpu::interrupts_enabled();
+            cpu::cli();
+            crate::arch::apic::ipi_to(pc.lapic_id, crate::arch::idt::VEC_WAKE);
+            if on {
+                cpu::sti();
+            }
+        }
+    }
 }
 
 pub fn sleep_ms(ms: u64) {

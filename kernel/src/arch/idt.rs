@@ -20,6 +20,7 @@ pub const VEC_MOUSE: u8 = 0x2c;
 pub const VEC_SYSCALL: u8 = 0x80;
 pub const VEC_YIELD: u8 = 0x81;
 pub const VEC_TLB: u8 = 0xf0;
+pub const VEC_WAKE: u8 = 0xf1;
 pub const VEC_SPURIOUS: u8 = 0xff;
 
 #[repr(C)]

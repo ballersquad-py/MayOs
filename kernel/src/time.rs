@@ -10,6 +10,11 @@ pub fn init(tsc_per_ms: u64) {
     TSC_PER_MS.store(tsc_per_ms, Ordering::Relaxed);
 }
 
+/// (TSC at boot, TSC ticks per millisecond), for the Linux vDSO.
+pub fn tsc_calibration() -> (u64, u64) {
+    (TSC_BOOT.load(Ordering::Relaxed), TSC_PER_MS.load(Ordering::Relaxed))
+}
+
 pub fn uptime_ms() -> u64 {
     let now = crate::arch::cpu::rdtsc();
     now.saturating_sub(TSC_BOOT.load(Ordering::Relaxed)) / TSC_PER_MS.load(Ordering::Relaxed)
