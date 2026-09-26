@@ -292,9 +292,10 @@ pub fn destroy_mob(id: u32) -> Result<(), String> {
     submit(&c)
 }
 
-/// The GPU round trip `gpu3d test` runs: upload a pattern into a surface,
-/// copy it on the GPU into a second surface, read that back.
+/// The GPU round trip `gpu3d test` runs, step by step so a failure says
+/// which part of the path does not work yet.
 pub fn self_test() -> Result<String, String> {
+    use core::fmt::Write;
     init()?;
     const W: u32 = 64;
     const H: u32 = 64;
@@ -303,27 +304,52 @@ pub fn self_test() -> Result<String, String> {
     let src = Mob::new(bytes).ok_or("out of memory")?;
     let dst = Mob::new(bytes).ok_or("out of memory")?;
     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + 3) as u8).collect();
-    src.write(0, &pattern);
-    // Ids high enough not to meet Mesa's.
     let (mob_a, mob_b, sid_a, sid_b) = (4000u32, 4001u32, 4000u32, 4001u32);
-    define_mob(mob_a, &src)?;
-    define_mob(mob_b, &dst)?;
+    let mut log = String::new();
+    let count = |m: &Mob| {
+        let mut back = alloc::vec![0u8; bytes];
+        m.read(0, &mut back);
+        let same = back.iter().zip(&pattern).filter(|(a, b)| a == b).count();
+        let zero = back.iter().filter(|b| **b == 0).count();
+        (same, zero, back[0..8].to_vec())
+    };
+    let mut run = |log: &mut String, what: &str, c: &Cmds| -> bool {
+        match submit(c) {
+            Ok(()) => { let _ = writeln!(log, "ok   {}", what); true }
+            Err(e) => { let _ = writeln!(log, "FAIL {}: {}", what, e); false }
+        }
+    };
+    src.write(0, &pattern);
+    let mut ok = true;
+    let mut c = Cmds::default();
+    c.cmd(CMD_DEFINE_GB_MOB64, &[mob_a, src.depth, src.base as u32, (src.base >> 32) as u32, src.size as u32]);
+    c.cmd(CMD_DEFINE_GB_MOB64, &[mob_b, dst.depth, dst.base as u32, (dst.base >> 32) as u32, dst.size as u32]);
+    ok &= run(&mut log, "define 2 memory objects", &c);
     let mut c = Cmds::default();
     for sid in [sid_a, sid_b] {
-        // sid, flags, format, mips, msaa, autogen filter, w, h, d
         c.cmd(CMD_DEFINE_GB_SURFACE, &[sid, 1 << 5, FMT_A8R8G8B8, 1, 0, 0, W, H, 1]);
     }
     c.cmd(CMD_BIND_GB_SURFACE, &[sid_a, mob_a]);
     c.cmd(CMD_BIND_GB_SURFACE, &[sid_b, mob_b]);
-    // Guest memory -> surface A.
+    ok &= ok && run(&mut log, "define 2 surfaces and bind them", &c);
+    // 1: upload into A, wipe A's memory, read A back.
+    let mut c = Cmds::default();
     c.cmd(CMD_UPDATE_GB_IMAGE, &[sid_a, 0, 0, 0, 0, 0, W, H, 1]);
-    // A -> B on the GPU.
+    ok &= ok && run(&mut log, "upload pattern to surface A", &c);
+    src.write(0, &alloc::vec![0u8; bytes]);
+    let mut c = Cmds::default();
+    c.cmd(CMD_READBACK_GB_IMAGE, &[sid_a, 0, 0]);
+    ok &= ok && run(&mut log, "read surface A back", &c);
+    let (same, zero, first) = count(&src);
+    let _ = writeln!(log, "{}  A round trip: {} of {} bytes match ({} zero), first bytes {:?}", if same == bytes { "ok  " } else { "FAIL" }, same, bytes, zero, first);
+    let upload_ok = same == bytes;
+    // 2: GPU copy A -> B, read B back.
+    let mut c = Cmds::default();
     c.cmd(CMD_SURFACE_COPY, &[sid_a, 0, 0, sid_b, 0, 0, 0, 0, 0, W, H, 1, 0, 0, 0]);
-    // Surface B -> its guest memory.
     c.cmd(CMD_READBACK_GB_IMAGE, &[sid_b, 0, 0]);
-    let r = submit(&c);
-    let mut back = alloc::vec![0u8; bytes];
-    dst.read(0, &mut back);
+    ok &= ok && run(&mut log, "copy A to B on the GPU, read B back", &c);
+    let (same_b, zero_b, first_b) = count(&dst);
+    let _ = writeln!(log, "{}  B after GPU copy: {} of {} bytes match ({} zero), first bytes {:?}", if same_b == bytes { "ok  " } else { "FAIL" }, same_b, bytes, zero_b, first_b);
     let mut cleanup = Cmds::default();
     cleanup.cmd(CMD_BIND_GB_SURFACE, &[sid_a, 0xffff_ffff]);
     cleanup.cmd(CMD_BIND_GB_SURFACE, &[sid_b, 0xffff_ffff]);
@@ -332,11 +358,5 @@ pub fn self_test() -> Result<String, String> {
     cleanup.cmd(CMD_DESTROY_GB_MOB, &[mob_a]);
     cleanup.cmd(CMD_DESTROY_GB_MOB, &[mob_b]);
     let _ = submit(&cleanup);
-    r.map_err(|e| alloc::format!("GPU copy: {}", e))?;
-    let same = back.iter().zip(&pattern).filter(|(a, b)| a == b).count();
-    if same == bytes {
-        Ok(alloc::format!("GPU copied a {}x{} image through two surfaces: all {} bytes match", W, H, bytes))
-    } else {
-        Err(alloc::format!("GPU copy finished but only {} of {} bytes match", same, bytes))
-    }
+    if ok && upload_ok && same_b == bytes { Ok(log) } else { Err(log) }
 }

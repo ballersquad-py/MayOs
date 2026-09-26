@@ -586,8 +586,8 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
         "gpu3d" => match args.first().copied() {
             // GPU 3D: `gpu3d test` runs a copy on the GPU and checks it.
             Some("test") => match crate::drivers::svga3d::self_test() {
-                Ok(m) => { let _ = writeln!(out, "ok   {}", m); }
-                Err(e) => err(out, format!("gpu3d test failed: {}", e)),
+                Ok(m) => { let _ = write!(out, "{}GPU TEST PASSED\n", m); }
+                Err(e) => { let _ = write!(out, "{}", e); err(out, "GPU TEST FAILED"); }
             },
             _ => err(out, "usage: gpu3d test"),
         },

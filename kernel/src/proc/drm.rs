@@ -131,7 +131,12 @@ pub fn ioctl(pml4: u64, cmd: u64, arg: u64) -> i64 {
             if usermem::write_bytes(pml4, buf, &bytes[..n]) { 0 } else { -EFAULT }
         }
         _ => {
-            crate::kprintln!("drm: ioctl nr {:#x} (cmd {:#x}) not implemented yet", nr, cmd);
+            // Logged a few times only: the serial port is slow and a
+            // probing loop would stall everything.
+            static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
+                crate::kprintln!("drm: ioctl nr {:#x} (cmd {:#x}) not implemented yet", nr, cmd);
+            }
             -EINVAL
         }
     }
