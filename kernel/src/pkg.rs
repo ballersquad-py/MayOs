@@ -99,8 +99,6 @@ pref("browser.tabs.remote.autostart", false);
 pref("dom.ipc.processCount", 1);
 pref("dom.ipc.processPrelaunch.enabled", false);
 pref("network.process.enabled", false);
-pref("media.rdd-process.enabled", false);
-pref("media.utility-process.enabled", false);
 pref("gfx.webrender.software", true);
 pref("layers.acceleration.disabled", true);
 pref("media.hardware-video-decoding.enabled", false);
@@ -112,8 +110,12 @@ pref("app.update.enabled", false);
 pref("toolkit.telemetry.enabled", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);
 pref("browser.sessionstore.resume_from_crash", false);
-// No accessibility bus: MayOS has no D-Bus session (and no screen reader).
+// No accessibility bus: MayOS has no screen reader.
 pref("accessibility.force_disabled", 1);
+// WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.
+pref("webgl.force-enabled", true);
+pref("webgl.disabled", false);
+pref("media.autoplay.blocking_policy", 0);
 "#;
     let pdir = format!("{}/defaults/pref", dir);
     let _ = mkdirs(&pdir);
@@ -248,7 +250,7 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
     // Things GTK programs need at run time but do not list.
-    let extras = [("fontconfig", "font-dejavu"), ("gdk-pixbuf", "shared-mime-info"), ("gtk+3.0", "gsettings-desktop-schemas"), ("gtk+3.0", "hicolor-icon-theme"), ("firefox", "dbus"), ("firefox-esr", "dbus")];
+    let extras = [("fontconfig", "font-dejavu"), ("gdk-pixbuf", "shared-mime-info"), ("gtk+3.0", "gsettings-desktop-schemas"), ("gtk+3.0", "hicolor-icon-theme"), ("firefox", "dbus"), ("firefox-esr", "dbus"), ("firefox", "mesa-dri-gallium"), ("firefox", "mesa-gles"), ("firefox-esr", "mesa-dri-gallium"), ("firefox-esr", "mesa-gles")];
     while let Some(n) = want.pop() {
         let dep = n.trim_start_matches('!');
         if n.starts_with('!') {
@@ -262,7 +264,9 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
             say(c, &format!("(no package provides {}, skipped)\n", key));
             continue;
         };
-        if SKIP.contains(&pkg.as_str()) && !names.contains(&pkg.as_str()) {
+        // Firefox uses Mesa's software OpenGL (llvmpipe) for WebGL.
+        let wants_gl = names.iter().any(|n| n.starts_with("firefox"));
+        if SKIP.contains(&pkg.as_str()) && !names.contains(&pkg.as_str()) && !wants_gl {
             continue;
         }
         if !seen.insert(pkg.clone()) {

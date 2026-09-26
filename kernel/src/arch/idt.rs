@@ -19,6 +19,7 @@ pub const VEC_KEYBOARD: u8 = 0x21;
 pub const VEC_MOUSE: u8 = 0x2c;
 pub const VEC_SYSCALL: u8 = 0x80;
 pub const VEC_YIELD: u8 = 0x81;
+pub const VEC_TLB: u8 = 0xf0;
 pub const VEC_SPURIOUS: u8 = 0xff;
 
 #[repr(C)]
@@ -73,6 +74,12 @@ isr_stubs:
     .endr
 
 isr_common:
+    # From user mode: switch GS to this CPU's area.
+    testq $3, 24(%rsp)
+    jz 1f
+    swapgs
+1:
+isr_common_swapped:
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -92,6 +99,13 @@ isr_common:
     cld
     call interrupt_dispatch
     movq %rax, %rsp
+    # We are off the previous thread's stack: let other CPUs run it.
+    movq %gs:32, %rax
+    testq %rax, %rax
+    jz 3f
+    movb $0, (%rax)
+    movq $0, %gs:32
+3:
     popq %r15
     popq %r14
     popq %r13
@@ -108,27 +122,26 @@ isr_common:
     popq %rbx
     popq %rax
     addq $16, %rsp
+    # Back to user mode: give the program its GS base again.
+    testq $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
     iretq
 
     .global syscall_entry
 syscall_entry:
-    movq %rsp, syscall_user_rsp(%rip)
-    movq syscall_kernel_rsp(%rip), %rsp
+    swapgs
+    movq %rsp, %gs:16
+    movq %gs:8, %rsp
     pushq $0x1b
-    pushq syscall_user_rsp(%rip)
+    pushq %gs:16
     pushq %r11
     pushq $0x23
     pushq %rcx
     pushq $0
     pushq $0x80
-    jmp isr_common
-
-    .section .data
-    .align 16
-    .global syscall_user_rsp
-syscall_user_rsp: .quad 0
-    .global syscall_kernel_rsp
-syscall_kernel_rsp: .quad 0
+    jmp isr_common_swapped
     "#,
     options(att_syntax)
 );
@@ -136,7 +149,6 @@ syscall_kernel_rsp: .quad 0
 unsafe extern "C" {
     static isr_stubs: u8;
     fn syscall_entry();
-    static mut syscall_kernel_rsp: u64;
 }
 
 #[repr(C)]
@@ -195,7 +207,15 @@ pub fn init_syscall() {
 }
 
 pub fn set_syscall_stack(top: u64) {
-    unsafe { *(&raw mut syscall_kernel_rsp) = top };
+    super::percpu::this().kernel_rsp = top;
+}
+
+/// Load the IDT on another CPU.
+pub fn load() {
+    unsafe {
+        let ptr = Pointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: &raw const IDT as u64 };
+        core::arch::asm!("lidt [{}]", in(reg) &ptr);
+    }
 }
 
 pub fn enable_nx() {

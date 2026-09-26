@@ -204,6 +204,51 @@ pub static CMDLINE: Request<CmdlineResponse> = Request::new(0x4b161536e598651e, 
 #[unsafe(link_section = ".limine_requests")]
 pub static MODULES: Request<ModuleResponse> = Request::new(0x3e7e279702be32af, 0xca1c4f3bd1280cee);
 
+/// Limine MP (SMP) request: it has an extra `flags` field (0: xAPIC).
+#[repr(C)]
+pub struct MpRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*const MpResponse>,
+    flags: u64,
+}
+
+unsafe impl Sync for MpRequest {}
+
+impl MpRequest {
+    pub fn response(&self) -> Option<&'static MpResponse> {
+        let p = unsafe { ptr::read_volatile(self.response.get()) };
+        unsafe { p.as_ref() }
+    }
+}
+
+#[repr(C)]
+pub struct MpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    _reserved: u64,
+    pub goto_address: core::sync::atomic::AtomicU64,
+    pub extra_argument: u64,
+}
+
+#[repr(C)]
+pub struct MpResponse {
+    pub revision: u64,
+    pub flags: u32,
+    pub bsp_lapic_id: u32,
+    pub cpu_count: u64,
+    pub cpus: *const *mut MpInfo,
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP: MpRequest = MpRequest {
+    id: [COMMON_MAGIC[0], COMMON_MAGIC[1], 0x95a67b819a1b857e, 0xa0b61b723b6a73e0],
+    revision: 0,
+    response: UnsafeCell::new(ptr::null()),
+    flags: 0,
+};
+
 pub fn cmdline() -> &'static str {
     CMDLINE.response().map(|r| r.as_str()).unwrap_or("")
 }

@@ -23,7 +23,7 @@ QEMU       ?= qemu-system-x86_64
 # Sound backend for QEMU: pa (PulseAudio), pipewire, alsa, sdl, dsound
 # (Windows), coreaudio (macOS) or none.
 AUDIO      ?= pa
-QEMU_BASE  := -M q35 -m 512M -cpu max -smp 1 \
+QEMU_BASE  := -M q35 -m 2G -cpu max -smp 4 \
               -accel kvm -accel tcg \
               -bios $(OVMF) \
               -vga none -device virtio-gpu-pci \

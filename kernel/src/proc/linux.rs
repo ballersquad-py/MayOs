@@ -129,6 +129,10 @@ pub enum Desc {
     EventFd { ev: Arc<EventFd>, nonblock: bool },
     Epoll(Arc<Epoll>),
     TimerFd { t: Arc<TimerFd>, nonblock: bool },
+    /// /dev/snd/controlC0
+    SndCtl,
+    /// /dev/snd/pcmC0D0p
+    SndPcm(Arc<super::alsa::Pcm>),
 }
 
 /// timerfd: expirations counted against the uptime clock (microseconds).
@@ -187,10 +191,15 @@ pub struct LinuxState {
 
 impl Drop for Desc {
     fn drop(&mut self) {
+        let key = self as *const Desc as usize;
         NONBLOCK.lock().remove(&(self as *const Desc as usize));
         match self {
             Desc::File { path, data: Some(d), dirty: true, .. } => {
-                let _ = fs::write_file(path, d);
+                LAST_SYNC.lock().remove(&key);
+                // Not for files deleted while open (temporary files).
+                if !UNLINKED.lock().remove(path.as_str()) {
+                    let _ = fs::write_file(path, d);
+                }
             }
             Desc::Udp { port, .. } => crate::network::udp_unbind(*port),
             Desc::PipeRead(p) => {
@@ -292,6 +301,7 @@ fn base_env(cwd: &str) -> Vec<String> {
         String::from("MOZ_CRASHREPORTER_DISABLE=1"),
         String::from("MOZ_FORCE_DISABLE_E10S=1"),
         String::from("LIBGL_ALWAYS_SOFTWARE=1"),
+        String::from("GALLIUM_DRIVER=llvmpipe"),
         alloc::format!("PWD={}", cwd),
     ]
 }
@@ -512,14 +522,19 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 
 fn unmap_range(p: &Process, start: u64, end: u64) {
     let mut a = start;
+    let mut any = false;
     while a < end {
         let borrowed = paging::translate(p.pml4(), a).is_some_and(|(_, e)| e & paging::BORROWED != 0);
-        if let Some(f) = paging::unmap(p.pml4(), a)
-            && !borrowed
-        {
-            pmm::free_frame(f);
+        if let Some(f) = paging::unmap(p.pml4(), a) {
+            any = true;
+            if !borrowed {
+                pmm::free_frame(f);
+            }
         }
         a += PAGE_SIZE;
+    }
+    if any {
+        crate::smp::tlb_shootdown(p.pml4());
     }
 }
 
@@ -741,11 +756,12 @@ fn virtual_file(path: &str) -> Option<Desc> {
             t
         }
         "/etc/hosts" => String::from("127.0.0.1 localhost\n::1 localhost\n"),
+        "/etc/asound.conf" => String::from(super::alsa::ASOUND_CONF),
         "/etc/passwd" => String::from("root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home:/bin/sh\n"),
         "/etc/group" => String::from("root:x:0:\nuser:x:1000:\n"),
         "/etc/hostname" => String::from("mayos\n"),
         "/etc/os-release" => String::from("NAME=MayOS\nID=mayos\nPRETTY_NAME=\"MayOS\"\n"),
-        "/proc/cpuinfo" => String::from("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: MayOS virtual CPU\nflags\t\t: fpu sse sse2\n\n"),
+        "/proc/cpuinfo" => (0..crate::smp::online()).map(|c| alloc::format!("processor\t: {}\nvendor_id\t: GenuineIntel\nmodel name\t: MayOS virtual CPU\nflags\t\t: fpu sse sse2\n\n", c)).collect(),
         "/proc/meminfo" => {
             let (free, total) = pmm::stats();
             alloc::format!("MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\n", total * 4, free * 4, free * 4)
@@ -807,6 +823,9 @@ fn sys_openat(p: &Process, dirfd: i64, ptr: u64, flags: u64) -> i64 {
 }
 
 fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
+    if flags & O_CREAT != 0 {
+        UNLINKED.lock().remove(path.as_str());
+    }
     if let Some(d) = proc_file(p, &path) {
         return add_fd(p, d);
     }
@@ -830,6 +849,23 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
             sched::process_thread_ids(p.pid).into_iter().map(|t| (alloc::format!("{}", t), true)).collect()
         };
         return add_fd(p, Desc::Dir { path: proc_self(p, &path), entries, pos: 0 });
+    }
+    if let Some(dev) = super::alsa::open(&path) {
+        let d = match dev {
+            super::alsa::Dev::Ctl => Desc::SndCtl,
+            super::alsa::Dev::Pcm(p) => Desc::SndPcm(p),
+        };
+        let fd = add_fd(p, d);
+        if flags & O_NONBLOCK != 0
+            && let Some(d) = get_fd(p, fd)
+        {
+            set_nonblock(&mut d.lock(), true);
+        }
+        return fd;
+    }
+    if path == "/dev/snd" {
+        let entries = super::alsa::names().iter().map(|n| (String::from(*n), false)).collect();
+        return add_fd(p, Desc::Dir { path, entries, pos: 0 });
     }
     if path == "/dev/input" {
         let entries = ["event0", "event1", "mice"].iter().map(|n| (String::from(*n), false)).collect();
@@ -1043,7 +1079,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 sched::wait_event(ev_seen, 20);
             }
         }
-        Desc::Epoll(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::SndCtl | Desc::SndPcm(_) => -EINVAL,
         Desc::TimerFd { t, nonblock } => {
             let (t, nb) = (t.clone(), *nonblock);
             drop(g);
@@ -1140,7 +1176,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             ev.add(u64::from_le_bytes(data[..8].try_into().unwrap()));
             8
         }
-        Desc::Epoll(_) | Desc::TimerFd { .. } => -EINVAL,
+        Desc::Epoll(_) | Desc::TimerFd { .. } | Desc::SndCtl | Desc::SndPcm(_) => -EINVAL,
         Desc::Tcp { stream: Some(s), .. } => match s.write_all(data, 60_000) {
             Ok(()) => data.len() as i64,
             Err(_) => -EPIPE,
@@ -1176,6 +1212,14 @@ fn sys_read(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
 
 fn sys_write(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let pcm = match &*d.lock() {
+        Desc::SndPcm(pcm) => Some(pcm.clone()),
+        _ => None,
+    };
+    if let Some(pcm) = pcm {
+        let nb = is_nonblock(&d.lock());
+        return super::alsa::pcm_write(&pcm, p.pml4(), ptr, len, nb);
+    }
     let Some(data) = usermem::read_bytes(p.pml4(), ptr, len.min(16 * 1024 * 1024)) else { return -EFAULT };
     write_desc(p, &d, &data)
 }
@@ -1368,8 +1412,11 @@ fn stat_path(path: &str) -> Result<[u8; 144], i64> {
         };
         return Ok(stat_buf(mode, size, 0, 1));
     }
-    if path == "/" || path == "/dev/input" {
+    if path == "/" || path == "/dev/input" || path == "/dev/snd" && crate::audio::is_present() {
         return Ok(stat_buf(0o40755, 4096, 0, 2));
+    }
+    if path.starts_with("/dev/snd/") && super::alsa::open(path).is_some() {
+        return Ok(stat_buf(0o20660, 0, 0, 116));
     }
     if matches!(path, "/dev/fb0" | "/dev/input/event0" | "/dev/input/event1" | "/dev/input/mice") {
         return Ok(stat_buf(0o20660, 0, 0, 9));
@@ -1398,6 +1445,7 @@ fn stat_fd(p: &Process, fd: i64) -> Result<[u8; 144], i64> {
         Desc::Unix { .. } => stat_buf(0o140777, 0, 0, 11),
         Desc::Memfd { shm, .. } => stat_buf(0o100600, shm.size(), 0, Arc::as_ptr(shm) as u64),
         Desc::EventFd { .. } | Desc::Epoll(_) | Desc::TimerFd { .. } => stat_buf(0o600, 0, 0, 12),
+        Desc::SndCtl | Desc::SndPcm(_) => stat_buf(0o20660, 0, 0, 116),
         Desc::Tcp { .. } | Desc::Udp { .. } => stat_buf(0o140777, 0, 0, 7),
         Desc::PipeRead(_) | Desc::PipeWrite(_) => stat_buf(0o10600, 0, 0, 8),
     })
@@ -2043,6 +2091,8 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
         Desc::Unix { .. } => (false, false),
         Desc::EventFd { ev, .. } => (*ev.count.lock() > 0, true),
         Desc::TimerFd { t, .. } => (t.ready(), false),
+        Desc::SndPcm(pcm) => (false, pcm.ready_to_write()),
+        Desc::SndCtl => (false, false),
         Desc::Epoll(e) => {
             let list: Vec<(DescRef, u32)> = e.list.lock().iter().filter(|i| !i.disabled).map(|i| (i.desc.clone(), i.events)).collect();
             drop(g);
@@ -2486,7 +2536,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             }
             -EINTR
         }
-        16 => match a1 {
+        16 => match a1 & 0xffff_ffff {
             0x5413 => {
                 // TIOCGWINSZ: 30 rows, 100 columns
                 let ws: [u16; 4] = [30, 100, 0, 0];
@@ -2525,7 +2575,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     None => -EBADF,
                 }
             }
-            _ => device_ioctl(p, a0 as i64, a1, a2),
+            _ => device_ioctl(p, a0 as i64, a1 & 0xffff_ffff, a2),
         },
         17 => sys_pread(p, a0 as i64, a1, a2, a3),
         19 => sys_readv(p, a0 as i64, a1, a2),
@@ -2560,6 +2610,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     }
                     a += PAGE_SIZE;
                 }
+                crate::smp::tlb_shootdown(p.pml4());
             }
             0
         }
@@ -2718,13 +2769,23 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             }
         }
         74 | 75 => {
-            // fsync / fdatasync: write the file back now.
-            if let Some(d) = get_fd(p, a0 as i64)
-                && let Desc::File { path, data: Some(data), dirty, .. } = &mut *d.lock()
-                && *dirty
-            {
-                let _ = fs::write_file(path, data);
-                *dirty = false;
+            // fsync / fdatasync: files are written back whole, so a
+            // database syncing after every transaction would rewrite
+            // megabytes each time. Write at most every few seconds (and
+            // always on close).
+            if let Some(d) = get_fd(p, a0 as i64) {
+                let mut g = d.lock();
+                let key = &*g as *const Desc as usize;
+                let now = crate::time::uptime_ms();
+                let due = LAST_SYNC.lock().get(&key).is_none_or(|&t| now - t >= 5000);
+                if due
+                    && let Desc::File { path, data: Some(data), dirty, .. } = &mut *g
+                    && *dirty
+                {
+                    let _ = fs::write_file(path, data);
+                    *dirty = false;
+                    LAST_SYNC.lock().insert(key, now);
+                }
             }
             0
         }
@@ -2783,7 +2844,13 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let path = if f.rax == 263 { path_at(p, a0 as i64, a1) } else { path_at(p, -100, a0) };
             match path {
                 Ok(path) if path.starts_with("/dev/shm/") => if unix::shm_unlink(&path[9..]) { 0 } else { -ENOENT },
-                Ok(path) => fs::remove(&path).map(|_| 0).unwrap_or_else(fs_err),
+                Ok(path) => {
+                    let r = fs::remove(&path).map(|_| 0).unwrap_or_else(fs_err);
+                    if r == 0 {
+                        remember_unlinked(&path);
+                    }
+                    r
+                }
                 Err(e) => e,
             }
         }
@@ -2878,10 +2945,10 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         202 => sys_futex(p, a0, a1, a2, a3),
         204 => {
-            // sched_getaffinity: one CPU
+            // sched_getaffinity: every CPU
             let mut m = vec![0u8; (a1 as usize).min(128)];
-            if !m.is_empty() {
-                m[0] = 1;
+            for c in 0..crate::smp::online().min(m.len() * 8) {
+                m[c / 8] |= 1 << (c % 8);
             }
             if usermem::write_bytes(pml4, a2, &m) { m.len() as i64 } else { -EFAULT }
         }
@@ -3245,6 +3312,18 @@ pub fn exe_name(p: &Process) -> String {
 /// ioctls of the framebuffer and input devices.
 fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let snd = match &*d.lock() {
+        Desc::SndCtl => Some(None),
+        Desc::SndPcm(pcm) => Some(Some(pcm.clone())),
+        _ => None,
+    };
+    if let Some(pcm) = snd {
+        let nb = is_nonblock(&d.lock());
+        return match pcm {
+            None => super::alsa::ctl_ioctl(p.pml4(), cmd, arg),
+            Some(pcm) => super::alsa::pcm_ioctl(&pcm, p.pml4(), cmd, arg, nb),
+        };
+    }
     let (screen, kind) = match &*d.lock() {
         Desc::Fb { screen, .. } => (screen.clone(), None),
         Desc::Input { screen, kind, .. } => (screen.clone(), Some(*kind)),
@@ -3467,6 +3546,8 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     };
     // Point of no return: the old program goes away.
     sched::kill_other_threads(p.pid);
+    // They may still be running on other CPUs for a moment.
+    sched::wait_others_off_cpu(p.pid);
     let old = p.replace_pml4(pml4);
     sched::switch_address_space(pml4);
     paging::destroy_address_space(old);
@@ -3577,6 +3658,7 @@ fn sys_mprotect(p: &Process, addr: u64, len: u64, prot: u64) -> i64 {
         paging::set_flags(p.pml4(), a, if prot == 0 { flags & !USER } else { flags });
         a += PAGE_SIZE;
     }
+    crate::smp::tlb_shootdown(p.pml4());
     0
 }
 
@@ -3790,6 +3872,7 @@ fn sys_mremap(p: &Process, old: u64, old_len: u64, new_len: u64, flags: u64) -> 
     }
     remove_regions(l, old, old + old_len);
     unmap_range(p, old, old + old_len);
+    crate::smp::tlb_shootdown(p.pml4());
     start as i64
 }
 
@@ -3899,7 +3982,10 @@ fn proc_file(p: &Process, path: &str) -> Option<Desc> {
         "/proc/stat" => String::from("cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nbtime 0\n"),
         "/proc/version" => String::from("Linux version 6.1.0-mayos (MayOS) #1\n"),
         "/proc/filesystems" => String::from("\tvfat\nnodev\ttmpfs\n"),
-        "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/present" | "/sys/devices/system/cpu/possible" => String::from("0\n"),
+        "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/present" | "/sys/devices/system/cpu/possible" => match crate::smp::online() {
+            1 => String::from("0\n"),
+            n => alloc::format!("0-{}\n", n - 1),
+        },
         "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq" => String::from("2000000\n"),
         "/etc/machine-id" | "/var/lib/dbus/machine-id" => String::from("6d61796f736d61796f736d61796f7331\n"),
         "/etc/localtime" => return None,
@@ -3972,4 +4058,19 @@ fn set_nonblock(d: &mut Desc, on: bool) {
             }
         }
     }
+}
+
+/// Paths removed while a program may still hold them open for writing: a
+/// later close must not bring the file back.
+static UNLINKED: Spin<alloc::collections::BTreeSet<String>> = Spin::new(alloc::collections::BTreeSet::new());
+
+/// When each open file (by descriptor address) was last written by fsync.
+static LAST_SYNC: Spin<alloc::collections::BTreeMap<usize, u64>> = Spin::new(alloc::collections::BTreeMap::new());
+
+fn remember_unlinked(path: &str) {
+    let mut u = UNLINKED.lock();
+    if u.len() > 1000 {
+        u.clear();
+    }
+    u.insert(String::from(path));
 }

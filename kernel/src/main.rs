@@ -21,6 +21,7 @@ mod pkg;
 mod power;
 mod proc;
 mod selftest;
+mod smp;
 mod serial;
 mod settings;
 mod storage;
@@ -40,9 +41,10 @@ extern "C" fn kmain() -> ! {
         kprintln!("Limine base revision 3 not supported by bootloader");
         cpu::halt_forever();
     }
-    gdt::init();
-    idt::init();
     mem::init();
+    // Per-CPU area (GS), GDT and TSS of the boot CPU, then the IDT.
+    gdt::init_cpu(arch::percpu::install(0, 0));
+    idt::init();
     let (free, total) = mem::pmm::stats();
     kprintln!("memory: {} MiB free of {} MiB", free * 4 / 1024, total * 4 / 1024);
 
@@ -64,6 +66,8 @@ extern "C" fn kmain() -> ! {
     init_devices();
 
     proc::sched::init();
+    // The other CPUs join the scheduler once it exists.
+    smp::start();
     // Drivers that start their own threads come after the scheduler.
     init_threaded_devices();
     storage::init();

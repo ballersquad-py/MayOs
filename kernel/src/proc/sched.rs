@@ -1,4 +1,4 @@
-//! Preemptive round-robin scheduler (single CPU).
+//! Preemptive round-robin scheduler: one run queue shared by all CPUs.
 //!
 //! A thread's saved context is simply a pointer to the `TrapFrame` sitting on
 //! top of its kernel stack. Switching threads means returning a different
@@ -12,6 +12,7 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::process::Process;
+use crate::arch::percpu::{self, MAX_CPUS, MSR_KERNEL_GS_BASE};
 use crate::arch::{cpu, gdt, idt};
 use crate::sync::Spin;
 
@@ -41,6 +42,10 @@ pub struct Thread {
     gs_base: u64,
     /// Sleeping in `wait_event`: `notify` wakes it early.
     waiting: bool,
+    /// Executing on some CPU (set until that CPU is off its stack).
+    on_cpu: AtomicBool,
+    /// A CPU's idle thread (runs only there, when nothing else can).
+    idle: bool,
     fpu: Box<cpu::FpuState>,
     /// Linux `set_tid_address`/CLONE_CHILD_CLEARTID: zeroed and woken at exit.
     pub clear_child_tid: u64,
@@ -58,13 +63,22 @@ impl Drop for Thread {
 
 struct Scheduler {
     threads: Vec<Box<Thread>>,
-    current: usize,
+    /// Index of the thread each CPU runs.
+    current: [usize; MAX_CPUS],
+    /// Index of each CPU's idle thread.
+    idle: [usize; MAX_CPUS],
     next_id: u64,
-    slice_start: u64,
+    slice_start: [u64; MAX_CPUS],
+}
+
+impl Scheduler {
+    fn cur(&self) -> usize {
+        self.current[percpu::index()]
+    }
 }
 
 static SCHED: Spin<Scheduler> =
-    Spin::new(Scheduler { threads: Vec::new(), current: 0, next_id: 1, slice_start: 0 });
+    Spin::new(Scheduler { threads: Vec::new(), current: [0; MAX_CPUS], idle: [0; MAX_CPUS], next_id: 1, slice_start: [0; MAX_CPUS] });
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Register the boot context as thread 0, the idle thread.
@@ -83,10 +97,42 @@ pub fn init() {
         fs_base: 0,
         gs_base: 0,
         waiting: false,
+        on_cpu: AtomicBool::new(true),
+        idle: true,
         fpu: Box::new(cpu::fpu_initial()),
         clear_child_tid: 0,
     }));
-    s.current = 0;
+    s.current[0] = 0;
+    s.idle[0] = 0;
+}
+
+/// Register the running context of another CPU as its idle thread.
+pub fn init_ap(cpu: usize) {
+    let mut s = SCHED.lock();
+    let id = s.next_id;
+    s.next_id += 1;
+    s.threads.push(Box::new(Thread {
+        id,
+        name: alloc::format!("idle{}", cpu),
+        rsp: 0,
+        kstack: core::ptr::null_mut(),
+        kstack_top: 0,
+        state: State::Running,
+        process: None,
+        pml4: crate::mem::paging::kernel_pml4(),
+        cpu_ms: 0,
+        fs_base: 0,
+        gs_base: 0,
+        waiting: false,
+        on_cpu: AtomicBool::new(true),
+        idle: true,
+        fpu: Box::new(cpu::fpu_initial()),
+        clear_child_tid: 0,
+    }));
+    let i = s.threads.len() - 1;
+    s.current[cpu] = i;
+    s.idle[cpu] = i;
+    s.slice_start[cpu] = crate::time::uptime_ms();
 }
 
 pub fn start() {
@@ -136,6 +182,8 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         fs_base,
         gs_base: 0,
         waiting: false,
+        on_cpu: AtomicBool::new(false),
+        idle: false,
         fpu: Box::new(fpu),
         clear_child_tid: 0,
     }));
@@ -162,37 +210,38 @@ pub fn spawn_user_frame(process: Arc<Process>, frame: idt::TrapFrame, fs_base: u
 /// Set the calling thread's GS base.
 pub fn set_gs_base(v: u64) {
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].gs_base = v;
-    unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, v) };
+    // In the kernel the program's GS base waits in KERNEL_GS_BASE.
+    unsafe { cpu::wrmsr(MSR_KERNEL_GS_BASE, v) };
 }
 
 pub fn gs_base() -> u64 {
     let s = SCHED.lock();
-    s.threads[s.current].gs_base
+    s.threads[s.cur()].gs_base
 }
 
 /// Set the calling thread's FS base (thread-local storage).
 pub fn set_fs_base(v: u64) {
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].fs_base = v;
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, v) };
 }
 
 pub fn fs_base() -> u64 {
     let s = SCHED.lock();
-    s.threads[s.current].fs_base
+    s.threads[s.cur()].fs_base
 }
 
 pub fn current_id() -> u64 {
     let s = SCHED.lock();
-    s.threads[s.current].id
+    s.threads[s.cur()].id
 }
 
 pub fn set_clear_child_tid(addr: u64) {
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].clear_child_tid = addr;
 }
 
@@ -206,7 +255,7 @@ pub fn set_clear_child_tid_of(id: u64, addr: u64) {
 
 pub fn clear_child_tid() -> u64 {
     let s = SCHED.lock();
-    s.threads[s.current].clear_child_tid
+    s.threads[s.cur()].clear_child_tid
 }
 
 /// Threads (ids) of a process that are still alive.
@@ -268,10 +317,11 @@ pub fn schedule(frame_rsp: u64) -> u64 {
     if !STARTED.load(Ordering::Acquire) {
         return frame_rsp;
     }
+    let c = percpu::index();
     let mut s = SCHED.lock();
     let now = crate::time::uptime_ms();
-    let cur = s.current;
-    let elapsed = now.saturating_sub(s.slice_start);
+    let cur = s.current[c];
+    let elapsed = now.saturating_sub(s.slice_start[c]);
     {
         let t = &mut s.threads[cur];
         t.rsp = frame_rsp;
@@ -281,20 +331,29 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         }
     }
 
-    // Reap dead threads other than the one whose stack we are standing on.
-    let mut i = 1;
+    // Reap dead threads no CPU is standing on.
+    let mut i = 0;
     while i < s.threads.len() {
-        if s.threads[i].state == State::Dead && i != s.current {
+        let t = &s.threads[i];
+        let in_use = t.idle || t.on_cpu.load(Ordering::Acquire) || s.current.iter().take(percpu::count()).any(|&k| k == i);
+        if t.state == State::Dead && !in_use {
             let t = s.threads.remove(i);
-            if i < s.current {
-                s.current -= 1;
+            for k in s.current.iter_mut() {
+                if *k > i {
+                    *k -= 1;
+                }
+            }
+            for k in s.idle.iter_mut() {
+                if *k > i {
+                    *k -= 1;
+                }
             }
             drop(t);
         } else {
             i += 1;
         }
     }
-    let cur = s.current;
+    let cur = s.current[c];
 
     for t in s.threads.iter_mut() {
         if let State::Sleeping(until) = t.state
@@ -304,14 +363,19 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         }
     }
 
+    // Next ready thread after the current one that no CPU is running.
     let n = s.threads.len();
-    let mut next = 0;
+    let mut next = s.idle[c];
     for k in 1..=n {
         let i = (cur + k) % n;
-        if i != 0 && s.threads[i].state == State::Ready {
+        let t = &s.threads[i];
+        if !t.idle && t.state == State::Ready && (i == cur || !t.on_cpu.load(Ordering::Acquire)) {
             next = i;
             break;
         }
+    }
+    if next == s.idle[c] && s.threads[cur].state == State::Ready && !s.threads[cur].idle {
+        next = cur;
     }
     if next != cur {
         // Floating-point registers and thread-local storage go with the thread.
@@ -320,12 +384,14 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         if s.threads[next].fs_base != s.threads[cur].fs_base {
             unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, s.threads[next].fs_base) };
         }
-        if s.threads[next].gs_base != s.threads[cur].gs_base {
-            unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, s.threads[next].gs_base) };
-        }
+        unsafe { cpu::wrmsr(MSR_KERNEL_GS_BASE, s.threads[next].gs_base) };
+        s.threads[next].on_cpu.store(true, Ordering::Release);
+        // The old thread is released by the entry code once this CPU has
+        // left its stack.
+        percpu::this().prev_on_cpu = &s.threads[cur].on_cpu as *const AtomicBool as u64;
     }
-    s.current = next;
-    s.slice_start = now;
+    s.current[c] = next;
+    s.slice_start[c] = now;
     let t = &mut s.threads[next];
     t.state = State::Running;
     if t.kstack_top != 0 {
@@ -346,7 +412,7 @@ pub fn yield_now() {
 
 fn set_current_state(state: State) {
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].state = state;
 }
 
@@ -371,13 +437,13 @@ pub fn wait_event(seen: u64, ms: u64) {
         if EVENTS.load(Ordering::Acquire) != seen {
             return;
         }
-        let c = s.current;
+        let c = s.cur();
         s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
         s.threads[c].waiting = true;
     }
     yield_now();
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].waiting = false;
 }
 
@@ -400,13 +466,13 @@ pub fn wait_flag(flag: &core::sync::atomic::AtomicBool, ms: u64) {
         if flag.load(Ordering::Acquire) {
             return;
         }
-        let c = s.current;
+        let c = s.cur();
         s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
         s.threads[c].waiting = true;
     }
     yield_now();
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].waiting = false;
 }
 
@@ -442,7 +508,7 @@ pub fn exit_current() -> ! {
 
 pub fn current_process() -> Option<Arc<Process>> {
     let s = SCHED.lock();
-    s.threads[s.current].process.clone()
+    s.threads[s.cur()].process.clone()
 }
 
 /// Mark every thread of a process dead (used when it exits or faults).
@@ -458,7 +524,7 @@ pub fn kill_process_threads(pid: u64) {
 /// End every thread of `pid` except the calling one (execve).
 pub fn kill_other_threads(pid: u64) {
     let mut s = SCHED.lock();
-    let cur = s.current;
+    let cur = s.cur();
     for (i, t) in s.threads.iter_mut().enumerate() {
         if i != cur && t.process.as_ref().map(|p| p.pid) == Some(pid) {
             t.state = State::Dead;
@@ -466,15 +532,31 @@ pub fn kill_other_threads(pid: u64) {
     }
 }
 
+/// Wait until no other thread of `pid` is still executing on some CPU
+/// (after `kill_other_threads`, before freeing their address space).
+pub fn wait_others_off_cpu(pid: u64) {
+    loop {
+        let busy = {
+            let s = SCHED.lock();
+            let cur = s.cur();
+            s.threads.iter().enumerate().any(|(i, t)| i != cur && t.process.as_ref().map(|p| p.pid) == Some(pid) && t.on_cpu.load(Ordering::Acquire))
+        };
+        if !busy {
+            return;
+        }
+        yield_now();
+    }
+}
+
 /// Run the calling thread in another address space from now on.
 pub fn switch_address_space(pml4: u64) {
     let mut s = SCHED.lock();
-    let c = s.current;
+    let c = s.cur();
     s.threads[c].pml4 = pml4;
     s.threads[c].fs_base = 0;
     s.threads[c].gs_base = 0;
     unsafe {
-        cpu::wrmsr(cpu::MSR_GS_BASE, 0);
+        cpu::wrmsr(MSR_KERNEL_GS_BASE, 0);
         cpu::write_cr3(pml4);
         cpu::wrmsr(cpu::MSR_FS_BASE, 0);
     }

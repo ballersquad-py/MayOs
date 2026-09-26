@@ -12,7 +12,7 @@ networking with TCP, audio, media playback (H.264/AAC/MP3) and the
 Settings app are done.
 
 - **Boot**: UEFI or legacy BIOS via the Limine bootloader, from one ISO.
-- **Kernel**: GDT/TSS/IDT, physical and virtual memory, kernel heap,
+- **Kernel**: multiple CPUs (SMP, started through Limine), GDT/TSS/IDT, physical and virtual memory, kernel heap,
   ACPI + APIC timer, preemptive scheduler, `syscall`-based user programs
   loaded from ELF files, shutdown/reboot.
 - **Drivers**: PCI, virtio block / GPU / tablet, VMware SVGA II
@@ -31,7 +31,8 @@ Settings app are done.
   `<canvas>` 2D, cookies and `localStorage`. Try `/docs/snake.html`.
   Certificates are not checked yet; `fetch`/XHR, floats, grid and WOFF2
   fonts are still missing.
-- **Linux programs**: MayOS speaks the Linux system-call ABI, so
+- **Linux programs**: MayOS speaks the Linux system-call ABI (sound
+  through ALSA `/dev/snd`, played by MayOS's mixer), so
   statically linked Linux x86_64 programs run unchanged: Rust programs
   built with `--target x86_64-unknown-linux-musl` (full `std`: files,
   threads, networking, time) or C programs built with `musl-gcc -static`.
@@ -60,8 +61,10 @@ Settings app are done.
   them and runs their setup steps; `pkg search`, `pkg list`. For
   example `pkg install netsurf` then `netsurf` gives you the NetSurf web
   browser (GTK 3). `pkg install firefox` then `firefox` runs Mozilla
-  Firefox (software WebRender, no sandbox; the first start takes a
-  while). A D-Bus session bus (Alpine's `dbus-daemon`) starts on its own
+  Firefox 142: JavaScript and WebAssembly, WebGL and WebGL2 (Mesa's
+  llvmpipe software OpenGL), video (VP9, H.264, AV1, `MediaSource`) and
+  sound (Web Audio and media, through ALSA), using every CPU (no sandbox;
+  the first start takes a while). A D-Bus session bus (Alpine's `dbus-daemon`) starts on its own
   for Linux programs. Give the VM 2 GB of RAM or more and about 1 GB of
   free disk. Firefox's `libEGL missing` / `No GPUs detected via PCI`
   messages are expected: there is no GPU driver for Linux programs, so it
@@ -113,7 +116,8 @@ Settings app are done.
 Use `mayos.iso` with any of these:
 
 **VirtualBox**: New VM → Type *Other*, Version *Other/Unknown (64-bit)*,
-1024 MB of RAM. Under *Storage*, attach `mayos.iso` to the optical drive.
+4096 MB of RAM and, under *System → Processor*, as many CPUs as you can
+spare (Firefox uses them all). Under *Storage*, attach `mayos.iso` to the optical drive.
 Under *System → Motherboard*, set **Pointing Device: PS/2 Mouse**. EFI can
 be on or off. Under *Display*, keep the **VMSVGA** controller, give it
 **64 MB or more** of video memory, and leave **3D acceleration off**

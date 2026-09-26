@@ -87,6 +87,30 @@ pub fn init(acpi: &AcpiInfo) {
     }
 }
 
+static TIMER_INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Enable this (application) CPU's local APIC and start its timer with
+/// the boot CPU's calibration.
+pub fn init_ap() {
+    lapic_write(LAPIC_TPR, 0);
+    lapic_write(LAPIC_SVR, 0x100 | super::idt::VEC_SPURIOUS as u32);
+    lapic_write(LAPIC_TIMER_DIV, 0x3);
+    lapic_write(LAPIC_LVT_TIMER, super::idt::VEC_TIMER as u32 | (1 << 17));
+    lapic_write(LAPIC_TIMER_INIT, TIMER_INIT.load(Ordering::Relaxed));
+}
+
+/// Send `vector` to every other CPU.
+pub fn ipi_others(vector: u8) {
+    const ICR_LOW: usize = 0x300;
+    const ICR_HIGH: usize = 0x310;
+    while lapic_read(ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    lapic_write(ICR_HIGH, 0);
+    // All excluding self, fixed delivery, assert.
+    lapic_write(ICR_LOW, vector as u32 | (1 << 14) | (0b11 << 18));
+}
+
 pub fn lapic_id() -> u32 {
     lapic_read(LAPIC_ID) >> 24
 }
@@ -127,5 +151,6 @@ pub fn start_timer(hz: u32) -> u64 {
     let per_ms = (elapsed / 20).max(1);
     lapic_write(LAPIC_LVT_TIMER, super::idt::VEC_TIMER as u32 | (1 << 17));
     lapic_write(LAPIC_TIMER_INIT, per_ms * 1000 / hz);
+    TIMER_INIT.store(per_ms * 1000 / hz, Ordering::Relaxed);
     ((t1 - t0) / 20).max(1)
 }

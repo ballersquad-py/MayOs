@@ -69,6 +69,11 @@ extern "C" fn interrupt_dispatch(frame: &mut TrapFrame) -> u64 {
             if exit { sched::schedule(rsp) } else { rsp }
         }
         idt::VEC_YIELD => sched::schedule(rsp),
+        idt::VEC_TLB => {
+            crate::smp::on_tlb_ipi();
+            apic::eoi();
+            rsp
+        }
         idt::VEC_SPURIOUS => rsp,
         _ => {
             apic::eoi();
