@@ -8,6 +8,7 @@ pub mod ramdisk;
 pub mod e1000;
 pub mod bochs_vga;
 pub mod vmware_svga;
+pub mod svga3d;
 pub mod ahci;
 pub mod ide;
 pub mod vmmdev;

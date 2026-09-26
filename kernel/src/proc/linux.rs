@@ -2611,12 +2611,16 @@ pub static FAULT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 
 /// `sysprof`: per-syscall counts and total time since the last reset.
 pub fn prof_report(reset: bool) -> String {
+    prof_report_n(reset, 14)
+}
+
+pub fn prof_report_n(reset: bool, top: usize) -> String {
     let mut v: Vec<(u64, u64, usize)> = (0..PROF_N)
         .map(|i| (PROF_US[i].load(Ordering::Relaxed), PROF_COUNT[i].load(Ordering::Relaxed), i))
         .filter(|x| x.1 > 0).collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = alloc::format!("page faults {}  {} ms\n", PAGE_FAULTS.load(Ordering::Relaxed), FAULT_US.load(Ordering::Relaxed) / 1000);
-    for (us, n, i) in v.iter().take(14) {
+    for (us, n, i) in v.iter().take(top) {
         out.push_str(&alloc::format!("{:<16} {:>8} calls {:>8} ms\n", syscall_name(*i as u64), n, us / 1000));
     }
     if reset {

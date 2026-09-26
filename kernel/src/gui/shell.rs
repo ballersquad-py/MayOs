@@ -518,6 +518,33 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {}", t.id, pid, state, t.cpu_ms, t.name);
             }
         }
+        "report" => {
+            // Everything needed to diagnose speed problems, in one file to
+            // download with `share`.
+            let mut r = String::new();
+            let _ = writeln!(r, "== sysprof (since last reset)\n{}", crate::proc::linux::prof_report_n(false, 60));
+            let _ = writeln!(r, "== threads (busiest first)");
+            let mut all = crate::proc::sched::list();
+            all.sort_by(|a, b| b.cpu_ms.cmp(&a.cpu_ms));
+            for t in all.iter().filter(|t| t.pid.is_some()) {
+                let exe = crate::proc::process::find(t.pid.unwrap()).map(|p| crate::proc::linux::exe_name(&p)).unwrap_or_default();
+                let [nr, a0, a1] = t.syscall;
+                let what = if nr == crate::proc::sched::NO_SYSCALL { String::from("user code") } else { format!("{}({:#x}, {:#x})", crate::proc::linux::syscall_name(nr), a0, a1) };
+                let _ = writeln!(r, "{:>5} {:>5} {:?} {:>8}ms {:<15} {} [{}]", t.id, t.pid.unwrap(), t.state, t.cpu_ms, crate::proc::linux::thread_name(t.id).unwrap_or_default(), what, exe);
+            }
+            let _ = writeln!(r, "\n== gpuinfo\n{}", crate::drivers::vmware_svga::report());
+            let log = crate::log::contents();
+            let mut from = log.len().saturating_sub(20000);
+            while !log.is_char_boundary(from) {
+                from += 1;
+            }
+            let tail = &log[from..];
+            let _ = writeln!(r, "== kernel log (end)\n{}", tail);
+            match fs::write_file("/report.txt", r.as_bytes()) {
+                Ok(()) => { let _ = writeln!(out, "Saved /report.txt. Download it with `share` (open the address in your host browser)."); }
+                Err(e) => err(out, format!("report: {}", e)),
+            }
+        }
         "sysprof" => {
             // Where Linux programs spend kernel time; "sysprof reset" clears.
             let _ = write!(out, "{}", crate::proc::linux::prof_report(args.first() == Some(&"reset")));
@@ -556,6 +583,14 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {:<15} {}", t.id, pid, state, t.cpu_ms, tname, what);
             }
         }
+        "gpu3d" => match args.first().copied() {
+            // GPU 3D: `gpu3d test` runs a copy on the GPU and checks it.
+            Some("test") => match crate::drivers::svga3d::self_test() {
+                Ok(m) => { let _ = writeln!(out, "ok   {}", m); }
+                Err(e) => err(out, format!("gpu3d test failed: {}", e)),
+            },
+            _ => err(out, "usage: gpu3d test"),
+        },
         "gpuinfo" => {
             let _ = write!(out, "{}", crate::drivers::vmware_svga::report());
         }

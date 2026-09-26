@@ -86,6 +86,28 @@ pub fn gpu_info() -> Option<GpuInfo> {
     GPU_INFO.lock().clone()
 }
 
+/// The index/value port pair is shared by the display code and the 3D
+/// code (drivers::svga3d), so each access holds this lock.
+static REG_LOCK: crate::sync::Spin<()> = crate::sync::Spin::new(());
+/// I/O base of the adapter in use (0 until it is initialised).
+pub static IO_BASE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+pub fn reg_read(io: u16, reg: u32) -> u32 {
+    let _g = REG_LOCK.lock();
+    unsafe {
+        outl(io, reg);
+        inl(io + 1)
+    }
+}
+
+pub fn reg_write(io: u16, reg: u32, v: u32) {
+    let _g = REG_LOCK.lock();
+    unsafe {
+        outl(io, reg);
+        outl(io + 1, v);
+    }
+}
+
 static FAILURES: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
 
 /// Remember why the adapter could not be used (shown by `gpuinfo`).
@@ -122,17 +144,11 @@ pub fn report() -> alloc::string::String {
 
 impl VmwareSvga {
     fn read(&self, reg: u32) -> u32 {
-        unsafe {
-            outl(self.io, reg);
-            inl(self.io + 1)
-        }
+        reg_read(self.io, reg)
     }
 
     fn write(&self, reg: u32, v: u32) {
-        unsafe {
-            outl(self.io, reg);
-            outl(self.io + 1, v);
-        }
+        reg_write(self.io, reg, v)
     }
 
     pub fn new(pci: &PciDevice) -> Option<VmwareSvga> {
@@ -263,6 +279,7 @@ impl VmwareSvga {
                 dev_caps.push(self.read(52));
             }
         }
+        IO_BASE.store(self.io, core::sync::atomic::Ordering::Release);
         *GPU_INFO.lock() = Some(GpuInfo {
             caps,
             cap2: if caps & 0x8000_0000 != 0 { self.read(59) } else { 0 },
