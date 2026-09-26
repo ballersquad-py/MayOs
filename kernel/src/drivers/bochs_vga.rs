@@ -48,20 +48,28 @@ impl BochsVga {
     /// Accepts QEMU std VGA (1234:1111) and VBoxVGA (80ee:beef with a
     /// memory BAR 0).
     pub fn new(pci: &PciDevice) -> Option<BochsVga> {
+        // Ask for the newest interface; VirtualBox may report its own
+        // 0xbe0x IDs (VBOX_VIDEO/HGSMI) when 3D or HGSMI is active.
+        write(REG_ID, 0xb0c5);
         let id = read(REG_ID);
-        if !(0xb0c0..=0xb0cf).contains(&id) {
+        if !(0xb0c0..=0xb0cf).contains(&id) && !(0xbe00..=0xbeff).contains(&id) {
+            crate::drivers::vmware_svga::fail(alloc::format!("DISPI ID {:#x} not recognised", id));
             return None;
         }
         pci.enable();
         let fb_phys = pci.bar(0);
         if fb_phys == 0 || pci.read32(0x10) & 1 != 0 {
+            crate::drivers::vmware_svga::fail(alloc::format!("framebuffer BAR {:#x} unusable", fb_phys));
             return None;
         }
         let vram_64k = read(REG_VIDEO_MEMORY_64K) as usize;
         let vram = if vram_64k != 0 { vram_64k * 64 * 1024 } else { 16 * 1024 * 1024 };
         // Map all of VRAM once, so every mode we accept is already mapped.
         let fb_len = vram.min(256 * 1024 * 1024);
-        let fb_virt = paging::map_framebuffer(fb_phys, fb_len)?;
+        let Some(fb_virt) = paging::map_framebuffer(fb_phys, fb_len) else {
+            crate::drivers::vmware_svga::fail(alloc::format!("could not map {} MiB VRAM at {:#x}", fb_len >> 20, fb_phys));
+            return None;
+        };
         crate::kprintln!("bochs-vga: vram {} MiB at {:#x}", vram / (1024 * 1024), fb_phys);
         Some(BochsVga { fb_virt, fb_len, width: 0, height: 0 })
     }
@@ -84,7 +92,11 @@ impl BochsVga {
         write(REG_X_OFFSET, 0);
         write(REG_Y_OFFSET, 0);
         write(REG_ENABLE, ENABLED | LFB_ENABLED);
-        if read(REG_XRES) != w as u16 || read(REG_YRES) != h as u16 {
+        let (rw, rh) = (read(REG_XRES), read(REG_YRES));
+        // VirtualBox with 3D can read back 0 here although the mode took;
+        // only a different non-zero size means refusal.
+        if (rw != 0 && rw != w as u16) || (rh != 0 && rh != h as u16) {
+            crate::drivers::vmware_svga::fail(alloc::format!("mode {}x{} refused (device says {}x{})", w, h, rw, rh));
             // Restore the previous mode.
             if self.width != 0 {
                 let (ow, oh) = (self.width, self.height);
