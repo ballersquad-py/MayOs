@@ -43,6 +43,7 @@ const HELP: &[(&str, &str)] = &[
     ("df", "disk usage"),
     ("perf", "speed of this machine, frame rate, sound glitches"),
     ("free", "memory usage"),
+    ("vbench <video>", "how fast this machine decodes a video"),
     ("ps", "list threads and processes"),
     ("kill <pid>", "stop a process"),
     ("uptime / date", "time since boot / current date"),
@@ -523,6 +524,15 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             },
             None => err(out, "usage: kill <pid>"),
         },
+        "vbench" => match args.first() {
+            Some(f) => match vbench(&abs(f)) {
+                Ok(msg) => {
+                    let _ = writeln!(out, "{}", msg);
+                }
+                Err(e) => err(out, format!("vbench: {}", e)),
+            },
+            None => err(out, "usage: vbench <video file>"),
+        },
         "uptime" => {
             let s = crate::time::uptime_ms() / 1000;
             let _ = writeln!(out, "up {}h {:02}m {:02}s", s / 3600, (s / 60) % 60, s % 60);
@@ -973,4 +983,52 @@ fn job_nslookup(name: &str, c: &Console, _cancel: &AtomicBool) -> i64 {
             1
         }
     }
+}
+
+/// Decode up to 10 seconds of a video's picture track as fast as possible
+/// and report the speed (decoding, and colour conversion for display).
+fn vbench(path: &str) -> Result<String, String> {
+    let data = fs::read_file(path).map_err(|e| e.to_string())?;
+    let mut dm = media::demux::open(alloc::boxed::Box::new(data)).map_err(|e| format!("{:?}", e))?;
+    let info = dm.info().clone();
+    let vi = media::pipeline::choose_tracks(&info.tracks).0.ok_or("no video track")?;
+    let t = &info.tracks[vi];
+    let mut dec = media::pipeline::VideoDecoder::new(t)?;
+    let (w, h) = (t.width as usize, t.height as usize);
+    let mut argb = alloc::vec![0u32; w * h];
+    let (mut frames, mut dec_us, mut conv_us) = (0u64, 0u64, 0u64);
+    let mut convert = |f: media::pipeline::VideoFrame, frames: &mut u64, conv_us: &mut u64| {
+        let t0 = crate::time::uptime_us();
+        f.render(&mut argb, w, h, w);
+        *conv_us += crate::time::uptime_us() - t0;
+        *frames += 1;
+    };
+    while let Some(Ok(p)) = dm.next_packet() {
+        if p.track != vi {
+            continue;
+        }
+        if p.pts > 10_000_000 {
+            break;
+        }
+        let t0 = crate::time::uptime_us();
+        dec.decode(&p);
+        dec_us += crate::time::uptime_us() - t0;
+        while let Some(f) = dec.next_frame() {
+            convert(f, &mut frames, &mut conv_us);
+        }
+    }
+    dec.flush();
+    while let Some(f) = dec.next_frame() {
+        convert(f, &mut frames, &mut conv_us);
+    }
+    let frames_f = frames.max(1);
+    Ok(format!(
+        "{}x{}: {} frames, decoding {:.1} ms/frame ({} fps), colour conversion {:.1} ms/frame",
+        w,
+        h,
+        frames,
+        dec_us as f64 / 1000.0 / frames_f as f64,
+        frames * 1_000_000 / dec_us.max(1),
+        conv_us as f64 / 1000.0 / frames_f as f64
+    ))
 }

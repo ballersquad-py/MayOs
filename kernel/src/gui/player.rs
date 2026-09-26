@@ -380,6 +380,10 @@ pub struct Player {
     /// Clock for files without audio: media time at `wall_start`.
     wall_base: i64,
     wall_start: u64,
+    /// Smoothed audio clock: (media time, uptime in us) of the last
+    /// reading. The sound card's position moves in 21 ms steps and in
+    /// bursts; following it directly shows frames for uneven times.
+    smooth: core::cell::Cell<Option<(i64, u64, u32)>>,
     position: i64,
     ended: bool,
     size: (i32, i32),
@@ -417,6 +421,7 @@ impl Player {
             paused: false,
             wall_base: 0,
             wall_start: uptime_ms(),
+            smooth: core::cell::Cell::new(None),
             position: 0,
             ended: false,
             size: (900, 560),
@@ -482,12 +487,34 @@ impl Player {
     /// Current media time.
     fn clock(&self) -> i64 {
         let s = self.shared.lock();
-        let base = s.base_us;
+        let (base, epoch) = (s.base_us, s.epoch);
         drop(s);
         let has_audio = self.summary.as_ref().map(|s| s.has_audio).unwrap_or(false);
         if has_audio {
             let played = self.stream.played().saturating_sub(audio::latency_frames());
-            base + (played as i64 * 1_000_000 / 48_000)
+            let a = base + (played as i64 * 1_000_000 / 48_000);
+            if self.paused {
+                self.smooth.set(None);
+                return a;
+            }
+            let now = crate::time::uptime_us();
+            let t = match self.smooth.get() {
+                // (Not across a seek: the clock restarts there.)
+                Some((m, w, e)) if e == epoch => {
+                    let p = m + (now - w) as i64;
+                    let err = a - p;
+                    if err > 150_000 {
+                        a // far behind the sound (a stall): jump
+                    } else if err < -60_000 {
+                        m // sound is not moving (starting, starved): wait for it
+                    } else {
+                        (p + err / 16).max(m) // follow the sound gently
+                    }
+                }
+                _ => a,
+            };
+            self.smooth.set(Some((t, now, epoch)));
+            t
         } else if self.paused {
             self.wall_base
         } else {

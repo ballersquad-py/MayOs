@@ -6,7 +6,6 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::demux::{Codec, Kind, Packet, TrackInfo};
@@ -150,14 +149,6 @@ impl VideoFrame {
         match &self.data {
             FrameData::Yuv(f) => {
                 let b = &f.buf;
-                if dw == f.width && dh == f.height {
-                    let mut tmp = vec![0u32; dw * dh];
-                    f.to_argb(&mut tmp);
-                    for y in 0..dh {
-                        dst[y * ds..y * ds + dw].copy_from_slice(&tmp[y * dw..y * dw + dw]);
-                    }
-                    return;
-                }
                 crate::yuv::scale_to_argb(&b.y, &b.cb, &b.cr, b.width, b.width / 2, f.crop_x, f.crop_y, f.width, f.height, f.matrix == 1, f.full_range, dst, dw, dh, ds);
             }
             FrameData::Argb(img) => {
