@@ -825,7 +825,7 @@ fn virtual_file(path: &str) -> Option<Desc> {
         "/etc/group" => String::from("root:x:0:\nuser:x:1000:\n"),
         "/etc/hostname" => String::from("mayos\n"),
         "/etc/os-release" => String::from("NAME=MayOS\nID=mayos\nPRETTY_NAME=\"MayOS\"\n"),
-        "/proc/cpuinfo" => (0..crate::smp::online()).map(|c| alloc::format!("processor\t: {}\nvendor_id\t: GenuineIntel\nmodel name\t: MayOS virtual CPU\nflags\t\t: fpu sse sse2\n\n", c)).collect(),
+        "/proc/cpuinfo" => (0..crate::smp::online()).map(|c| alloc::format!("processor\t: {}\nvendor_id\t: GenuineIntel\nmodel name\t: MayOS virtual CPU\nflags\t\t: {}\n\n", c, crate::arch::cpu::cpu_flags())).collect(),
         "/proc/meminfo" => {
             let (free, total) = pmm::stats();
             alloc::format!("MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\n", total * 4, free * 4, free * 4)

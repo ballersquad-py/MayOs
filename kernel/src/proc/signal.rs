@@ -462,11 +462,11 @@ fn setup_frame(p: &Process, f: &mut TrapFrame, sig: u64, act: Action, info: Info
     let pml4 = p.pml4();
     let on_alt = alt.1 != 0 && f.rsp > alt.0 && f.rsp <= alt.0 + alt.1;
     let mut sp = if act.flags & SA_ONSTACK != 0 && alt.1 != 0 && !on_alt { alt.0 + alt.1 } else { f.rsp - 128 };
-    // Floating-point state (fxsave format, 64-byte aligned).
-    sp -= 512;
+    // Floating-point state (xsave/fxsave format, 64-byte aligned).
+    sp -= cpu::FPU_BYTES as u64;
     sp &= !63;
     let fx = sp;
-    let mut fpu = FpuState([0; 512]);
+    let mut fpu = FpuState::zeroed();
     cpu::fxsave(&mut fpu);
     if !usermem::write_bytes(pml4, fx, &fpu.0) {
         return false;
@@ -543,13 +543,12 @@ pub fn sigreturn(p: &Process, f: &mut TrapFrame) -> bool {
     f.ss = ss;
     let fx = g(23);
     if fx != 0
-        && let Some(state) = usermem::read_bytes(pml4, fx, 512)
+        && let Some(state) = usermem::read_bytes(pml4, fx, cpu::FPU_BYTES as u64)
     {
-        let mut s = FpuState([0; 512]);
+        let mut s = FpuState::zeroed();
         s.0.copy_from_slice(&state);
-        // Reserved MXCSR bits would fault in fxrstor.
-        let mxcsr = u32::from_le_bytes(s.0[24..28].try_into().unwrap()) & 0xffff;
-        s.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        // Reserved MXCSR bits or header fields would fault in the restore.
+        cpu::sanitize(&mut s);
         cpu::fxrstor(&s);
     }
     let mask = u64::from_le_bytes(b[UC_SIGMASK as usize..UC_SIGMASK as usize + 8].try_into().unwrap());

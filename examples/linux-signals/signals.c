@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,6 +129,28 @@ static void sockets(void) {
     CHECK(read(bl[0], b, 1) == -1 && errno == EINTR, "EINTR from a blocking read");
     pthread_join(k, 0);
     unlink(a.sun_path);
+}
+
+#include <immintrin.h>
+static volatile int avx_bad;
+static void avx_sig(int s) {
+    (void)s;
+    __asm__ volatile("vpxor %%ymm0, %%ymm0, %%ymm0" ::: "xmm0");
+}
+__attribute__((target("avx"))) static void *avx_worker(void *arg) {
+    long id = (long)arg;
+    for (int i = 0; i < 2000; i++) {
+        __m256d v = _mm256_set1_pd((double)(id * 1000 + i));
+        __asm__ volatile("" : "+x"(v));
+        sched_yield();
+        if (i % 100 == 0) raise(SIGUSR2);
+        __asm__ volatile("" : "+x"(v));
+        double out[4];
+        _mm256_storeu_pd(out, v);
+        for (int k = 0; k < 4; k++)
+            if (out[k] != (double)(id * 1000 + i)) avx_bad = 1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -260,6 +283,22 @@ int main(int argc, char **argv) {
     }
     PART(7) {
     sockets();
+    }
+    PART(9) {
+    // AVX registers survive thread switches and signal handlers.
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    char cb[2048] = {0};
+    if (ci) { fread(cb, 1, sizeof cb - 1, ci); fclose(ci); }
+    if (__builtin_cpu_supports("avx")) {
+        CHECK(strstr(cb, " avx") != 0, "cpuinfo lists avx");
+        signal(SIGUSR2, avx_sig);
+        pthread_t th[4];
+        for (long i = 0; i < 4; i++) pthread_create(&th[i], 0, avx_worker, (void *)i);
+        for (int i = 0; i < 4; i++) pthread_join(th[i], 0);
+        CHECK(!avx_bad, "AVX state kept across switches and signals");
+    } else {
+        printf("ok   (no AVX on this CPU)\n");
+    }
     }
     PART(8) {
     // vDSO clock_gettime: present, monotonic, matches the system call.
