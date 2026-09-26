@@ -112,7 +112,16 @@ pref("browser.sessionstore.resume_from_crash", false);
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
     let u = web::url::Url::parse(url).ok_or("bad url")?;
-    let r = crate::network::http::get(&u)?;
+    // Big packages (Firefox is ~90 MB): allow up to 1 GB, and retry a
+    // download that was cut off.
+    let mut tries = 0;
+    let r = loop {
+        match crate::network::http::get_limit(&u, 1 << 30) {
+            Ok(r) => break r,
+            Err(e) if tries < 3 && e.contains("cut off") => tries += 1,
+            Err(e) => return Err(e),
+        }
+    };
     if r.status != 200 {
         return Err(format!("{}: HTTP {}", url, r.status));
     }

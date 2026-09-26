@@ -36,9 +36,15 @@ impl Response {
 
 /// GET a URL, following up to 8 redirects. `file://` reads from disk.
 pub fn get(url: &Url) -> Result<Response, String> {
+    get_limit(url, MAX_BODY)
+}
+
+/// GET with a larger size limit (package downloads). A body cut short of
+/// its Content-Length is an error rather than a silently truncated file.
+pub fn get_limit(url: &Url, max: usize) -> Result<Response, String> {
     let mut url = url.clone();
     for _ in 0..8 {
-        let r = get_once(&url)?;
+        let r = get_once(&url, max)?;
         if matches!(r.status, 301 | 302 | 303 | 307 | 308)
             && let Some(loc) = r.header("location")
         {
@@ -50,7 +56,7 @@ pub fn get(url: &Url) -> Result<Response, String> {
     Err(String::from("too many redirects"))
 }
 
-fn get_once(url: &Url) -> Result<Response, String> {
+fn get_once(url: &Url, max: usize) -> Result<Response, String> {
     if url.scheme == "file" {
         let path = url.path.split('?').next().unwrap_or("/");
         let body = crate::fs::read_file(&percent_decode(path)).map_err(|e| format!("{}: {}", path, e))?;
@@ -64,8 +70,14 @@ fn get_once(url: &Url) -> Result<Response, String> {
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Encoding: identity\r\nAccept-Language: en\r\n{}Connection: close\r\n\r\n",
         url.path, url.host, USER_AGENT, cookie_line
     );
-    let raw = if url.scheme == "https" { tls_exchange(stream, &url.host, request.as_bytes())? } else { plain_exchange(stream, request.as_bytes())? };
+    let raw = if url.scheme == "https" { tls_exchange(stream, &url.host, request.as_bytes(), max)? } else { plain_exchange(stream, request.as_bytes(), max)? };
     let r = parse_response(raw, url)?;
+    if let Some(len) = r.header("content-length").and_then(|v| v.parse::<usize>().ok())
+        && r.body.len() < len
+        && r.header("transfer-encoding").is_none()
+    {
+        return Err(format!("download cut off ({} of {} bytes)", r.body.len(), len));
+    }
     for (k, v) in &r.headers {
         if k.eq_ignore_ascii_case("set-cookie") {
             crate::gui::js::set_cookie(url, v);
@@ -74,7 +86,7 @@ fn get_once(url: &Url) -> Result<Response, String> {
     Ok(r)
 }
 
-fn plain_exchange(mut s: TcpStream, req: &[u8]) -> Result<Vec<u8>, String> {
+fn plain_exchange(mut s: TcpStream, req: &[u8], max: usize) -> Result<Vec<u8>, String> {
     s.write_all(req, TIMEOUT_MS).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
@@ -85,7 +97,7 @@ fn plain_exchange(mut s: TcpStream, req: &[u8]) -> Result<Vec<u8>, String> {
             Err(e) if out.is_empty() => return Err(e.to_string()),
             Err(_) => break,
         }
-        if out.len() > MAX_BODY {
+        if out.len() > max {
             break;
         }
     }
@@ -151,7 +163,7 @@ fn seed() -> [u8; 32] {
     s
 }
 
-fn tls_exchange(s: TcpStream, host: &str, req: &[u8]) -> Result<Vec<u8>, String> {
+fn tls_exchange(s: TcpStream, host: &str, req: &[u8], max: usize) -> Result<Vec<u8>, String> {
     let has_rdrand = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
     let seed = if has_rdrand {
         seed()
@@ -183,7 +195,7 @@ fn tls_exchange(s: TcpStream, host: &str, req: &[u8]) -> Result<Vec<u8>, String>
             // Many servers just drop the connection after the body.
             Err(_) => break,
         }
-        if out.len() > MAX_BODY {
+        if out.len() > max {
             break;
         }
     }
