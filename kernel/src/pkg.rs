@@ -124,10 +124,6 @@ pref("accessibility.force_disabled", 1);
 // WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.
 pref("webgl.force-enabled", true);
 pref("webgl.disabled", false);
-// Run WebGL in the page's own process: out of process, every GL call that
-// returns a value is a synchronous IPC round trip (hundreds per frame).
-pref("webgl.out-of-process", false);
-pref("webgl.out-of-process.force", false);
 pref("media.autoplay.blocking_policy", 0);
 // Speed: files are rewritten whole on MayOS, and drawing is in software.
 pref("browser.cache.disk.enable", false);

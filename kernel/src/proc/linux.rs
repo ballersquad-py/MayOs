@@ -131,6 +131,8 @@ pub enum Desc {
     TimerFd { t: Arc<TimerFd>, nonblock: bool },
     /// /dev/snd/controlC0
     SndCtl,
+    /// /dev/dri/card0 or renderD128 (the minor number)
+    Drm(u64),
     /// /dev/snd/pcmC0D0p
     SndPcm(Arc<super::alsa::Pcm>),
 }
@@ -930,6 +932,13 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
         }
         return fd;
     }
+    if let Some(minor) = super::drm::node(&path) {
+        return add_fd(p, Desc::Drm(minor));
+    }
+    if path == "/dev/dri" && super::drm::enabled() {
+        let entries = super::drm::NODES.iter().map(|(n, _)| (String::from(*n), false)).collect();
+        return add_fd(p, Desc::Dir { path, entries, pos: 0 });
+    }
     if path == "/dev/snd" {
         let entries = super::alsa::names().iter().map(|n| (String::from(*n), false)).collect();
         return add_fd(p, Desc::Dir { path, entries, pos: 0 });
@@ -1146,7 +1155,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 sched::wait_event(ev_seen, 20);
             }
         }
-        Desc::Epoll(_) | Desc::SndCtl | Desc::SndPcm(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) => -EINVAL,
         Desc::TimerFd { t, nonblock } => {
             let (t, nb) = (t.clone(), *nonblock);
             drop(g);
@@ -1243,7 +1252,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             ev.add(u64::from_le_bytes(data[..8].try_into().unwrap()));
             8
         }
-        Desc::Epoll(_) | Desc::TimerFd { .. } | Desc::SndCtl | Desc::SndPcm(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::TimerFd { .. } | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) => -EINVAL,
         Desc::Tcp { stream: Some(s), .. } => match s.write_all(data, 60_000) {
             Ok(()) => data.len() as i64,
             Err(_) => -EPIPE,
@@ -1469,6 +1478,13 @@ fn stat_buf(mode: u32, size: u64, mtime: i64, ino: u64) -> [u8; 144] {
     b
 }
 
+/// A DRM character device with its device number (libdrm checks it).
+fn drm_stat(minor: u64) -> [u8; 144] {
+    let mut b = stat_buf(0o20666, 0, 0, 300 + minor);
+    b[40..48].copy_from_slice(&super::drm::rdev(minor).to_le_bytes());
+    b
+}
+
 fn stat_path(path: &str) -> Result<[u8; 144], i64> {
     let resolved = fs::resolve_link(path);
     let path = resolved.as_str();
@@ -1481,6 +1497,12 @@ fn stat_path(path: &str) -> Result<[u8; 144], i64> {
     }
     if path == "/" || path == "/dev/input" || path == "/dev/snd" && crate::audio::is_present() {
         return Ok(stat_buf(0o40755, 4096, 0, 2));
+    }
+    if path == "/dev/dri" && super::drm::enabled() {
+        return Ok(stat_buf(0o40755, 4096, 0, 3));
+    }
+    if let Some(minor) = super::drm::node(path) {
+        return Ok(drm_stat(minor));
     }
     if path.starts_with("/dev/snd/") && super::alsa::open(path).is_some() {
         return Ok(stat_buf(0o20660, 0, 0, 116));
@@ -1513,6 +1535,7 @@ fn stat_fd(p: &Process, fd: i64) -> Result<[u8; 144], i64> {
         Desc::Memfd { shm, .. } => stat_buf(0o100600, shm.size(), 0, Arc::as_ptr(shm) as u64),
         Desc::EventFd { .. } | Desc::Epoll(_) | Desc::TimerFd { .. } => stat_buf(0o600, 0, 0, 12),
         Desc::SndCtl | Desc::SndPcm(_) => stat_buf(0o20660, 0, 0, 116),
+        Desc::Drm(minor) => drm_stat(*minor),
         Desc::Tcp { .. } | Desc::Udp { .. } => stat_buf(0o140777, 0, 0, 7),
         Desc::PipeRead(_) | Desc::PipeWrite(_) => stat_buf(0o10600, 0, 0, 8),
     })
@@ -2159,7 +2182,7 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
         Desc::EventFd { ev, .. } => (*ev.count.lock() > 0, true),
         Desc::TimerFd { t, .. } => (t.ready(), false),
         Desc::SndPcm(pcm) => (false, pcm.ready_to_write()),
-        Desc::SndCtl => (false, false),
+        Desc::SndCtl | Desc::Drm(_) => (false, false),
         Desc::Epoll(e) => {
             let list: Vec<(DescRef, u32)> = e.list.lock().iter().filter(|i| !i.disabled).map(|i| (i.desc.clone(), i.events)).collect();
             drop(g);
@@ -3439,6 +3462,9 @@ pub fn exe_name(p: &Process) -> String {
 /// ioctls of the framebuffer and input devices.
 fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
+    if let Desc::Drm(_) = &*d.lock() {
+        return super::drm::ioctl(p.pml4(), cmd, arg);
+    }
     let snd = match &*d.lock() {
         Desc::SndCtl => Some(None),
         Desc::SndPcm(pcm) => Some(Some(pcm.clone())),

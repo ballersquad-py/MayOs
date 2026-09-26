@@ -5,6 +5,7 @@ pub mod sched;
 pub mod screen;
 pub mod signal;
 pub mod alsa;
+pub mod drm;
 pub mod syscall;
 pub mod unix;
 pub mod wayland;

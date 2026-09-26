@@ -66,6 +66,26 @@ unsafe impl Send for VmwareSvga {}
 
 static REPORT: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
 
+/// What the 3D side of the adapter offers (for the vmwgfx DRM device).
+#[derive(Clone)]
+pub struct GpuInfo {
+    pub caps: u32,
+    pub cap2: u32,
+    pub fifo_caps: u32,
+    pub fifo_hw_version: u32,
+    pub vram: u64,
+    pub max_mob_bytes: u64,
+    pub mob_memory_kib: u64,
+    pub max_surface_kib: u64,
+    pub dev_caps: alloc::vec::Vec<u32>,
+}
+
+pub static GPU_INFO: crate::sync::Spin<Option<GpuInfo>> = crate::sync::Spin::new(None);
+
+pub fn gpu_info() -> Option<GpuInfo> {
+    GPU_INFO.lock().clone()
+}
+
 static FAILURES: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
 
 /// Remember why the adapter could not be used (shown by `gpuinfo`).
@@ -238,11 +258,22 @@ impl VmwareSvga {
         // otherwise the FIFO's 3D caps block (records of dwords).
         let mut dev_caps = alloc::vec::Vec::new();
         if caps & 0x0800_0000 != 0 {
-            for i in 0..260u32 {
+            for i in 0..262u32 {
                 self.write(52, i);
                 dev_caps.push(self.read(52));
             }
         }
+        *GPU_INFO.lock() = Some(GpuInfo {
+            caps,
+            cap2: if caps & 0x8000_0000 != 0 { self.read(59) } else { 0 },
+            fifo_caps: if caps & CAP_EXTENDED_FIFO != 0 { self.fifo_reg(4) } else { 0 },
+            fifo_hw_version: if caps & CAP_EXTENDED_FIFO != 0 { self.fifo_reg(7) } else { 0 },
+            vram: self.vram as u64,
+            max_mob_bytes: if caps & 0x0800_0000 != 0 { self.read(57) as u64 } else { 0 },
+            mob_memory_kib: if caps & 0x0800_0000 != 0 { self.read(51) as u64 } else { 0 },
+            max_surface_kib: self.read(47) as u64,
+            dev_caps: dev_caps.clone(),
+        });
         let _ = writeln!(o, "3D: {}", if dev_caps.first().copied().unwrap_or(0) != 0 || self.fifo_reg(7) != 0 { "available" } else { "NOT available (enable 3D acceleration in VirtualBox's display settings)" });
         if !dev_caps.is_empty() {
             let _ = write!(o, "dev caps:");
