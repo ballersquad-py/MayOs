@@ -162,6 +162,8 @@ fn default_env(cwd: &str) -> Vec<String> {
         String::from("USER=user"),
         String::from("LANG=C.UTF-8"),
         String::from("TERM=xterm"),
+        String::from("XDG_RUNTIME_DIR=/run"),
+        String::from("WAYLAND_DISPLAY=wayland-0"),
         alloc::format!("PWD={}", cwd),
     ]
 }
@@ -455,14 +457,22 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         // File mapping: copy the contents in (private mappings only).
         let Some(d) = get_fd(p, fd) else { return -EBADF };
         let mut buf = vec![0u8; len as usize];
-        let n = {
+        // The file layer may return short reads: fill the whole mapping.
+        let mut n = 0usize;
+        {
             let mut g = d.lock();
-            read_at(&mut g, off, &mut buf)
-        };
-        if n < 0 {
-            return n;
+            while n < buf.len() {
+                let r = read_at(&mut g, off + n as u64, &mut buf[n..]);
+                if r < 0 {
+                    return r;
+                }
+                if r == 0 {
+                    break;
+                }
+                n += r as usize;
+            }
         }
-        if !usermem::write_bytes(p.pml4(), start, &buf[..n as usize]) {
+        if !usermem::write_bytes(p.pml4(), start, &buf[..n]) {
             return -ENOMEM;
         }
     }

@@ -71,6 +71,7 @@ extern "C" fn kmain() -> ! {
     if selftest {
         proc::sched::spawn_kernel("selftest", selftest::run, 0);
     }
+    proc::wayland::init();
     proc::sched::spawn_kernel("desktop", gui::desktop_main, 0);
     proc::sched::start();
     kprintln!("boot complete in {} ms", time::uptime_ms());

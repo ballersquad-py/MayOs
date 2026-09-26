@@ -17,6 +17,7 @@ pub mod explorer;
 pub mod imageview;
 pub mod keep_resolution;
 pub mod linuxwin;
+pub mod waylandwin;
 pub mod settings_app;
 pub mod shell;
 pub mod terminal;
@@ -178,6 +179,10 @@ pub extern "C" fn desktop_main(_: usize) {
         for screen in crate::proc::screen::take_pending() {
             wm.open(alloc::boxed::Box::new(linuxwin::LinuxWindow::new(screen)), None);
         }
+        for w in crate::proc::wayland::take_pending() {
+            wm.open(alloc::boxed::Box::new(waylandwin::WaylandWindow::new(w)), None);
+        }
+        crate::proc::wayland::tick();
         let start = crate::time::uptime_ms();
         let t0 = crate::time::uptime_us();
         wm.frame();

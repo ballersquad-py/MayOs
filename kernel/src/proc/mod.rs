@@ -5,4 +5,5 @@ pub mod sched;
 pub mod screen;
 pub mod syscall;
 pub mod unix;
+pub mod wayland;
 pub mod usermem;

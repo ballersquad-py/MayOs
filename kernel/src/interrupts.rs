@@ -93,6 +93,14 @@ fn exception(frame: &mut TrapFrame) -> u64 {
             frame.error
         );
         crate::kprint!("{}", msg);
+        // Details for debugging on the serial port.
+        if let Some(p) = sched::current_process() {
+            let code = crate::proc::usermem::read_bytes(p.pml4(), frame.rip, 16).unwrap_or_default();
+            crate::kprintln!(
+                "  code {:02x?}\n  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}\n  rsp={:#x} rbp={:#x} r8={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                code, frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rsp, frame.rbp, frame.r8, frame.r12, frame.r13, frame.r14, frame.r15
+            );
+        }
         crate::proc::process::exit_current_process(-1, Some(&msg));
         return sched::schedule(frame as *mut TrapFrame as u64);
     }
