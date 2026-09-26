@@ -36,6 +36,9 @@ const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const ENODEV: i64 = 19;
 const EISDIR: i64 = 21;
+const ENOEXEC: i64 = 8;
+const ESRCH: i64 = 3;
+const E2BIG: i64 = 7;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
 const ESPIPE: i64 = 29;
@@ -109,7 +112,9 @@ pub struct LinuxState {
     /// (heap start, current break)
     pub brk: Spin<(u64, u64)>,
     pub cwd: Spin<String>,
-    pub exe: String,
+    pub exe: Spin<String>,
+    /// Descriptors closed by execve (O_CLOEXEC / FD_CLOEXEC).
+    pub cloexec: Spin<alloc::collections::BTreeSet<usize>>,
     /// Window for /dev/fb0 and /dev/input, made on first use.
     pub screen: Spin<Option<Arc<Screen>>>,
 }
@@ -138,7 +143,53 @@ impl Drop for Desc {
 
 /// Build the Linux initial stack (argc, argv, envp, auxv) for a program
 /// whose image is loaded; returns (state, initial rsp).
-pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str, cwd: &str) -> Result<(LinuxState, u64), String> {
+/// Where dynamic linkers are loaded.
+const INTERP_BASE: u64 = 0x0000_7f00_0000_0000;
+
+fn default_env(cwd: &str) -> Vec<String> {
+    alloc::vec![
+        String::from("PATH=/bin:/usr/bin:/sbin:/usr/sbin"),
+        String::from("HOME=/home"),
+        String::from("USER=user"),
+        String::from("LANG=C.UTF-8"),
+        String::from("TERM=xterm"),
+        alloc::format!("PWD={}", cwd),
+    ]
+}
+
+/// Load the program's dynamic linker, if it names one: (entry, AT_BASE).
+fn load_interp(pml4: u64, image: &super::elf::LoadedImage) -> Result<(u64, u64), String> {
+    let Some(path) = &image.interp else { return Ok((image.entry, 0)) };
+    let data = fs::read_file(path).map_err(|e| alloc::format!("dynamic linker {}: {} (copy it from the Linux distribution the program comes from)", path, e))?;
+    let li = super::elf::load_at(pml4, &data, INTERP_BASE)?;
+    Ok((li.entry, INTERP_BASE))
+}
+
+pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str, cwd: &str) -> Result<(LinuxState, u64, u64), String> {
+    let mut argv: Vec<String> = alloc::vec![String::from(path)];
+    argv.extend(split_args(args));
+    let (entry, at_base) = load_interp(pml4, image)?;
+    let (rsp, stack) = build_stack(pml4, image, at_base, &argv, &default_env(cwd), path)?;
+    let state = LinuxState {
+        fds: Spin::new(alloc::vec![
+            Some(Arc::new(Mutex::new(Desc::Console))),
+            Some(Arc::new(Mutex::new(Desc::Console))),
+            Some(Arc::new(Mutex::new(Desc::Console))),
+        ]),
+        regions: Spin::new(alloc::vec![stack]),
+        mmap_next: Spin::new(MMAP_BASE),
+        brk: Spin::new((image.brk, image.brk)),
+        cwd: Spin::new(String::from(cwd)),
+        exe: Spin::new(String::from(path)),
+        cloexec: Spin::new(alloc::collections::BTreeSet::new()),
+        screen: Spin::new(None),
+    };
+    Ok((state, rsp, entry))
+}
+
+/// Build the initial stack (argc, argv, envp, auxv) in `pml4`; returns the
+/// stack pointer and the stack's demand-paged region.
+fn build_stack(pml4: u64, image: &super::elf::LoadedImage, at_base: u64, argv: &[String], env: &[String], path: &str) -> Result<(u64, Region), String> {
     let top = super::process::STACK_TOP;
     let bottom = top - STACK_SIZE;
     // The top of the stack is needed right away.
@@ -159,16 +210,6 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
             }
         }
     };
-    let mut argv: Vec<String> = alloc::vec![String::from(path)];
-    argv.extend(split_args(args));
-    let env = [
-        String::from("PATH=/bin"),
-        String::from("HOME=/home"),
-        String::from("USER=user"),
-        String::from("LANG=C.UTF-8"),
-        String::from("TERM=xterm"),
-        alloc::format!("PWD={}", cwd),
-    ];
     // Strings at the very top.
     let mut sp = top - 16;
     let mut put_str = |s: &str| -> u64 {
@@ -193,7 +234,7 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
         (4, image.phent),  // AT_PHENT
         (5, image.phnum),  // AT_PHNUM
         (6, PAGE_SIZE),    // AT_PAGESZ
-        (7, 0),            // AT_BASE (no interpreter)
+        (7, at_base),      // AT_BASE (dynamic linker)
         (8, 0),            // AT_FLAGS
         (9, image.entry),  // AT_ENTRY
         (11, 1000),        // AT_UID
@@ -230,20 +271,7 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
     }
     put(0);
     put(0);
-    let state = LinuxState {
-        fds: Spin::new(alloc::vec![
-            Some(Arc::new(Mutex::new(Desc::Console))),
-            Some(Arc::new(Mutex::new(Desc::Console))),
-            Some(Arc::new(Mutex::new(Desc::Console))),
-        ]),
-        regions: Spin::new(alloc::vec![Region { start: bottom, end: top - eager * PAGE_SIZE, writable: true, exec: false }]),
-        mmap_next: Spin::new(MMAP_BASE),
-        brk: Spin::new((image.brk, image.brk)),
-        cwd: Spin::new(String::from(cwd)),
-        exe: String::from(path),
-        screen: Spin::new(None),
-    };
-    Ok((state, sp))
+    Ok((sp, Region { start: bottom, end: top - eager * PAGE_SIZE, writable: true, exec: false }))
 }
 
 fn split_args(s: &str) -> Vec<String> {
@@ -292,7 +320,7 @@ pub fn fault_in(addr: u64, write: bool) -> bool {
     if write && !r.writable {
         return false;
     }
-    if paging::translate(p.pml4, page).is_some() {
+    if paging::translate(p.pml4(), page).is_some() {
         return true;
     }
     let Some(f) = pmm::alloc_frame_zeroed() else { return false };
@@ -303,7 +331,7 @@ pub fn fault_in(addr: u64, write: bool) -> bool {
     if !r.exec {
         flags |= NO_EXECUTE;
     }
-    if paging::map(p.pml4, page, f, flags).is_err() {
+    if paging::map(p.pml4(), page, f, flags).is_err() {
         pmm::free_frame(f);
         return false;
     }
@@ -319,8 +347,8 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 fn unmap_range(p: &Process, start: u64, end: u64) {
     let mut a = start;
     while a < end {
-        let borrowed = paging::translate(p.pml4, a).is_some_and(|(_, e)| e & paging::BORROWED != 0);
-        if let Some(f) = paging::unmap(p.pml4, a)
+        let borrowed = paging::translate(p.pml4(), a).is_some_and(|(_, e)| e & paging::BORROWED != 0);
+        if let Some(f) = paging::unmap(p.pml4(), a)
             && !borrowed
         {
             pmm::free_frame(f);
@@ -382,7 +410,7 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         }
         for i in 0..n {
             let f = phys + (first + i) * PAGE_SIZE;
-            if paging::map(p.pml4, start + i * PAGE_SIZE, f, USER | WRITABLE | NO_EXECUTE | paging::BORROWED).is_err() {
+            if paging::map(p.pml4(), start + i * PAGE_SIZE, f, USER | WRITABLE | NO_EXECUTE | paging::BORROWED).is_err() {
                 return -ENOMEM;
             }
         }
@@ -401,7 +429,7 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         if n < 0 {
             return n;
         }
-        if !usermem::write_bytes(p.pml4, start, &buf[..n as usize]) {
+        if !usermem::write_bytes(p.pml4(), start, &buf[..n as usize]) {
             return -ENOMEM;
         }
     }
@@ -486,7 +514,7 @@ fn fs_err(e: fs::FsError) -> i64 {
 
 /// Resolve a path argument (relative to `dirfd` or the working directory).
 fn path_at(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
-    let s = usermem::read_cstr(p.pml4, ptr, 4096).ok_or(-EFAULT)?;
+    let s = usermem::read_cstr(p.pml4(), ptr, 4096).ok_or(-EFAULT)?;
     let base = if s.starts_with('/') || dirfd == -100 {
         linux(p).map(|l| l.cwd.lock().clone()).unwrap_or_else(|| String::from("/"))
     } else {
@@ -539,7 +567,8 @@ fn process_screen(p: &Process) -> Option<Arc<Screen>> {
     let l = linux(p)?;
     let mut s = l.screen.lock();
     if s.is_none() {
-        let name = l.exe.rsplit('/').next().unwrap_or("Linux program");
+        let exe = l.exe.lock().clone();
+        let name = exe.rsplit('/').next().unwrap_or("Linux program");
         *s = Screen::new(p.pid, String::from(name));
     }
     s.clone()
@@ -568,12 +597,23 @@ const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
 const O_NONBLOCK: u64 = 0x800;
 const O_DIRECTORY: u64 = 0x10000;
+const O_CLOEXEC: u64 = 0x80000;
 
 fn sys_openat(p: &Process, dirfd: i64, ptr: u64, flags: u64) -> i64 {
     let path = match path_at(p, dirfd, ptr) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    let fd = openat_inner(p, path, flags);
+    if fd >= 0 && flags & O_CLOEXEC != 0
+        && let Some(l) = linux(p)
+    {
+        l.cloexec.lock().insert(fd as usize);
+    }
+    fd
+}
+
+fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
     if let Some(d) = virtual_file(&path) {
         return add_fd(p, d);
     }
@@ -830,7 +870,7 @@ fn sys_read(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     let mut buf = vec![0u8; (len as usize).min(4 * 1024 * 1024)];
     let n = read_desc(p, &d, &mut buf);
-    if n > 0 && !usermem::write_bytes(p.pml4, ptr, &buf[..n as usize]) {
+    if n > 0 && !usermem::write_bytes(p.pml4(), ptr, &buf[..n as usize]) {
         return -EFAULT;
     }
     n
@@ -838,15 +878,15 @@ fn sys_read(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
 
 fn sys_write(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
-    let Some(data) = usermem::read_bytes(p.pml4, ptr, len.min(16 * 1024 * 1024)) else { return -EFAULT };
+    let Some(data) = usermem::read_bytes(p.pml4(), ptr, len.min(16 * 1024 * 1024)) else { return -EFAULT };
     write_desc(p, &d, &data)
 }
 
 fn iovecs(p: &Process, iov: u64, cnt: u64) -> Option<Vec<(u64, u64)>> {
     let mut v = Vec::new();
     for i in 0..cnt.min(1024) {
-        let base = usermem::read_u64(p.pml4, iov + i * 16)?;
-        let len = usermem::read_u64(p.pml4, iov + i * 16 + 8)?;
+        let base = usermem::read_u64(p.pml4(), iov + i * 16)?;
+        let len = usermem::read_u64(p.pml4(), iov + i * 16 + 8)?;
         v.push((base, len));
     }
     Some(v)
@@ -856,7 +896,7 @@ fn sys_writev(p: &Process, fd: i64, iov: u64, cnt: u64) -> i64 {
     let Some(vecs) = iovecs(p, iov, cnt) else { return -EFAULT };
     let mut all = Vec::new();
     for (b, l) in vecs {
-        match usermem::read_bytes(p.pml4, b, l) {
+        match usermem::read_bytes(p.pml4(), b, l) {
             Some(d) => all.extend_from_slice(&d),
             None => return -EFAULT,
         }
@@ -880,7 +920,7 @@ fn sys_readv(p: &Process, fd: i64, iov: u64, cnt: u64) -> i64 {
             break;
         }
         let k = (l as usize).min(n as usize - off);
-        if !usermem::write_bytes(p.pml4, b, &buf[off..off + k]) {
+        if !usermem::write_bytes(p.pml4(), b, &buf[off..off + k]) {
             return -EFAULT;
         }
         off += k;
@@ -892,7 +932,7 @@ fn sys_pread(p: &Process, fd: i64, ptr: u64, len: u64, off: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     let mut buf = vec![0u8; (len as usize).min(4 * 1024 * 1024)];
     let n = read_at(&mut d.lock(), off, &mut buf);
-    if n > 0 && !usermem::write_bytes(p.pml4, ptr, &buf[..n as usize]) {
+    if n > 0 && !usermem::write_bytes(p.pml4(), ptr, &buf[..n as usize]) {
         return -EFAULT;
     }
     n
@@ -941,14 +981,15 @@ fn sys_lseek(p: &Process, fd: i64, off: i64, whence: u64) -> i64 {
 
 fn sys_close(p: &Process, fd: i64) -> i64 {
     let Some(l) = linux(p) else { return -EBADF };
+    l.cloexec.lock().remove(&(fd as usize));
     let mut fds = l.fds.lock();
-    match fds.get_mut(fd as usize) {
-        Some(slot @ Some(_)) => {
-            *slot = None;
-            0
-        }
-        _ => -EBADF,
-    }
+    let old = match fds.get_mut(fd as usize) {
+        Some(slot @ Some(_)) => slot.take(),
+        _ => return -EBADF,
+    };
+    drop(fds);
+    drop(old);
+    0
 }
 
 fn sys_dup(p: &Process, fd: i64, to: Option<i64>, min: usize) -> i64 {
@@ -959,11 +1000,14 @@ fn sys_dup(p: &Process, fd: i64, to: Option<i64>, min: usize) -> i64 {
                 return t;
             }
             let Some(l) = linux(p) else { return -EBADF };
+            l.cloexec.lock().remove(&(t as usize));
             let mut fds = l.fds.lock();
             while fds.len() <= t as usize {
                 fds.push(None);
             }
-            fds[t as usize] = Some(d);
+            let old = fds[t as usize].replace(d);
+            drop(fds);
+            drop(old);
             t
         }
         _ => add_fd_ref(p, d, min),
@@ -974,7 +1018,7 @@ fn sys_pipe(p: &Process, ptr: u64) -> i64 {
     let pipe = Arc::new(Pipe { buf: Spin::new(VecDeque::new()), writers: 1.into(), readers: 1.into() });
     let r = add_fd(p, Desc::PipeRead(pipe.clone()));
     let w = add_fd(p, Desc::PipeWrite(pipe));
-    if !usermem::write_u32(p.pml4, ptr, r as u32) || !usermem::write_u32(p.pml4, ptr + 4, w as u32) {
+    if !usermem::write_u32(p.pml4(), ptr, r as u32) || !usermem::write_u32(p.pml4(), ptr + 4, w as u32) {
         return -EFAULT;
     }
     0
@@ -1080,7 +1124,7 @@ fn sys_getdents64(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     if out.is_empty() && *pos < entries.len() + 2 {
         return -EINVAL;
     }
-    if !usermem::write_bytes(p.pml4, ptr, &out) {
+    if !usermem::write_bytes(p.pml4(), ptr, &out) {
         return -EFAULT;
     }
     out.len() as i64
@@ -1089,7 +1133,7 @@ fn sys_getdents64(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
 // --- sockets ----------------------------------------------------------
 
 fn read_sockaddr(p: &Process, ptr: u64, len: u64) -> Result<(net::Ipv4, u16), i64> {
-    let b = usermem::read_bytes(p.pml4, ptr, len.min(128)).ok_or(-EFAULT)?;
+    let b = usermem::read_bytes(p.pml4(), ptr, len.min(128)).ok_or(-EFAULT)?;
     if b.len() < 8 {
         return Err(-EINVAL);
     }
@@ -1109,7 +1153,7 @@ fn write_sockaddr(p: &Process, ptr: u64, lenptr: u64, addr: (net::Ipv4, u16)) ->
     b[0..2].copy_from_slice(&2u16.to_le_bytes());
     b[2..4].copy_from_slice(&addr.1.to_be_bytes());
     b[4..8].copy_from_slice(&addr.0 .0);
-    usermem::write_bytes(p.pml4, ptr, &b) && (lenptr == 0 || usermem::write_u32(p.pml4, lenptr, 16))
+    usermem::write_bytes(p.pml4(), ptr, &b) && (lenptr == 0 || usermem::write_u32(p.pml4(), lenptr, 16))
 }
 
 fn sys_socket(p: &Process, domain: u64, ty: u64) -> i64 {
@@ -1199,7 +1243,7 @@ fn sys_accept(p: &Process, fd: i64, ptr: u64, lenptr: u64, flags: u64) -> i64 {
 
 fn sys_sendto(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alen: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
-    let Some(data) = usermem::read_bytes(p.pml4, buf, len) else { return -EFAULT };
+    let Some(data) = usermem::read_bytes(p.pml4(), buf, len) else { return -EFAULT };
     if addr != 0 {
         let dest = match read_sockaddr(p, addr, alen) {
             Ok(a) => a,
@@ -1223,7 +1267,7 @@ fn sys_recvfrom(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alenp: u64)
         return match crate::network::udp_recv(port, if nb { 0 } else { 3_600_000 }) {
             Some((ip, sport, data)) => {
                 let n = data.len().min(len as usize);
-                if !usermem::write_bytes(p.pml4, buf, &data[..n]) {
+                if !usermem::write_bytes(p.pml4(), buf, &data[..n]) {
                     return -EFAULT;
                 }
                 write_sockaddr(p, addr, alenp, (ip, sport));
@@ -1237,10 +1281,10 @@ fn sys_recvfrom(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alenp: u64)
 
 /// Read a `struct msghdr`: (name ptr, name len, iovecs, control len ptr offset).
 fn msghdr(p: &Process, ptr: u64) -> Option<(u64, u64, Vec<(u64, u64)>)> {
-    let name = usermem::read_u64(p.pml4, ptr)?;
-    let namelen = usermem::read_u64(p.pml4, ptr + 8)? & 0xffff_ffff;
-    let iov = usermem::read_u64(p.pml4, ptr + 16)?;
-    let iovlen = usermem::read_u64(p.pml4, ptr + 24)?;
+    let name = usermem::read_u64(p.pml4(), ptr)?;
+    let namelen = usermem::read_u64(p.pml4(), ptr + 8)? & 0xffff_ffff;
+    let iov = usermem::read_u64(p.pml4(), ptr + 16)?;
+    let iovlen = usermem::read_u64(p.pml4(), ptr + 24)?;
     Some((name, namelen, iovecs(p, iov, iovlen)?))
 }
 
@@ -1248,7 +1292,7 @@ fn sys_sendmsg(p: &Process, fd: i64, ptr: u64) -> i64 {
     let Some((name, namelen, vecs)) = msghdr(p, ptr) else { return -EFAULT };
     let mut data = Vec::new();
     for (b, l) in vecs {
-        match usermem::read_bytes(p.pml4, b, l) {
+        match usermem::read_bytes(p.pml4(), b, l) {
             Some(d) => data.extend_from_slice(&d),
             None => return -EFAULT,
         }
@@ -1296,7 +1340,7 @@ fn sys_recvmsg(p: &Process, fd: i64, ptr: u64) -> i64 {
             break;
         }
         let k = (l as usize).min(data.len() - off);
-        if !usermem::write_bytes(p.pml4, b, &data[off..off + k]) {
+        if !usermem::write_bytes(p.pml4(), b, &data[off..off + k]) {
             return -EFAULT;
         }
         off += k;
@@ -1307,8 +1351,8 @@ fn sys_recvmsg(p: &Process, fd: i64, ptr: u64) -> i64 {
         write_sockaddr(p, name, ptr + 8, a);
     }
     // No control data, no flags.
-    usermem::write_u64(p.pml4, ptr + 40, 0);
-    usermem::write_u32(p.pml4, ptr + 48, 0);
+    usermem::write_u64(p.pml4(), ptr + 40, 0);
+    usermem::write_u32(p.pml4(), ptr + 48, 0);
     off as i64
 }
 
@@ -1369,7 +1413,7 @@ fn ready(p: &Process, fd: i64, events: u16) -> u16 {
 fn sys_poll(p: &Process, ptr: u64, n: u64, timeout_ms: i64) -> i64 {
     let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
     loop {
-        let Some(raw) = usermem::read_bytes(p.pml4, ptr, n * 8) else { return -EFAULT };
+        let Some(raw) = usermem::read_bytes(p.pml4(), ptr, n * 8) else { return -EFAULT };
         let mut out = raw.clone();
         let mut count = 0;
         for i in 0..n as usize {
@@ -1382,7 +1426,7 @@ fn sys_poll(p: &Process, ptr: u64, n: u64, timeout_ms: i64) -> i64 {
             }
         }
         if count > 0 || crate::time::uptime_ms() >= deadline {
-            if !usermem::write_bytes(p.pml4, ptr, &out) {
+            if !usermem::write_bytes(p.pml4(), ptr, &out) {
                 return -EFAULT;
             }
             return count;
@@ -1420,8 +1464,8 @@ fn timespec_ms(p: &Process, ptr: u64) -> Option<u64> {
     if ptr == 0 {
         return None;
     }
-    let s = usermem::read_u64(p.pml4, ptr)? as i64;
-    let ns = usermem::read_u64(p.pml4, ptr + 8)? as i64;
+    let s = usermem::read_u64(p.pml4(), ptr)? as i64;
+    let ns = usermem::read_u64(p.pml4(), ptr + 8)? as i64;
     Some((s.max(0) as u64) * 1000 + (ns.max(0) as u64) / 1_000_000)
 }
 
@@ -1430,7 +1474,7 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
     match cmd {
         0 | 9 => {
             // FUTEX_WAIT(_BITSET)
-            let Some(b) = usermem::read_bytes(p.pml4, addr, 4) else { return -EFAULT };
+            let Some(b) = usermem::read_bytes(p.pml4(), addr, 4) else { return -EFAULT };
             if u32::from_le_bytes(b.try_into().unwrap()) != val as u32 {
                 return -EAGAIN;
             }
@@ -1444,7 +1488,7 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 None => u64::MAX,
             };
             let woken = Arc::new(AtomicBool::new(false));
-            FUTEX.lock().push(Waiter { pml4: p.pml4, addr, woken: woken.clone() });
+            FUTEX.lock().push(Waiter { pml4: p.pml4(), addr, woken: woken.clone() });
             loop {
                 if woken.load(Ordering::Acquire) {
                     return 0;
@@ -1456,8 +1500,8 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 sched::sleep_ms(1);
             }
         }
-        1 | 10 => futex_wake(p.pml4, addr, val),
-        3 | 4 => futex_wake(p.pml4, addr, u64::MAX),
+        1 | 10 => futex_wake(p.pml4(), addr, val),
+        3 | 4 => futex_wake(p.pml4(), addr, u64::MAX),
         _ => -ENOSYS,
     }
 }
@@ -1469,9 +1513,10 @@ fn sys_clone(p: &Arc<Process>, f: &TrapFrame) -> i64 {
     const CLONE_CHILD_CLEARTID: u64 = 0x200000;
     const CLONE_CHILD_SETTID: u64 = 0x1000000;
     let (flags, newsp, ptid, ctid, tls) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8);
-    if flags & CLONE_VM == 0 {
-        // No fork(): MayOS processes can't be copied (yet).
-        return -ENOSYS;
+    const CLONE_VFORK: u64 = 0x4000;
+    if flags & CLONE_VM == 0 || flags & CLONE_VFORK != 0 {
+        // A new process (fork, vfork, posix_spawn).
+        return sys_fork(p, f, flags, newsp, ptid, ctid, tls);
     }
     let mut frame = f.clone();
     frame.rax = 0;
@@ -1481,10 +1526,10 @@ fn sys_clone(p: &Arc<Process>, f: &TrapFrame) -> i64 {
     let fs = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
     let tid = sched::spawn_user_frame(p.clone(), frame, fs);
     if flags & CLONE_PARENT_SETTID != 0 {
-        usermem::write_u32(p.pml4, ptid, tid as u32);
+        usermem::write_u32(p.pml4(), ptid, tid as u32);
     }
     if flags & CLONE_CHILD_SETTID != 0 {
-        usermem::write_u32(p.pml4, ctid, tid as u32);
+        usermem::write_u32(p.pml4(), ctid, tid as u32);
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         sched::set_clear_child_tid_of(tid, ctid);
@@ -1496,8 +1541,8 @@ fn sys_clone(p: &Arc<Process>, f: &TrapFrame) -> i64 {
 fn thread_exit(p: &Arc<Process>, code: i64) -> ! {
     let ctid = sched::clear_child_tid();
     if ctid != 0 {
-        usermem::write_u32(p.pml4, ctid, 0);
-        futex_wake(p.pml4, ctid, 1);
+        usermem::write_u32(p.pml4(), ctid, 0);
+        futex_wake(p.pml4(), ctid, 1);
     }
     if sched::process_thread_count(p.pid) <= 1 {
         super::process::exit_current_process(code, None);
@@ -1514,7 +1559,7 @@ pub fn unix_ms() -> u64 {
 }
 
 fn write_timespec(p: &Process, ptr: u64, us: u64) -> bool {
-    usermem::write_u64(p.pml4, ptr, us / 1_000_000) && usermem::write_u64(p.pml4, ptr + 8, (us % 1_000_000) * 1000)
+    usermem::write_u64(p.pml4(), ptr, us / 1_000_000) && usermem::write_u64(p.pml4(), ptr + 8, (us % 1_000_000) * 1000)
 }
 
 /// Random bytes (ChaCha20, seeded from RDRAND/TSC at first use).
@@ -1543,7 +1588,7 @@ fn sys_uname(p: &Process, ptr: u64) -> i64 {
     for (i, s) in ["Linux", "mayos", "6.1.0-mayos", "#1 MayOS", "x86_64", "(none)"].iter().enumerate() {
         b[i * 65..i * 65 + s.len()].copy_from_slice(s.as_bytes());
     }
-    if usermem::write_bytes(p.pml4, ptr, &b) { 0 } else { -EFAULT }
+    if usermem::write_bytes(p.pml4(), ptr, &b) { 0 } else { -EFAULT }
 }
 
 // -------------------------------------------------------------------------
@@ -1551,9 +1596,21 @@ fn sys_uname(p: &Process, ptr: u64) -> i64 {
 // -------------------------------------------------------------------------
 
 /// Handle a Linux system call. Returns true if the thread must not resume.
+/// Log every Linux system call to the serial port (`linuxtrace on`).
+pub static TRACE: AtomicBool = AtomicBool::new(false);
+
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
+    let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
+    let exited = syscall_inner(p, f);
+    if TRACE.load(Ordering::Relaxed) {
+        crate::kprintln!("[{}] sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {}", p.pid, nr, args[0], args[1], args[2], args[3], f.rax as i64);
+    }
+    exited
+}
+
+fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (a0, a1, a2, a3, a4, a5) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
-    let pml4 = p.pml4;
+    let pml4 = p.pml4();
     let ret: i64 = match f.rax {
         0 => sys_read(p, a0 as i64, a1, a2),
         1 => sys_write(p, a0 as i64, a1, a2),
@@ -1570,7 +1627,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         7 => sys_poll(p, a0, a1, a2 as i32 as i64),
         8 => sys_lseek(p, a0 as i64, a1 as i64, a2),
         9 => sys_mmap(p, a0, a1, a2, a3, a4 as i64, a5),
-        10 => 0, // mprotect
+        10 => sys_mprotect(p, a0, a1, a2),
         11 => sys_munmap(p, a0, a1),
         12 => sys_brk(p, a0),
         13 | 14 | 131 => {
@@ -1662,12 +1719,22 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             0
         }
         56 => sys_clone(p, f),
-        57 | 58 => -ENOSYS, // fork, vfork
-        59 => -ENOSYS,      // execve
+        57 => sys_fork(p, f, 0, 0, 0, 0, 0),
+        58 => sys_fork(p, f, 0x4000, 0, 0, 0, 0), // vfork
+        59 | 322 => {
+            let (path, argv, envp) = if f.rax == 59 { (a0, a1, a2) } else { (a1, a2, a3) };
+            let dirfd = if f.rax == 59 { -100 } else { a0 as i32 as i64 };
+            match sys_execve(p, f, dirfd, path, argv, envp) {
+                Ok(()) => return false,
+                Err(e) => e,
+            }
+        }
         60 => thread_exit(p, a0 as i64),
-        61 => -ECHILD, // wait4
-        62 | 200 | 234 => {
-            // kill / tkill / tgkill: fatal signals end the process.
+        105 | 106 | 113 | 114 | 117 | 119 => 0, // set*id: one user
+        61 => sys_wait4(p, a0 as i32 as i64, a1, a2),
+        62 => sys_kill(p, a0 as i32 as i64, a1),
+        200 | 234 => {
+            // tkill / tgkill: fatal signals end the process.
             let sig = if f.rax == 234 { a2 } else { a1 };
             if matches!(sig, 6 | 9 | 11 | 15) {
                 let msg = if sig == 6 { "Aborted\n" } else { "Killed\n" };
@@ -1680,8 +1747,23 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         72 => {
             // fcntl
             match a1 {
-                0 | 1030 => sys_dup(p, a0 as i64, None, a2 as usize),
-                1 | 2 => 0,
+                0 | 1030 => {
+                    let r = sys_dup(p, a0 as i64, None, a2 as usize);
+                    if r >= 0 && a1 == 1030
+                        && let Some(l) = linux(p)
+                    {
+                        l.cloexec.lock().insert(r as usize);
+                    }
+                    r
+                }
+                1 => linux(p).map(|l| l.cloexec.lock().contains(&(a0 as usize)) as i64).unwrap_or(0),
+                2 => {
+                    if let Some(l) = linux(p) {
+                        let mut c = l.cloexec.lock();
+                        if a2 & 1 != 0 { c.insert(a0 as usize); } else { c.remove(&(a0 as usize)); }
+                    }
+                    0
+                }
                 3 => match get_fd(p, a0 as i64) {
                     Some(d) => match &*d.lock() {
                         Desc::Tcp { nonblock: true, .. } | Desc::Udp { nonblock: true, .. } | Desc::Input { nonblock: true, .. } => 2 | O_NONBLOCK as i64,
@@ -1775,7 +1857,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let (pp, buf, len) = if f.rax == 89 { (a0, a1, a2) } else { (a1, a2, a3) };
             let path = usermem::read_cstr(pml4, pp, 4096).unwrap_or_default();
             if path == "/proc/self/exe" {
-                let exe = linux(p).map(|l| l.exe.clone()).unwrap_or_default();
+                let exe = linux(p).map(|l| l.exe.lock().clone()).unwrap_or_default();
                 let n = exe.len().min(len as usize);
                 if usermem::write_bytes(pml4, buf, &exe.as_bytes()[..n]) { n as i64 } else { -EFAULT }
             } else {
@@ -1814,7 +1896,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             if usermem::write_bytes(pml4, a0, &b) { 0 } else { -EFAULT }
         }
         102 | 104 | 107 | 108 => 1000,
-        110 => 1,
+        110 => p.parent.max(1) as i64,
         137 | 138 => {
             let mut b = [0u8; 120];
             b[0..8].copy_from_slice(&0x4d44u64.to_le_bytes()); // MSDOS_SUPER_MAGIC
@@ -1916,8 +1998,26 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         273 => 0, // set_robust_list
         288 => sys_accept(p, a0 as i64, a1, a2, a3),
-        292 => sys_dup(p, a0 as i64, Some(a1 as i64), 0),
-        293 => sys_pipe(p, a0),
+        292 => {
+            let r = sys_dup(p, a0 as i64, Some(a1 as i64), 0);
+            if r >= 0 && a2 & O_CLOEXEC != 0
+                && let Some(l) = linux(p)
+            {
+                l.cloexec.lock().insert(r as usize);
+            }
+            r
+        }
+        293 => {
+            let r = sys_pipe(p, a0);
+            if r == 0 && a1 & O_CLOEXEC != 0
+                && let (Some(l), Some(b)) = (linux(p), usermem::read_bytes(pml4, a0, 8))
+            {
+                let mut c = l.cloexec.lock();
+                c.insert(u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize);
+                c.insert(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize);
+            }
+            r
+        }
         318 => {
             // getrandom
             let mut b = vec![0u8; (a1 as usize).min(1 << 20)];
@@ -1948,7 +2048,7 @@ pub fn is_linux(p: &Process) -> bool {
 }
 
 pub fn exe_name(p: &Process) -> String {
-    linux(p).map(|l| l.exe.to_string()).unwrap_or_default()
+    linux(p).map(|l| l.exe.lock().clone()).unwrap_or_default()
 }
 
 /// ioctls of the framebuffer and input devices.
@@ -1959,13 +2059,13 @@ fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
         Desc::Input { screen, kind, .. } => (screen.clone(), Some(*kind)),
         _ => return -ENOTTY,
     };
-    let put = |b: &[u8]| if usermem::write_bytes(p.pml4, arg, b) { 0 } else { -EFAULT };
+    let put = |b: &[u8]| if usermem::write_bytes(p.pml4(), arg, b) { 0 } else { -EFAULT };
     let Some(kind) = kind else {
         return match cmd {
             0x4600 => put(&screen::var_info(&screen)), // FBIOGET_VSCREENINFO
             0x4601 => {
                 // FBIOPUT_VSCREENINFO: only the resolution can change.
-                let Some(v) = usermem::read_bytes(p.pml4, arg, 160) else { return -EFAULT };
+                let Some(v) = usermem::read_bytes(p.pml4(), arg, 160) else { return -EFAULT };
                 let w = u32::from_le_bytes(v[0..4].try_into().unwrap());
                 let h = u32::from_le_bytes(v[4..8].try_into().unwrap());
                 let bpp = u32::from_le_bytes(v[24..28].try_into().unwrap());
@@ -2044,4 +2144,236 @@ fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
         0x03 | 0xa0 => 0, // EVIOCSREP / EVIOCSCLOCKID
         _ => -EINVAL,
     }
+}
+
+// --- processes ----------------------------------------------------------
+
+/// Drop every descriptor (process exit).
+pub fn close_all(l: &LinuxState) {
+    let old = core::mem::take(&mut *l.fds.lock());
+    drop(old);
+}
+
+/// fork / vfork / clone without CLONE_VM: a copy of the process whose
+/// only thread continues from the same place with rax = 0.
+fn sys_fork(p: &Arc<Process>, f: &TrapFrame, flags: u64, newsp: u64, ptid: u64, ctid: u64, tls: u64) -> i64 {
+    const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_SETTLS: u64 = 0x80000;
+    const CLONE_PARENT_SETTID: u64 = 0x100000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+    const CLONE_CHILD_SETTID: u64 = 0x1000000;
+    let Some(l) = linux(p) else { return -ENOSYS };
+    let Some(pml4) = paging::clone_address_space(p.pml4()) else { return -ENOMEM };
+    let state = LinuxState {
+        fds: Spin::new(l.fds.lock().clone()),
+        regions: Spin::new(l.regions.lock().clone()),
+        mmap_next: Spin::new(*l.mmap_next.lock()),
+        brk: Spin::new(*l.brk.lock()),
+        cwd: Spin::new(l.cwd.lock().clone()),
+        exe: Spin::new(l.exe.lock().clone()),
+        cloexec: Spin::new(l.cloexec.lock().clone()),
+        screen: Spin::new(None),
+    };
+    let child = super::process::fork_process(p, pml4, state);
+    let mut frame = f.clone();
+    frame.rax = 0;
+    if newsp != 0 {
+        frame.rsp = newsp;
+    }
+    let fs = if flags & CLONE_SETTLS != 0 { tls } else { sched::fs_base() };
+    if flags & CLONE_CHILD_SETTID != 0 {
+        usermem::write_u32(pml4, ctid, child.pid as u32);
+    }
+    if flags & CLONE_PARENT_SETTID != 0 {
+        usermem::write_u32(p.pml4(), ptid, child.pid as u32);
+    }
+    let tid = sched::spawn_user_frame(child.clone(), frame, fs);
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        sched::set_clear_child_tid_of(tid, ctid);
+    }
+    if flags & CLONE_VFORK != 0 {
+        // The parent sleeps until the child has run execve or exited.
+        while child.has_exited().is_none() && child.pml4() == pml4 {
+            sched::sleep_ms(1);
+        }
+    }
+    child.pid as i64
+}
+
+fn read_strv(pml4: u64, mut ptr: u64) -> Result<Vec<String>, i64> {
+    let mut v = Vec::new();
+    if ptr == 0 {
+        return Ok(v);
+    }
+    let mut total = 0;
+    loop {
+        let a = usermem::read_u64(pml4, ptr).ok_or(-EFAULT)?;
+        if a == 0 {
+            return Ok(v);
+        }
+        let s = usermem::read_cstr(pml4, a, 128 * 1024).ok_or(-EFAULT)?;
+        total += s.len() + 1 + 8;
+        if total > 48 * 1024 || v.len() > 4096 {
+            return Err(-E2BIG);
+        }
+        v.push(s);
+        ptr += 8;
+    }
+}
+
+/// Replace the program. On success the trap frame starts the new one.
+fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp: u64, envp: u64) -> Result<(), i64> {
+    let l = linux(p).ok_or(-ENOSYS)?;
+    let mut path = path_at(p, dirfd, pathp)?;
+    let mut argv = read_strv(p.pml4(), argvp)?;
+    let env = read_strv(p.pml4(), envp)?;
+    let mut data = fs::read_file(&path).map_err(fs_err)?;
+    // Scripts: "#!interpreter [one argument]".
+    for _ in 0..4 {
+        if !data.starts_with(b"#!") {
+            break;
+        }
+        let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len()).min(256);
+        let line = String::from_utf8_lossy(&data[2..line_end]).trim().to_string();
+        let mut parts = line.splitn(2, [' ', '\t']);
+        let interp = parts.next().unwrap_or("").to_string();
+        if interp.is_empty() {
+            return Err(-ENOEXEC);
+        }
+        let mut new_argv = alloc::vec![interp.clone()];
+        if let Some(arg) = parts.next().map(str::trim).filter(|a| !a.is_empty()) {
+            new_argv.push(arg.to_string());
+        }
+        new_argv.push(path.clone());
+        new_argv.extend(argv.into_iter().skip(1));
+        argv = new_argv;
+        path = interp;
+        data = fs::read_file(&path).map_err(fs_err)?;
+    }
+    if !super::elf::is_elf(&data) {
+        return Err(-ENOEXEC);
+    }
+    if argv.is_empty() {
+        argv.push(path.clone());
+    }
+    let pml4 = paging::new_address_space().ok_or(-ENOMEM)?;
+    let prepared = (|| -> Result<(u64, u64, u64, Region), String> {
+        let image = super::elf::load(pml4, &data)?;
+        let (entry, at_base) = load_interp(pml4, &image)?;
+        let (rsp, stack) = build_stack(pml4, &image, at_base, &argv, &env, &path)?;
+        Ok((entry, rsp, image.brk, stack))
+    })();
+    let (entry, rsp, brk, stack) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            paging::destroy_address_space(pml4);
+            p.console.write(alloc::format!("{}: {}\n", path, e).as_bytes());
+            return Err(-ENOEXEC);
+        }
+    };
+    // Point of no return: the old program goes away.
+    sched::kill_other_threads(p.pid);
+    let old = p.replace_pml4(pml4);
+    sched::switch_address_space(pml4);
+    paging::destroy_address_space(old);
+    *l.regions.lock() = alloc::vec![stack];
+    *l.mmap_next.lock() = MMAP_BASE;
+    *l.brk.lock() = (brk, brk);
+    *l.exe.lock() = path;
+    let closing: Vec<usize> = core::mem::take(&mut *l.cloexec.lock()).into_iter().collect();
+    let dropped: Vec<Option<DescRef>> = {
+        let mut fds = l.fds.lock();
+        closing.iter().filter_map(|&fd| fds.get_mut(fd).map(|s| s.take())).collect()
+    };
+    drop(dropped);
+    sched::set_clear_child_tid(0);
+    let (cs, ss) = (f.cs, f.ss);
+    *f = TrapFrame { rip: entry, rsp, cs, ss, rflags: 0x202, ..Default::default() };
+    // Fresh floating-point state.
+    crate::arch::cpu::fxrstor(&crate::arch::cpu::fpu_initial());
+    Ok(())
+}
+
+/// wait4: collect an exited child. Status: exit code << 8, or the signal.
+fn sys_wait4(p: &Arc<Process>, pid: i64, status: u64, options: u64) -> i64 {
+    const WNOHANG: u64 = 1;
+    loop {
+        let kids: Vec<Arc<Process>> = super::process::children(p.pid)
+            .into_iter()
+            .filter(|c| pid == -1 || pid == 0 || pid < -1 || c.pid as i64 == pid)
+            .collect();
+        if kids.is_empty() {
+            return -ECHILD;
+        }
+        if let Some((c, code)) = kids.iter().find_map(|c| c.has_exited().map(|code| (c, code))) {
+            let st: u32 = if code == -130 { 2 } else if code < 0 && code >= -64 { (-code) as u32 } else { ((code as u32) & 0xff) << 8 };
+            if status != 0 && !usermem::write_u32(p.pml4(), status, st) {
+                return -EFAULT;
+            }
+            let id = c.pid;
+            super::process::reap(id);
+            return id as i64;
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        sched::sleep_ms(2);
+    }
+}
+
+/// kill: signals are not delivered, so any fatal signal ends the target.
+fn sys_kill(p: &Arc<Process>, pid: i64, sig: u64) -> i64 {
+    let target = if pid == 0 || pid == -1 { p.pid } else { pid.unsigned_abs() };
+    let Some(t) = super::process::find(target) else { return -ESRCH };
+    if sig == 0 || sig == 17 || sig == 18 || sig == 28 || sig == 23 {
+        return 0; // probe, SIGCHLD, SIGCONT, SIGWINCH, SIGURG
+    }
+    if t.pid == p.pid {
+        super::process::exit_current_process(-(sig as i64), None);
+        sched::exit_current();
+    }
+    super::process::kill_signal(&t, sig as i64);
+    0
+}
+
+fn sys_mprotect(p: &Process, addr: u64, len: u64, prot: u64) -> i64 {
+    let Some(l) = linux(p) else { return -ENOSYS };
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return -EINVAL;
+    }
+    let end = addr + len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let mut flags = USER;
+    if prot & 2 != 0 {
+        flags |= WRITABLE;
+    }
+    if prot & 4 == 0 {
+        flags |= NO_EXECUTE;
+    }
+    // Pages still to be faulted in get the new rights from their region.
+    {
+        let mut regs = l.regions.lock();
+        let mut out = Vec::new();
+        for r in regs.iter() {
+            if r.end <= addr || r.start >= end {
+                out.push(*r);
+                continue;
+            }
+            if r.start < addr {
+                out.push(Region { end: addr, ..*r });
+            }
+            out.push(Region { start: r.start.max(addr), end: r.end.min(end), writable: prot & 2 != 0 || prot == 0, exec: prot & 4 != 0 });
+            if r.end > end {
+                out.push(Region { start: end, ..*r });
+            }
+        }
+        *regs = out;
+    }
+    let mut a = addr;
+    while a < end {
+        if prot != 0 {
+            paging::set_flags(p.pml4(), a, flags);
+        }
+        a += PAGE_SIZE;
+    }
+    0
 }

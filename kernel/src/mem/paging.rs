@@ -236,3 +236,60 @@ pub fn destroy_address_space(pml4: u64) {
     }
     pmm::free_frame(pml4);
 }
+
+/// Copy the user half of an address space (fork): every present 4 KiB
+/// page gets a private copy, except borrowed pages (shared buffers),
+/// which are mapped again.
+pub fn clone_address_space(src: u64) -> Option<u64> {
+    let dst = new_address_space()?;
+    let mut pages: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    {
+        let _g = LOCK.lock();
+        fn walk(t: u64, level: u32, base: u64, out: &mut alloc::vec::Vec<(u64, u64)>) {
+            for (i, &e) in table(t).iter().enumerate() {
+                if e & PRESENT == 0 || (level == 4 && i >= 256) {
+                    continue;
+                }
+                let va = base | ((i as u64) << (12 + 9 * (level - 1)));
+                if level == 1 {
+                    out.push((va, e));
+                } else if e & HUGE == 0 {
+                    walk(e & ADDR_MASK, level - 1, va, out);
+                }
+            }
+        }
+        walk(src, 4, 0, &mut pages);
+    }
+    for (va, e) in pages {
+        let flags = e & !ADDR_MASK;
+        let phys = if e & BORROWED != 0 {
+            e & ADDR_MASK
+        } else {
+            let Some(f) = pmm::alloc_frame() else {
+                destroy_address_space(dst);
+                return None;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(phys_to_virt(e & ADDR_MASK) as *const u8, phys_to_virt(f) as *mut u8, PAGE_SIZE as usize);
+            }
+            f
+        };
+        if map(dst, va, phys, flags & !(PRESENT | 1 << 5 | 1 << 6)).is_err() {
+            destroy_address_space(dst);
+            return None;
+        }
+    }
+    Some(dst)
+}
+
+/// Change the flags of a present page (mprotect). Returns false if the
+/// page is not mapped.
+pub fn set_flags(pml4: u64, virt: u64, flags: u64) -> bool {
+    match translate(pml4, virt) {
+        Some((phys, e)) => {
+            let keep = e & BORROWED;
+            map(pml4, virt & !(PAGE_SIZE - 1), phys & !(PAGE_SIZE - 1), flags | keep).is_ok()
+        }
+        None => false,
+    }
+}

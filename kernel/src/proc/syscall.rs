@@ -119,7 +119,7 @@ pub fn handle(f: &mut TrapFrame) -> bool {
 }
 
 fn path_arg(p: &Process, ptr: u64, len: u64) -> Result<String, i64> {
-    let s = usermem::read_str(p.pml4, ptr, len).ok_or(EFAULT)?;
+    let s = usermem::read_str(p.pml4(), ptr, len).ok_or(EFAULT)?;
     Ok(fs::normalize(&p.cwd, &s))
 }
 
@@ -131,7 +131,7 @@ fn with_path(p: &Process, ptr: u64, len: u64, f: impl FnOnce(&str) -> i64) -> i6
 }
 
 fn sys_write(p: &Process, fd: u64, ptr: u64, len: u64) -> i64 {
-    let Some(data) = usermem::read_bytes(p.pml4, ptr, len) else { return EFAULT };
+    let Some(data) = usermem::read_bytes(p.pml4(), ptr, len) else { return EFAULT };
     if fd == 1 || fd == 2 {
         p.console.write(&data);
         return len as i64;
@@ -158,7 +158,7 @@ fn sys_read(p: &Process, fd: u64, ptr: u64, len: u64) -> i64 {
             match p.console.try_read(len as usize) {
                 None => return 0,
                 Some(v) if !v.is_empty() => {
-                    return if usermem::write_bytes(p.pml4, ptr, &v) { v.len() as i64 } else { EFAULT };
+                    return if usermem::write_bytes(p.pml4(), ptr, &v) { v.len() as i64 } else { EFAULT };
                 }
                 Some(_) => sched::sleep_ms(10),
             }
@@ -168,7 +168,7 @@ fn sys_read(p: &Process, fd: u64, ptr: u64, len: u64) -> i64 {
     let Some(Some(file)) = files.get_mut(fd.wrapping_sub(3) as usize) else { return EBADF };
     let n = (len as usize).min(file.data.len().saturating_sub(file.pos));
     let chunk = &file.data[file.pos..file.pos + n];
-    if !usermem::write_bytes(p.pml4, ptr, chunk) {
+    if !usermem::write_bytes(p.pml4(), ptr, chunk) {
         return EFAULT;
     }
     file.pos += n;
@@ -279,7 +279,7 @@ fn sys_readdir(p: &Process, pptr: u64, plen: u64, buf: u64, buflen: u64) -> i64 
         }
         out.push_str(&line);
     }
-    if usermem::write_bytes(p.pml4, buf, out.as_bytes()) { out.len() as i64 } else { EFAULT }
+    if usermem::write_bytes(p.pml4(), buf, out.as_bytes()) { out.len() as i64 } else { EFAULT }
 }
 
 fn sys_spawn(p: &Arc<Process>, pptr: u64, plen: u64, aptr: u64, alen: u64) -> i64 {
@@ -287,7 +287,7 @@ fn sys_spawn(p: &Arc<Process>, pptr: u64, plen: u64, aptr: u64, alen: u64) -> i6
         Ok(p) => p,
         Err(e) => return e,
     };
-    let Some(args) = usermem::read_str(p.pml4, aptr, alen) else { return EFAULT };
+    let Some(args) = usermem::read_str(p.pml4(), aptr, alen) else { return EFAULT };
     match process::spawn(&path, &args, &p.cwd, p.console.clone()) {
         Ok(child) => child.pid as i64,
         Err(msg) => {

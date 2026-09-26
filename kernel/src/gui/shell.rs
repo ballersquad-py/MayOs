@@ -524,6 +524,11 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             },
             None => err(out, "usage: kill <pid>"),
         },
+        "linuxtrace" => {
+            let on = args.first() == Some(&"on");
+            crate::proc::linux::TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
+            let _ = writeln!(out, "Linux system call log on the serial port: {}", if on { "on" } else { "off" });
+        }
         "vbench" => match args.first() {
             Some(f) => match vbench(&abs(f)) {
                 Ok(msg) => {
@@ -868,7 +873,18 @@ fn run_program(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String) 
         err(out, format!("{}: command not found (try 'help')", cmd));
         return;
     };
-    let joined: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    // Keep arguments with spaces together (the program splits the line
+    // again, honouring quotes).
+    let joined: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(char::is_whitespace) || a.contains('\'') || a.contains('"') {
+                if a.contains('\'') { format!("\"{}\"", a) } else { format!("'{}'", a) }
+            } else {
+                a.to_string()
+            }
+        })
+        .collect();
     if let Err(e) = term.start_program(&path, &joined.join(" ")) {
         err(out, e);
     }

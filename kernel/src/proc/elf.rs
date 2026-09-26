@@ -16,8 +16,10 @@ pub struct LoadedImage {
     pub phent: u64,
     /// Load bias (non-zero for position-independent executables).
     pub base: u64,
-    /// Built for Linux (has thread-local storage, or is a static PIE).
+    /// Built for Linux (thread-local storage, a PIE or dynamically linked).
     pub linux: bool,
+    /// Program interpreter (dynamic linker) the program asks for.
+    pub interp: Option<String>,
 }
 
 /// Where static position-independent Linux executables are placed.
@@ -33,12 +35,26 @@ fn u64at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
+/// Native MayOS programs carry this marker (userspace/src/lib.rs).
+pub fn is_native(data: &[u8]) -> bool {
+    data.windows(16).any(|w| w == b"MayOS-native-v1\0")
+}
+
 pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 64 && &data[..4] == b"\x7fELF"
 }
 
 /// Map every PT_LOAD segment of `data` into the address space `pml4`.
 pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
+    load_with(pml4, data, None)
+}
+
+/// Load a position-independent image (a dynamic linker) at `base`.
+pub fn load_at(pml4: u64, data: &[u8], base: u64) -> Result<LoadedImage, String> {
+    load_with(pml4, data, Some(base))
+}
+
+fn load_with(pml4: u64, data: &[u8], forced_base: Option<u64>) -> Result<LoadedImage, String> {
     if !is_elf(data) {
         return Err("not an ELF file".into());
     }
@@ -52,7 +68,7 @@ pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
     let phoff = u64at(data, 32) as usize;
     let phentsize = u16at(data, 54) as usize;
     let phnum = u16at(data, 56) as usize;
-    let mut has_tls = false;
+    let mut interp = None;
     let mut first_load = None;
     for i in 0..phnum {
         let ph = phoff + i * phentsize;
@@ -60,13 +76,21 @@ pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
             return Err("truncated program header".into());
         }
         match u32at(data, ph) {
-            3 => return Err("dynamically linked programs are not supported (build it static, e.g. with musl)".into()),
-            7 => has_tls = true,
+            3 => {
+                let (off, len) = (u64at(data, ph + 8) as usize, u64at(data, ph + 32) as usize);
+                let raw = data.get(off..off + len).ok_or("bad interpreter path")?;
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                interp = Some(String::from(core::str::from_utf8(&raw[..end]).map_err(|_| "bad interpreter path")?));
+            }
             1 if first_load.is_none() => first_load = Some((u64at(data, ph + 16), u64at(data, ph + 8))),
             _ => {}
         }
     }
-    let base = if etype == 3 { PIE_BASE } else { 0 };
+    let base = match forced_base {
+        Some(b) if etype == 3 => b,
+        _ if etype == 3 => PIE_BASE,
+        _ => 0,
+    };
     let entry = u64at(data, 24) + base;
     let mut brk = 0u64;
     for i in 0..phnum {
@@ -132,6 +156,7 @@ pub fn load(pml4: u64, data: &[u8]) -> Result<LoadedImage, String> {
         phnum: phnum as u64,
         phent: phentsize as u64,
         base,
-        linux: has_tls || etype == 3,
+        linux: !is_native(data),
+        interp,
     })
 }

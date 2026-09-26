@@ -51,3 +51,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     io::eprint_fmt(format_args!("\npanic: {}\n", info));
     process::exit(101)
 }
+
+/// Marks the executable as a native MayOS program (anything else that is
+/// an ELF file is run as a Linux program).
+#[used]
+#[unsafe(link_section = ".rodata.mayos_native")]
+static MAYOS_NATIVE: [u8; 16] = *b"MayOS-native-v1\0";

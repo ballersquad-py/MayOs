@@ -83,7 +83,10 @@ pub struct OpenFile {
 pub struct Process {
     pub pid: u64,
     pub name: String,
-    pub pml4: u64,
+    /// Address space. Changes only when a Linux program calls `execve`.
+    pml4: AtomicU64,
+    /// Process that started this one with `fork` (0 for none).
+    pub parent: u64,
     pub cwd: String,
     #[allow(dead_code)]
     pub args: String,
@@ -97,8 +100,45 @@ pub struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        paging::destroy_address_space(self.pml4);
+        paging::destroy_address_space(self.pml4());
     }
+}
+
+impl Process {
+    pub fn pml4(&self) -> u64 {
+        self.pml4.load(Ordering::Relaxed)
+    }
+
+    /// Switch to a new address space (execve) and return the old one.
+    pub fn replace_pml4(&self, new: u64) -> u64 {
+        self.pml4.swap(new, Ordering::Relaxed)
+    }
+}
+
+/// A copy of a Linux process (fork): same memory contents, descriptors
+/// shared, parent `parent`.
+pub fn fork_process(parent: &Arc<Process>, pml4: u64, linux: super::linux::LinuxState) -> Arc<Process> {
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let proc = Arc::new(Process {
+        pid,
+        name: parent.name.clone(),
+        pml4: AtomicU64::new(pml4),
+        parent: parent.pid,
+        cwd: parent.cwd.clone(),
+        args: parent.args.clone(),
+        console: parent.console.clone(),
+        brk: Spin::new(*parent.brk.lock()),
+        files: Mutex::new(Vec::new()),
+        exit_code: Spin::new(None),
+        linux: Some(alloc::boxed::Box::new(linux)),
+    });
+    TABLE.lock().push(proc.clone());
+    proc
+}
+
+/// Exited children of `pid` (for wait4); `which` is a pid or -1 for any.
+pub fn children(pid: u64) -> Vec<Arc<Process>> {
+    TABLE.lock().iter().filter(|p| p.parent == pid && pid != 0).cloned().collect()
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -116,7 +156,7 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
         }
     };
     if image.linux {
-        let (state, rsp) = match super::linux::setup(pml4, &image, path, args, cwd) {
+        let (state, rsp, entry) = match super::linux::setup(pml4, &image, path, args, cwd) {
             Ok(v) => v,
             Err(e) => {
                 paging::destroy_address_space(pml4);
@@ -127,7 +167,8 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
         let proc = Arc::new(Process {
             pid,
             name: String::from(crate::fs::file_name(path)),
-            pml4,
+            pml4: AtomicU64::new(pml4),
+            parent: 0,
             cwd: String::from(cwd),
             args: String::from(args),
             console,
@@ -138,7 +179,7 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
         });
         TABLE.lock().push(proc.clone());
         // Linux entry: registers zero, rsp at argc.
-        sched::spawn_user(proc.clone(), image.entry, rsp, 0, 0);
+        sched::spawn_user(proc.clone(), entry, rsp, 0, 0);
         return Ok(proc);
     }
     // Stack, with the argument string copied to its top.
@@ -167,7 +208,8 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
     let proc = Arc::new(Process {
         pid,
         name,
-        pml4,
+        pml4: AtomicU64::new(pml4),
+        parent: 0,
         cwd: String::from(cwd),
         args: String::from(args),
         console,
@@ -199,7 +241,20 @@ fn finish(p: &Arc<Process>, code: i64) {
             *e = Some(code);
         }
     }
+    // Descriptors go now (so pipe readers see the end), not when the
+    // parent collects the exit code. Before the threads stop: closing a
+    // file writes it to disk, which may sleep.
+    if let Some(l) = p.linux.as_deref() {
+        super::linux::close_all(l);
+    }
     sched::kill_process_threads(p.pid);
+    // Nobody will wait for children of a finished process, nor for a
+    // forked process whose parent is gone.
+    let mut t = TABLE.lock();
+    t.retain(|x| !(x.parent == p.pid && x.has_exited().is_some()));
+    if p.parent != 0 && !t.iter().any(|x| x.pid == p.parent && x.has_exited().is_none()) {
+        t.retain(|x| x.pid != p.pid);
+    }
 }
 
 /// Forget an exited process once its parent has collected the exit code.
@@ -211,6 +266,11 @@ pub fn reap(pid: u64) {
 pub fn kill(p: &Arc<Process>) {
     p.console.write(b"^C\n");
     finish(p, -130);
+}
+
+/// End a process for a signal (exit status reports the signal).
+pub fn kill_signal(p: &Arc<Process>, sig: i64) {
+    finish(p, -sig);
 }
 
 pub fn find(pid: u64) -> Option<Arc<Process>> {
@@ -239,7 +299,7 @@ impl Process {
         let mut page = old_top;
         while page < new_top {
             let f = pmm::alloc_frame_zeroed()?;
-            if paging::map(self.pml4, page, f, USER | WRITABLE | NO_EXECUTE).is_err() {
+            if paging::map(self.pml4(), page, f, USER | WRITABLE | NO_EXECUTE).is_err() {
                 pmm::free_frame(f);
                 return None;
             }
@@ -247,7 +307,7 @@ impl Process {
         }
         let mut page = new_top;
         while page < old_top {
-            if let Some(f) = paging::unmap(self.pml4, page) {
+            if let Some(f) = paging::unmap(self.pml4(), page) {
                 pmm::free_frame(f);
             }
             page += PAGE_SIZE;

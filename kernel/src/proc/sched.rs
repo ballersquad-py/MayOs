@@ -113,7 +113,7 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
     let (kstack, top) = new_stack();
     let frame = frame_for(top);
     let rsp = push_frame(top, frame);
-    let pml4 = process.as_ref().map(|p| p.pml4).unwrap_or_else(crate::mem::paging::kernel_pml4);
+    let pml4 = process.as_ref().map(|p| p.pml4()).unwrap_or_else(crate::mem::paging::kernel_pml4);
     let mut s = SCHED.lock();
     let id = s.next_id;
     s.next_id += 1;
@@ -150,6 +150,11 @@ pub fn set_fs_base(v: u64) {
     let c = s.current;
     s.threads[c].fs_base = v;
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, v) };
+}
+
+pub fn fs_base() -> u64 {
+    let s = SCHED.lock();
+    s.threads[s.current].fs_base
 }
 
 pub fn current_id() -> u64 {
@@ -332,6 +337,29 @@ pub fn kill_process_threads(pid: u64) {
         if t.process.as_ref().map(|p| p.pid) == Some(pid) {
             t.state = State::Dead;
         }
+    }
+}
+
+/// End every thread of `pid` except the calling one (execve).
+pub fn kill_other_threads(pid: u64) {
+    let mut s = SCHED.lock();
+    let cur = s.current;
+    for (i, t) in s.threads.iter_mut().enumerate() {
+        if i != cur && t.process.as_ref().map(|p| p.pid) == Some(pid) {
+            t.state = State::Dead;
+        }
+    }
+}
+
+/// Run the calling thread in another address space from now on.
+pub fn switch_address_space(pml4: u64) {
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].pml4 = pml4;
+    s.threads[c].fs_base = 0;
+    unsafe {
+        cpu::write_cr3(pml4);
+        cpu::wrmsr(cpu::MSR_FS_BASE, 0);
     }
 }
 

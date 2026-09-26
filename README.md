@@ -40,8 +40,15 @@ Settings app are done.
   Graphics use the Linux framebuffer: a program that opens `/dev/fb0`
   gets a window, maps its pixels with `mmap` and reads the keyboard and
   mouse from `/dev/input/event0`, `event1` (evdev) or `/dev/input/mice`.
-  Try `linux-paint` in the Terminal. Not yet: `fork`/`exec`, signals.
-  See `examples/linux-hello` and `examples/linux-paint`.
+  Try `linux-paint` in the Terminal. Processes work too: `fork`,
+  `vfork`/`posix_spawn`, `execve` (including `#!` scripts), `wait4` and
+  pipes, so shells run pipelines. Dynamically linked programs load their
+  dynamic linker: copy e.g. Alpine Linux's `/lib/ld-musl-x86_64.so.1`
+  (also as `/lib/libc.musl-x86_64.so.1`) and the libraries a program
+  needs into `/lib`. Alpine's BusyBox runs as is. Signals are not
+  delivered yet (fatal ones end the process). `linuxtrace on` logs every
+  Linux system call to the serial port. See `examples/linux-hello` and
+  `examples/linux-paint`.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
