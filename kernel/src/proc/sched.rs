@@ -39,6 +39,8 @@ pub struct Thread {
     fs_base: u64,
     /// GS base of Linux threads (arch_prctl ARCH_SET_GS).
     gs_base: u64,
+    /// Sleeping in `wait_event`: `notify` wakes it early.
+    waiting: bool,
     fpu: Box<cpu::FpuState>,
     /// Linux `set_tid_address`/CLONE_CHILD_CLEARTID: zeroed and woken at exit.
     pub clear_child_tid: u64,
@@ -80,6 +82,7 @@ pub fn init() {
         cpu_ms: 0,
         fs_base: 0,
         gs_base: 0,
+        waiting: false,
         fpu: Box::new(cpu::fpu_initial()),
         clear_child_tid: 0,
     }));
@@ -132,6 +135,7 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         cpu_ms: 0,
         fs_base,
         gs_base: 0,
+        waiting: false,
         fpu: Box::new(fpu),
         clear_child_tid: 0,
     }));
@@ -344,6 +348,78 @@ fn set_current_state(state: State) {
     let mut s = SCHED.lock();
     let c = s.current;
     s.threads[c].state = state;
+}
+
+/// Bumped by `notify` whenever something waiting threads may care about
+/// happens (data queued, a descriptor ready, a process ended, a signal).
+static EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The current event count: read it before checking for readiness, then
+/// pass it to `wait_event`.
+pub fn events() -> u64 {
+    EVENTS.load(Ordering::Acquire)
+}
+
+/// Sleep up to `ms`, or until `notify` is called, unless events happened
+/// since `seen` (then return at once: nothing is missed).
+pub fn wait_event(seen: u64, ms: u64) {
+    if !STARTED.load(Ordering::Acquire) {
+        return sleep_ms(ms);
+    }
+    {
+        let mut s = SCHED.lock();
+        if EVENTS.load(Ordering::Acquire) != seen {
+            return;
+        }
+        let c = s.current;
+        s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
+        s.threads[c].waiting = true;
+    }
+    yield_now();
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].waiting = false;
+}
+
+/// Something happened: wake every thread in `wait_event`.
+pub fn notify() {
+    EVENTS.fetch_add(1, Ordering::AcqRel);
+    let mut s = SCHED.lock();
+    for t in s.threads.iter_mut() {
+        if t.waiting && matches!(t.state, State::Sleeping(_)) {
+            t.state = State::Ready;
+            t.waiting = false;
+        }
+    }
+}
+
+/// Sleep up to `ms` unless `flag` is set; `wake` ends the sleep early.
+pub fn wait_flag(flag: &core::sync::atomic::AtomicBool, ms: u64) {
+    {
+        let mut s = SCHED.lock();
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        let c = s.current;
+        s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
+        s.threads[c].waiting = true;
+    }
+    yield_now();
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].waiting = false;
+}
+
+/// End the `wait_flag`/`wait_event` sleep of thread `id`.
+pub fn wake(id: u64) {
+    let mut s = SCHED.lock();
+    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id)
+        && t.waiting
+        && matches!(t.state, State::Sleeping(_))
+    {
+        t.state = State::Ready;
+        t.waiting = false;
+    }
 }
 
 pub fn sleep_ms(ms: u64) {

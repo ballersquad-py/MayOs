@@ -195,9 +195,11 @@ impl Drop for Desc {
             Desc::Udp { port, .. } => crate::network::udp_unbind(*port),
             Desc::PipeRead(p) => {
                 p.readers.fetch_sub(1, Ordering::Relaxed);
+                sched::notify();
             }
             Desc::PipeWrite(p) => {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
+                sched::notify();
             }
             _ => {}
         }
@@ -908,13 +910,14 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
         Desc::Console => {
             drop(g);
             loop {
+                let ev_seen = sched::events();
                 match p.console.try_read(buf.len()) {
                     None => return 0,
                     Some(v) if !v.is_empty() => {
                         buf[..v.len()].copy_from_slice(&v);
                         return v.len() as i64;
                     }
-                    Some(_) => sched::sleep_ms(10),
+                    Some(_) => sched::wait_event(ev_seen, 20),
                 }
             }
         }
@@ -971,6 +974,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
             let nb = is_nonblock(&g);
             drop(g);
             loop {
+                let ev_seen = sched::events();
                 {
                     let mut q = pipe.buf.lock();
                     if !q.is_empty() {
@@ -990,7 +994,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 if signal::interrupted(p) {
                     return -EINTR;
                 }
-                sched::sleep_ms(2);
+                sched::wait_event(ev_seen, 20);
             }
         }
         Desc::PipeWrite(_) => -EBADF,
@@ -1028,6 +1032,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 return -EINVAL;
             }
             loop {
+                let ev_seen = sched::events();
                 if let Some(v) = ev.take() {
                     buf[..8].copy_from_slice(&v.to_le_bytes());
                     return 8;
@@ -1035,7 +1040,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 if nb {
                     return -EAGAIN;
                 }
-                sched::sleep_ms(1);
+                sched::wait_event(ev_seen, 20);
             }
         }
         Desc::Epoll(_) => -EINVAL,
@@ -1067,6 +1072,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 return -EINVAL;
             }
             loop {
+                let ev_seen = sched::events();
                 if let Some(n) = screen::read_input(&screen, kind, buf) {
                     return n as i64;
                 }
@@ -1076,7 +1082,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 if nb {
                     return -EAGAIN;
                 }
-                sched::sleep_ms(4);
+                sched::wait_event(ev_seen, 20);
             }
         }
     }
@@ -1151,6 +1157,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             }
             pipe.buf.lock().extend(data.iter().copied());
             pipe.written.fetch_add(data.len() as u64, Ordering::Relaxed);
+            sched::notify();
             data.len() as i64
         }
         Desc::PipeRead(_) => -EBADF,
@@ -1533,6 +1540,7 @@ fn unix_wait(rx: &unix::QueueRef, max: usize, nonblock: bool) -> Result<(Vec<u8>
 /// EINTR for a signal, and leaves the data in place for MSG_PEEK.
 fn unix_recv(p: Option<&Process>, rx: &unix::QueueRef, max: usize, nonblock: bool, peek: bool) -> Result<(Vec<u8>, Vec<DescRef>), i64> {
     loop {
+        let ev_seen = sched::events();
         {
             let mut q = rx.lock();
             if !q.is_empty() {
@@ -1552,7 +1560,7 @@ fn unix_recv(p: Option<&Process>, rx: &unix::QueueRef, max: usize, nonblock: boo
         if interrupted {
             return Err(-EINTR);
         }
-        sched::sleep_ms(1);
+        sched::wait_event(ev_seen, 20);
     }
 }
 
@@ -1563,6 +1571,7 @@ fn unix_send(ep: &Endpoint, nonblock: bool, data: &[u8], fds: Vec<DescRef>) -> i
 fn unix_send_flags(ep: &Endpoint, nonblock: bool, data: &[u8], mut fds: Vec<DescRef>, flags: u64) -> i64 {
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     loop {
+        let ev_seen = sched::events();
         match ep.send(data, core::mem::take(&mut fds)) {
             None => {
                 return match sched::current_process() {
@@ -1577,7 +1586,7 @@ fn unix_send_flags(ep: &Endpoint, nonblock: bool, data: &[u8], mut fds: Vec<Desc
                 if sched::current_process().is_some_and(|p| signal::interrupted(&p)) {
                     return -EINTR;
                 }
-                sched::sleep_ms(1);
+                sched::wait_event(ev_seen, 20);
             }
             Some(n) => return n as i64,
         }
@@ -1695,13 +1704,14 @@ fn sys_accept(p: &Process, fd: i64, ptr: u64, lenptr: u64, flags: u64) -> i64 {
     };
     if let Some((l, nb)) = unix_l {
         let ep = loop {
+            let ev_seen = sched::events();
             if let Some(ep) = l.pending.lock().pop_front() {
                 break ep;
             }
             if nb {
                 return -EAGAIN;
             }
-            sched::sleep_ms(1);
+            sched::wait_event(ev_seen, 20);
         };
         let path = l.path.clone();
         let r = add_fd(p, Desc::Unix { ep: Some(ep), listener: None, bound: None, nonblock: flags & 0x800 != 0 });
@@ -2112,6 +2122,7 @@ fn sys_epoll_wait(p: &Process, epfd: i64, out: u64, max: i32, timeout_ms: i64) -
     }
     let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
     loop {
+        let ev_seen = sched::events();
         let items: Vec<(usize, DescRef, u32, u64, (u32, u64))> =
             ep.list.lock().iter().enumerate().filter(|(_, i)| !i.disabled).map(|(k, i)| (k, i.desc.clone(), i.events, i.data, i.last)).collect();
         let mut buf = Vec::new();
@@ -2175,13 +2186,14 @@ fn sys_epoll_wait(p: &Process, epfd: i64, out: u64, max: i32, timeout_ms: i64) -
         if signal::interrupted(p) {
             return -EINTR;
         }
-        sched::sleep_ms(1);
+        sched::wait_event(ev_seen, 10);
     }
 }
 
 fn sys_poll(p: &Process, ptr: u64, n: u64, timeout_ms: i64) -> i64 {
     let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
     loop {
+        let ev_seen = sched::events();
         let Some(raw) = usermem::read_bytes(p.pml4(), ptr, n * 8) else { return -EFAULT };
         let mut out = raw.clone();
         let mut count = 0;
@@ -2203,7 +2215,7 @@ fn sys_poll(p: &Process, ptr: u64, n: u64, timeout_ms: i64) -> i64 {
         if signal::interrupted(p) {
             return -EINTR;
         }
-        sched::sleep_ms(2);
+        sched::wait_event(ev_seen, 10);
     }
 }
 
@@ -2213,16 +2225,27 @@ struct Waiter {
     pml4: u64,
     addr: u64,
     woken: Arc<AtomicBool>,
+    tid: u64,
 }
 
 static FUTEX: Spin<Vec<Waiter>> = Spin::new(Vec::new());
 
 fn futex_wake(pml4: u64, addr: u64, n: u64) -> i64 {
+    let mut wake = Vec::new();
+    let r = futex_wake_list(pml4, addr, n, &mut wake);
+    for t in wake {
+        sched::wake(t);
+    }
+    r
+}
+
+fn futex_wake_list(pml4: u64, addr: u64, n: u64, wake: &mut Vec<u64>) -> i64 {
     let mut q = FUTEX.lock();
     let mut woken = 0;
     q.retain(|w| {
         if (woken as u64) < n && w.pml4 == pml4 && w.addr == addr {
             w.woken.store(true, Ordering::Release);
+            wake.push(w.tid);
             woken += 1;
             false
         } else {
@@ -2267,7 +2290,7 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 if u32::from_le_bytes(b.try_into().unwrap()) != val as u32 {
                     return -EAGAIN;
                 }
-                q.push(Waiter { pml4: p.pml4(), addr, woken: woken.clone() });
+                q.push(Waiter { pml4: p.pml4(), addr, woken: woken.clone(), tid: sched::current_id() });
             }
             loop {
                 if woken.load(Ordering::Acquire) {
@@ -2281,7 +2304,10 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                     FUTEX.lock().retain(|w| !Arc::ptr_eq(&w.woken, &woken));
                     return -EINTR;
                 }
-                sched::sleep_ms(1);
+                // Woken directly by FUTEX_WAKE; the cap is for timeouts
+                // and signals.
+                let left = deadline.saturating_sub(crate::time::uptime_ms()).clamp(1, 50);
+                sched::wait_flag(&woken, left);
             }
         }
         1 | 10 => futex_wake(p.pml4(), addr, val),
@@ -3469,6 +3495,7 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
 fn sys_wait4(p: &Arc<Process>, pid: i64, status: u64, options: u64) -> i64 {
     const WNOHANG: u64 = 1;
     loop {
+        let ev_seen = sched::events();
         let kids: Vec<Arc<Process>> = super::process::children(p.pid)
             .into_iter()
             .filter(|c| pid == -1 || pid == 0 || pid < -1 || c.pid as i64 == pid)
@@ -3491,7 +3518,7 @@ fn sys_wait4(p: &Arc<Process>, pid: i64, status: u64, options: u64) -> i64 {
         if signal::interrupted(p) {
             return -EINTR;
         }
-        sched::sleep_ms(2);
+        sched::wait_event(ev_seen, 20);
     }
 }
 
@@ -3633,6 +3660,7 @@ fn sys_select(p: &Process, n: usize, rp: u64, wp: u64, ep: u64, timeout_ms: i64)
     let (Some(r), Some(w), Some(_e)) = (read_set(rp), read_set(wp), read_set(ep)) else { return -EFAULT };
     let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
     loop {
+        let ev_seen = sched::events();
         let mut ro = vec![0u64; words];
         let mut wo = vec![0u64; words];
         let mut count = 0;
@@ -3664,7 +3692,7 @@ fn sys_select(p: &Process, n: usize, rp: u64, wp: u64, ep: u64, timeout_ms: i64)
         if signal::interrupted(p) {
             return -EINTR;
         }
-        sched::sleep_ms(2);
+        sched::wait_event(ev_seen, 10);
     }
 }
 
@@ -3703,6 +3731,7 @@ fn sys_timerfd(p: &Process, set: bool, fd: i64, a1: u64, a2: u64, a3: u64) -> i6
             now + value
         };
         *t.state.lock() = (next, interval);
+        sched::notify();
     }
     0
 }

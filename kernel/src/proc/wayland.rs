@@ -177,6 +177,26 @@ struct Surface {
     /// Sub-surfaces and popups drawn on top, in order.
     children: Vec<u32>,
     entered_output: bool,
+    /// Input region (None: the whole surface) and the one set before the
+    /// next commit (Some(None) resets it to the whole surface).
+    input: Option<Rects>,
+    pending_input: Option<Option<Rects>>,
+    /// Rectangles changed since the last commit (surface = buffer
+    /// coordinates: MayOS uses scale 1).
+    damage: Vec<(i32, i32, i32, i32)>,
+}
+
+/// A wl_region: rectangles added (true) or subtracted (false), in order.
+type Rects = Vec<(i32, i32, i32, i32, bool)>;
+
+fn region_contains(r: &Rects, x: i32, y: i32) -> bool {
+    let mut inside = false;
+    for &(rx, ry, w, h, add) in r {
+        if x >= rx && y >= ry && x < rx + w && y < ry + h {
+            inside = add;
+        }
+    }
+    inside
 }
 
 #[derive(Default, Clone)]
@@ -200,7 +220,7 @@ enum Obj {
     ShmPool { shm: Arc<Shm> },
     Buffer(Buffer),
     Surface(Surface),
-    Region,
+    Region(Rects),
     Seat,
     Pointer,
     Keyboard,
@@ -451,7 +471,7 @@ impl State {
         } else if is!(Obj::Compositor) {
             match op {
                 0 => self.new_obj(a.u(), Obj::Surface(Surface::default()), parent_ver),
-                1 => self.new_obj(a.u(), Obj::Region, 1),
+                1 => self.new_obj(a.u(), Obj::Region(Vec::new()), 1),
                 _ => {}
             }
         } else if is!(Obj::SubCompositor) {
@@ -526,9 +546,16 @@ impl State {
             }
         } else if is!(Obj::Surface(_)) {
             self.surface_request(id, op, a);
-        } else if is!(Obj::Region) {
-            if op == 0 {
-                self.destroy(id);
+        } else if is!(Obj::Region(_)) {
+            match op {
+                0 => self.destroy(id),
+                1 | 2 => {
+                    let (x, y, w, h) = (a.i(), a.i(), a.i(), a.i());
+                    if let Some(Obj::Region(r)) = self.objs.get_mut(&id) {
+                        r.push((x, y, w, h, op == 1));
+                    }
+                }
+                _ => {}
             }
         } else if is!(Obj::Seat) {
             match op {
@@ -778,8 +805,28 @@ impl State {
                     s.frames.push(cb);
                 }
             }
+            5 => {
+                // set_input_region (null: the whole surface)
+                let r = a.u();
+                let rects = match self.objs.get(&r) {
+                    Some(Obj::Region(v)) => Some(v.clone()),
+                    _ => None,
+                };
+                if let Some(s) = self.surface(id) {
+                    s.pending_input = Some(rects);
+                }
+            }
+            2 | 9 => {
+                // damage / damage_buffer
+                let (x, y, w, h) = (a.i(), a.i(), a.i(), a.i());
+                if let Some(s) = self.surface(id)
+                    && s.damage.len() < 64
+                {
+                    s.damage.push((x, y, w, h));
+                }
+            }
             6 => self.commit(id),
-            _ => {} // damage, regions, transform, scale
+            _ => {} // opaque region, transform, scale
         }
     }
 
@@ -787,6 +834,9 @@ impl State {
         let Some(s) = self.surface(id) else { return };
         let frames = core::mem::take(&mut s.frames);
         let pending = s.pending.take();
+        if let Some(input) = s.pending_input.take() {
+            s.input = input;
+        }
         let needs_enter = !s.entered_output;
         self.frame_ready.extend(frames);
         if let Some(att) = pending {
@@ -799,9 +849,22 @@ impl State {
                 Some(bid) => {
                     if let Some(Obj::Buffer(b)) = self.objs.get(&bid) {
                         let b = b.clone();
-                        let img = copy_buffer(&b);
-                        if let Some(s) = self.surface(id) {
-                            s.image = img;
+                        let Some(s) = self.surface(id) else { return };
+                        let damage = core::mem::take(&mut s.damage);
+                        // Same size as before and only part changed: copy just
+                        // the damaged rectangles into our copy of the picture.
+                        let area: i64 = damage.iter().map(|d| d.2.max(0) as i64 * d.3.max(0) as i64).sum();
+                        let partial = !damage.is_empty()
+                            && area < b.w as i64 * b.h as i64 / 2
+                            && s.image.as_ref().is_some_and(|i| i.0 == b.w && i.1 == b.h);
+                        if partial {
+                            let img = s.image.as_mut().unwrap();
+                            let px = Arc::make_mut(&mut img.2);
+                            for d in damage {
+                                copy_rect(&b, px, d);
+                            }
+                        } else {
+                            s.image = copy_buffer(&b);
                         }
                         // Pixels are copied: the program may reuse the buffer.
                         self.ev(bid, 0, vec![]);
@@ -997,11 +1060,15 @@ impl State {
         let mut best = (root, -gx, -gy);
         fn walk(st: &State, id: u32, ox: i32, oy: i32, x: i32, y: i32, best: &mut (u32, i32, i32), depth: u32) {
             let Some(Obj::Surface(s)) = st.objs.get(&id) else { return };
+            // Surfaces with an input region only take the pointer inside
+            // it (Firefox's content sub-surface has an empty one, so its
+            // clicks go to the GTK window below).
             if let Some((w, h, _)) = &s.image
                 && x >= ox
                 && y >= oy
                 && x < ox + w
                 && y < oy + h
+                && s.input.as_ref().is_none_or(|r| region_contains(r, x - ox, y - oy))
             {
                 *best = (id, ox, oy);
             }
@@ -1105,6 +1172,10 @@ impl State {
         let v = -delta.signum() * 10 * 256;
         let ps: Vec<u32> = self.pointers.clone();
         for p in ps {
+            if self.version(p) >= 5 {
+                self.ev(p, 6, vec![A::U(0)]); // axis_source: wheel
+                self.ev(p, 8, vec![A::U(0), A::I(-delta.signum())]); // axis_discrete
+            }
             self.ev(p, 4, vec![A::U(t), A::U(0), A::F(v)]);
         }
         self.pointer_frame();
@@ -1182,18 +1253,40 @@ fn copy_buffer(b: &Buffer) -> Option<(i32, i32, Arc<Vec<u32>>)> {
         return None;
     }
     let mut px = vec![0u32; (b.w * b.h) as usize];
-    let mut row = vec![0u8; (b.w * 4) as usize];
     for y in 0..b.h {
-        if !b.shm.copy_out(b.off + y as u64 * b.stride as u64, &mut row) {
+        if !copy_row(b, &mut px, y, 0, b.w) {
             return None;
-        }
-        let dst = &mut px[(y * b.w) as usize..((y + 1) * b.w) as usize];
-        for (d, s) in dst.iter_mut().zip(row.chunks_exact(4)) {
-            let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            *d = if b.opaque { v | 0xff00_0000 } else { v };
         }
     }
     Some((b.w, b.h, Arc::new(px)))
+}
+
+/// Copy pixels [x0, x1) of row `y` from the buffer straight into `px`.
+fn copy_row(b: &Buffer, px: &mut [u32], y: i32, x0: i32, x1: i32) -> bool {
+    let start = (y * b.w + x0) as usize;
+    let dst = &mut px[start..start + (x1 - x0) as usize];
+    let bytes = unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 4) };
+    if !b.shm.copy_out(b.off + y as u64 * b.stride as u64 + x0 as u64 * 4, bytes) {
+        return false;
+    }
+    if b.opaque {
+        for v in dst.iter_mut() {
+            *v |= 0xff00_0000;
+        }
+    }
+    true
+}
+
+/// Copy one damaged rectangle (clamped to the buffer).
+fn copy_rect(b: &Buffer, px: &mut [u32], (x, y, w, h): (i32, i32, i32, i32)) {
+    let (x0, y0) = (x.max(0), y.max(0));
+    let (x1, y1) = (x.saturating_add(w).min(b.w), y.saturating_add(h).min(b.h));
+    if x0 >= x1 || y0 >= y1 || b.stride < b.w * 4 {
+        return;
+    }
+    for row in y0..y1 {
+        copy_row(b, px, row, x0, x1);
+    }
 }
 
 /// Draw premultiplied ARGB `src` over `dst` at (x, y).

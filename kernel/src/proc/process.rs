@@ -48,10 +48,12 @@ impl Console {
     }
 
     pub fn send_input(&self, data: &[u8]) {
+        super::sched::notify();
         self.inner.lock().input.extend(data.iter().copied());
     }
 
     pub fn close_input(&self) {
+        super::sched::notify();
         self.inner.lock().input_closed = true;
     }
 
@@ -273,6 +275,7 @@ fn finish(p: &Arc<Process>, code: i64) {
         }
         first
     };
+    super::sched::notify(); // wait4, pipe readers
     // Linux parents hear about it through SIGCHLD.
     if first && p.parent != 0
         && let Some(parent) = find(p.parent)

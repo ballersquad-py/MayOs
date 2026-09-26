@@ -186,6 +186,8 @@ pub fn send(t: &Arc<Process>, tid: Option<u64>, sig: u64, code: i32, from_pid: u
                 Some(id) => s.thread(id).pending |= bit(sig),
                 None => s.pending |= bit(sig),
             }
+            drop(s);
+            sched::notify(); // interrupt waits
             false
         }
     }

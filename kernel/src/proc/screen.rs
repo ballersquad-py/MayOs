@@ -134,6 +134,7 @@ impl Screen {
     }
 
     fn push(q: &Spin<VecDeque<[u8; 24]>>, events: &[(u16, u16, i32)]) {
+        super::sched::notify();
         let us = super::linux::unix_ms() * 1000 + crate::time::uptime_us() % 1000;
         let mut q = q.lock();
         if q.len() + events.len() + 1 > QUEUE_MAX {

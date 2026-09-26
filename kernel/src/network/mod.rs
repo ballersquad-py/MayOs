@@ -153,6 +153,7 @@ impl Iface {
             self.stats[0] += 1;
             self.stats[2] += frame.len() as u64;
             self.handle_frame(&frame);
+            crate::proc::sched::notify(); // sockets may be readable now
         }
     }
 

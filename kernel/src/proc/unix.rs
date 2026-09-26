@@ -42,6 +42,7 @@ impl Queue {
             self.fds.push_back((at, fds));
         }
         self.data.extend(bytes.iter().copied());
+        crate::proc::sched::notify();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -172,6 +173,8 @@ impl Drop for Endpoint {
         let mut q = self.rx.lock();
         q.fds.clear();
         q.closed = true;
+        drop(q);
+        crate::proc::sched::notify();
     }
 }
 
@@ -228,6 +231,7 @@ pub fn connect(path: &str, pid: u64) -> Option<Endpoint> {
         Ok(listener) => {
             let (mine, theirs) = Endpoint::pair(Some(String::from(path)));
             listener.pending.lock().push_back(theirs);
+            crate::proc::sched::notify();
             Some(mine)
         }
         Err(factory) => {
@@ -404,6 +408,8 @@ impl EventFd {
         self.writes.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut c = self.count.lock();
         *c = c.saturating_add(v).min(u64::MAX - 1);
+        drop(c);
+        crate::proc::sched::notify();
     }
 }
 
