@@ -518,6 +518,34 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {}", t.id, pid, state, t.cpu_ms, t.name);
             }
         }
+        "threads" => {
+            // What every thread of a Linux program is doing right now.
+            let filter = args.first().copied().unwrap_or("");
+            let _ = writeln!(out, "{}  TID   PID  STATE      CPU(ms)  IN{}", C_HEAD, C_OFF);
+            for t in crate::proc::sched::list() {
+                let Some(pid) = t.pid else { continue };
+                let exe = crate::proc::process::find(pid).map(|p| crate::proc::linux::exe_name(&p)).unwrap_or_default();
+                if !filter.is_empty() && !exe.contains(filter) {
+                    continue;
+                }
+                let state = match t.state {
+                    crate::proc::sched::State::Ready => "ready",
+                    crate::proc::sched::State::Running => "running",
+                    crate::proc::sched::State::Sleeping(_) => "sleeping",
+                    crate::proc::sched::State::Dead => "dead",
+                };
+                let [nr, a0, a1] = t.syscall;
+                let what = if nr == crate::proc::sched::NO_SYSCALL {
+                    String::from("user code")
+                } else {
+                    format!("{}({:#x}, {:#x})", crate::proc::linux::syscall_name(nr), a0, a1)
+                };
+                let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {}", t.id, pid, state, t.cpu_ms, what);
+            }
+        }
+        "gpuinfo" => {
+            let _ = write!(out, "{}", crate::drivers::vmware_svga::report());
+        }
         "kill" => match args.first().and_then(|a| a.parse::<u64>().ok()) {
             Some(pid) => match crate::proc::process::find(pid) {
                 Some(p) => crate::proc::process::kill(&p),

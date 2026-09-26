@@ -45,6 +45,9 @@ pub struct Thread {
     wait_seen: u64,
     /// Sleeping in `wait_flag`: the flag (`*const AtomicBool`) that ends it.
     wait_flag: usize,
+    /// Linux system call in progress (number, first two arguments), for
+    /// the `threads` command; NO_EVENT when none.
+    pub syscall: [u64; 3],
     /// Executing on some CPU (set until that CPU is off its stack).
     on_cpu: AtomicBool,
     /// A CPU's idle thread (runs only there, when nothing else can).
@@ -133,6 +136,7 @@ pub fn init() {
         gs_base: 0,
         wait_seen: NO_EVENT,
         wait_flag: 0,
+        syscall: [NO_EVENT, 0, 0],
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -162,6 +166,7 @@ pub fn init_ap(cpu: usize) {
         gs_base: 0,
         wait_seen: NO_EVENT,
         wait_flag: 0,
+        syscall: [NO_EVENT, 0, 0],
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -222,6 +227,7 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         gs_base: 0,
         wait_seen: NO_EVENT,
         wait_flag: 0,
+        syscall: [NO_EVENT, 0, 0],
         on_cpu: AtomicBool::new(false),
         idle: false,
         fpu: Box::new(fpu),
@@ -281,6 +287,15 @@ pub fn set_fs_base(v: u64) {
 pub fn fs_base() -> u64 {
     me().map(|t| t.fs_base).unwrap_or(0)
 }
+
+/// Record the system call this thread is in (or leaves: `nr` NO_SYSCALL).
+pub fn set_syscall(nr: u64, a0: u64, a1: u64) {
+    if let Some(t) = me() {
+        t.syscall = [nr, a0, a1];
+    }
+}
+
+pub const NO_SYSCALL: u64 = NO_EVENT;
 
 pub fn current_id() -> u64 {
     me().map(|t| t.id).unwrap_or(0)
@@ -648,6 +663,7 @@ pub struct ThreadInfo {
     pub state: State,
     pub pid: Option<u64>,
     pub cpu_ms: u64,
+    pub syscall: [u64; 3],
 }
 
 pub fn list() -> Vec<ThreadInfo> {
@@ -660,6 +676,7 @@ pub fn list() -> Vec<ThreadInfo> {
             state: t.state,
             pid: t.process.as_ref().map(|p| p.pid),
             cpu_ms: t.cpu_ms,
+            syscall: t.syscall,
         })
         .collect()
 }

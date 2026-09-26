@@ -64,6 +64,14 @@ pub struct VmwareSvga {
 
 unsafe impl Send for VmwareSvga {}
 
+static REPORT: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
+
+/// The 3D capability report made at start-up (the `gpuinfo` command).
+pub fn report() -> alloc::string::String {
+    let r = REPORT.lock().clone();
+    if r.is_empty() { alloc::string::String::from("No VMware SVGA (VMSVGA) display adapter in use.\n") } else { r }
+}
+
 impl VmwareSvga {
     fn read(&self, reg: u32) -> u32 {
         unsafe {
@@ -139,7 +147,8 @@ impl VmwareSvga {
             f.add(FIFO_NEXT_CMD).write_volatile(min);
             f.add(FIFO_STOP).write_volatile(min);
         }
-        dev.write(REG_GUEST_ID, 0x500a); // "other 64-bit"
+        dev.write(REG_GUEST_ID, 0x500a); // "other 64-bit"        *REPORT.lock() = dev.gpu_report(caps);
+
         dev.write(REG_CONFIG_DONE, 1);
         crate::kprintln!(
             "svga: vram {} MiB at {:#x}, max {}x{}, fifo {} KiB, caps {:#x}",
@@ -151,6 +160,60 @@ impl VmwareSvga {
             caps
         );
         Some(dev)
+    }
+
+    /// What the device offers for 3D (the first step towards a GPU driver
+    /// for Linux programs): capability registers, FIFO 3D version and the
+    /// 3D capability list.
+    fn gpu_report(&self, caps: u32) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut o = alloc::string::String::new();
+        let names = [
+            (0x0000_0002, "RECT_COPY"), (0x0000_0020, "CURSOR"), (0x0000_8000, "EXTENDED_FIFO"), (0x0002_0000, "PITCHLOCK"),
+            (0x0010_0000, "GMR"), (0x0020_0000, "TRACES"), (0x0040_0000, "GMR2"), (0x0080_0000, "SCREEN_OBJECT_2"),
+            (0x0100_0000, "COMMAND_BUFFERS"), (0x0400_0000, "CMD_BUFFERS_2"), (0x0800_0000, "GBOBJECTS"), (0x1000_0000, "DX"),
+            (0x2000_0000, "HP_CMD_QUEUE"), (0x4000_0000, "NO_BB_RESTRICTION"), (0x8000_0000, "CAP2_REGISTER"),
+        ];
+        let _ = writeln!(o, "VMSVGA capabilities {:#010x}:", caps);
+        for (bit, name) in names {
+            if caps & bit != 0 {
+                let _ = write!(o, " {}", name);
+            }
+        }
+        let _ = writeln!(o);
+        if caps & 0x8000_0000 != 0 {
+            let _ = writeln!(o, "cap2 {:#010x}", self.read(59));
+        }
+        let _ = writeln!(o, "vram {} MiB, memory {} KiB, max primary {} KiB", self.vram >> 20, self.read(47), self.read(50) / 1024);
+        if caps & 0x0010_0000 != 0 {
+            let _ = writeln!(o, "GMR: max ids {}, max pages {}", self.read(43), self.read(46));
+        }
+        if caps & 0x0800_0000 != 0 {
+            let _ = writeln!(o, "GB objects: suggested memory {} KiB, max MOB {} KiB, screen target max {}x{}", self.read(51), self.read(57) / 1024, self.read(55), self.read(56));
+        }
+        if caps & CAP_EXTENDED_FIFO != 0 {
+            let _ = writeln!(o, "FIFO caps {:#x}, 3D hw version {:#x}", self.fifo_reg(4), self.fifo_reg(7));
+        }
+        // 3D capabilities: through SVGA_REG_DEV_CAP with GB objects,
+        // otherwise the FIFO's 3D caps block (records of dwords).
+        let mut dev_caps = alloc::vec::Vec::new();
+        if caps & 0x0800_0000 != 0 {
+            for i in 0..260u32 {
+                self.write(52, i);
+                dev_caps.push(self.read(52));
+            }
+        }
+        let _ = writeln!(o, "3D: {}", if dev_caps.first().copied().unwrap_or(0) != 0 || self.fifo_reg(7) != 0 { "available" } else { "NOT available (enable 3D acceleration in VirtualBox's display settings)" });
+        if !dev_caps.is_empty() {
+            let _ = write!(o, "dev caps:");
+            for (i, v) in dev_caps.iter().enumerate() {
+                if *v != 0 {
+                    let _ = write!(o, " {}={:#x}", i, v);
+                }
+            }
+            let _ = writeln!(o);
+        }
+        o
     }
 
     pub fn supports(&self, w: u32, h: u32) -> bool {

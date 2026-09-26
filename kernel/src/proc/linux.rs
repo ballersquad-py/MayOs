@@ -2483,7 +2483,9 @@ pub static TRACE: AtomicBool = AtomicBool::new(false);
 
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
+    sched::set_syscall(nr, f.rdi, f.rsi);
     let mut exited = syscall_inner(p, f);
+    sched::set_syscall(sched::NO_SYSCALL, 0, 0);
     if !exited && nr != 15 {
         exited = signal::deliver(p, f);
     }
@@ -4122,4 +4124,18 @@ fn sys_waitid(p: &Arc<Process>, idtype: u64, id: i64, infop: u64, options: u64) 
         }
         sched::wait_event(ev_seen, 20);
     }
+}
+
+/// Short names of common system calls (for `threads`).
+pub fn syscall_name(nr: u64) -> String {
+    let n = match nr {
+        0 => "read", 1 => "write", 2 => "open", 3 => "close", 4 => "stat", 5 => "fstat", 7 => "poll", 8 => "lseek",
+        9 => "mmap", 10 => "mprotect", 11 => "munmap", 16 => "ioctl", 17 => "pread", 18 => "pwrite", 23 => "select",
+        28 => "madvise", 35 => "nanosleep", 42 => "connect", 43 => "accept", 44 => "sendto", 45 => "recvfrom",
+        46 => "sendmsg", 47 => "recvmsg", 56 => "clone", 57 => "fork", 59 => "execve", 61 => "wait4", 72 => "fcntl",
+        74 => "fsync", 75 => "fdatasync", 202 => "futex", 217 => "getdents64", 230 => "clock_nanosleep",
+        232 | 281 => "epoll_wait", 247 => "waitid", 257 => "openat", 262 => "newfstatat", 270 => "pselect6", 271 => "ppoll",
+        _ => return alloc::format!("sys{}", nr),
+    };
+    String::from(n)
 }
