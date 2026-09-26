@@ -70,6 +70,7 @@ impl BochsVga {
             crate::drivers::vmware_svga::fail(alloc::format!("could not map {} MiB VRAM at {:#x}", fb_len >> 20, fb_phys));
             return None;
         };
+        crate::drivers::vmware_svga::fail(alloc::format!("note: bochs-vga driver v2, DISPI id {:#x}", id));
         crate::kprintln!("bochs-vga: vram {} MiB at {:#x}", vram / (1024 * 1024), fb_phys);
         Some(BochsVga { fb_virt, fb_len, width: 0, height: 0 })
     }
@@ -81,6 +82,7 @@ impl BochsVga {
 
     pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
         if !self.supports(w, h) {
+            crate::drivers::vmware_svga::fail(alloc::format!("mode {}x{} unsupported (VRAM {} KiB)", w, h, self.fb_len >> 10));
             return false;
         }
         write(REG_ENABLE, 0);
