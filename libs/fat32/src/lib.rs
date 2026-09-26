@@ -15,6 +15,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -222,6 +223,9 @@ pub struct FatFs<D: BlockDevice> {
     next_free: u32,
     volume_label: String,
     cache: Vec<CachedSector>,
+    /// Parsed directories by first cluster, with a lowercase-name index.
+    /// Cleared on every write to the device.
+    dir_cache: BTreeMap<u32, (Vec<DirEntry>, BTreeMap<String, usize>)>,
     stamp: u64,
     clock: Option<fn() -> Timestamp>,
 }
@@ -453,6 +457,7 @@ impl<D: BlockDevice> FatFs<D> {
             next_free: 2,
             volume_label,
             cache: Vec::new(),
+            dir_cache: BTreeMap::new(),
             stamp: 0,
             clock: None,
         };
@@ -556,7 +561,7 @@ impl<D: BlockDevice> FatFs<D> {
             if rd32(&s, 0) == 0x4161_5252 && rd32(&s, 484) == 0x6141_7272 {
                 wr32(&mut s, 488, self.free_clusters);
                 wr32(&mut s, 492, self.next_free);
-                self.dev.write(lba, &s).map_err(|_| FsError::Io)?;
+                self.dev_write(lba, &s).map_err(|_| FsError::Io)?;
             }
         }
         self.dev.flush().map_err(|_| FsError::Io)
@@ -578,6 +583,7 @@ impl<D: BlockDevice> FatFs<D> {
     }
 
     fn fat_set(&mut self, cluster: u32, value: u32) -> Result<()> {
+        self.dir_cache.clear();
         let (lba, off) = self.fat_location(cluster);
         let i = self.cache_index(lba)?;
         let old = rd32(&self.cache[i].data[..], off);
@@ -727,13 +733,13 @@ impl<D: BlockDevice> FatFs<D> {
             let end = (i + run) * cs;
             let lba = self.cluster_lba(chain[i]);
             if end <= data.len() {
-                self.dev.write(lba, &data[start..end]).map_err(|_| FsError::Io)?;
+                self.dev_write(lba, &data[start..end]).map_err(|_| FsError::Io)?;
             } else {
                 let mut tmp = vec![0u8; end - start];
                 if start < data.len() {
                     tmp[..data.len() - start].copy_from_slice(&data[start..]);
                 }
-                self.dev.write(lba, &tmp).map_err(|_| FsError::Io)?;
+                self.dev_write(lba, &tmp).map_err(|_| FsError::Io)?;
             }
             // Keep the metadata cache coherent if it held any of these sectors.
             let first = lba;
@@ -772,7 +778,7 @@ impl<D: BlockDevice> FatFs<D> {
             let cluster = dir.clusters[off / cs];
             let lba = self.cluster_lba(cluster) + ((off % cs) / SECTOR) as u64;
             let sector = &dir.data[off..off + SECTOR];
-            self.dev.write(lba, sector).map_err(|_| FsError::Io)?;
+            self.dev_write(lba, sector).map_err(|_| FsError::Io)?;
             if let Some(c) = self.cache.iter_mut().find(|c| c.lba == lba) {
                 c.data.copy_from_slice(sector);
                 c.dirty = false;
@@ -871,8 +877,28 @@ impl<D: BlockDevice> FatFs<D> {
     }
 
     fn find_in(&mut self, dir_cluster: u32, name: &str) -> Result<Option<DirEntry>> {
-        let dir = self.load_dir(dir_cluster)?;
-        Ok(self.parse_dir(&dir).into_iter().find(|e| names_equal(&e.name, name)))
+        if !self.dir_cache.contains_key(&dir_cluster) {
+            let dir = self.load_dir(dir_cluster)?;
+            let entries = self.parse_dir(&dir);
+            let mut index = BTreeMap::new();
+            for (i, e) in entries.iter().enumerate() {
+                index.entry(e.name.to_lowercase()).or_insert(i);
+            }
+            if self.dir_cache.len() >= 512 {
+                self.dir_cache.clear();
+            }
+            self.dir_cache.insert(dir_cluster, (entries, index));
+        }
+        let (entries, index) = &self.dir_cache[&dir_cluster];
+        if let Some(&i) = index.get(&name.to_lowercase()) {
+            return Ok(Some(entries[i].clone()));
+        }
+        Ok(entries.iter().find(|e| names_equal(&e.name, name)).cloned())
+    }
+
+    fn dev_write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), ()> {
+        self.dir_cache.clear();
+        self.dev.write(lba, buf)
     }
 
     /// Resolve a path to its entry. Returns the root for "/".

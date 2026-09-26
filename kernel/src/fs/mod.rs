@@ -77,7 +77,126 @@ impl fat32::BlockDevice for Disk {
     }
 }
 
-pub type Volume = fat32::FatFs<Disk>;
+pub type Volume = fat32::FatFs<Cached>;
+
+/// Sectors per cache chunk (64 KiB).
+const CHUNK: u64 = 128;
+const CHUNK_BYTES: usize = CHUNK as usize * 512;
+
+/// A disk with a write-through RAM cache in front of it, so libraries and
+/// directories that are read over and over come from memory. Eviction is
+/// CLOCK (second chance).
+pub struct Cached {
+    pub disk: Disk,
+    map: alloc::collections::BTreeMap<u64, usize>,
+    slots: Vec<(u64, bool, alloc::boxed::Box<[u8]>)>,
+    hand: usize,
+    max_slots: usize,
+}
+
+impl core::ops::Deref for Cached {
+    type Target = Disk;
+    fn deref(&self) -> &Disk {
+        &self.disk
+    }
+}
+
+impl Cached {
+    fn new(disk: Disk) -> Cached {
+        // An eighth of RAM, between 32 MiB and 1 GiB.
+        let (_, frames) = crate::mem::pmm::stats();
+        let bytes = (frames * 4096 / 8).clamp(32 << 20, 1 << 30);
+        Cached { disk, map: alloc::collections::BTreeMap::new(), slots: Vec::new(), hand: 0, max_slots: bytes / CHUNK_BYTES }
+    }
+
+    fn insert(&mut self, chunk: u64, data: &[u8]) {
+        if let Some(&i) = self.map.get(&chunk) {
+            self.slots[i].2.copy_from_slice(data);
+            self.slots[i].1 = true;
+            return;
+        }
+        let i = if self.slots.len() < self.max_slots {
+            self.slots.push((chunk, true, alloc::vec![0u8; CHUNK_BYTES].into_boxed_slice()));
+            self.slots.len() - 1
+        } else {
+            loop {
+                let h = self.hand;
+                self.hand = (self.hand + 1) % self.slots.len();
+                if self.slots[h].1 {
+                    self.slots[h].1 = false;
+                } else {
+                    self.map.remove(&self.slots[h].0);
+                    self.slots[h].0 = chunk;
+                    self.slots[h].1 = true;
+                    break h;
+                }
+            }
+        };
+        self.slots[i].2.copy_from_slice(data);
+        self.map.insert(chunk, i);
+    }
+}
+
+impl fat32::BlockDevice for Cached {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> core::result::Result<(), ()> {
+        let total = self.disk.sectors();
+        let end = lba + (buf.len() / 512) as u64;
+        let mut sec = lba;
+        while sec < end {
+            let chunk = sec / CHUNK;
+            let off = ((sec % CHUNK) * 512) as usize;
+            let n = ((CHUNK - sec % CHUNK).min(end - sec) * 512) as usize;
+            let dst = ((sec - lba) * 512) as usize;
+            if let Some(&i) = self.map.get(&chunk) {
+                self.slots[i].1 = true;
+                buf[dst..dst + n].copy_from_slice(&self.slots[i].2[off..off + n]);
+                sec += (n / 512) as u64;
+                continue;
+            }
+            // Read a run of missing chunks (up to 1 MiB) in one request.
+            let mut run = 1u64;
+            while run < 16 && (chunk + run) * CHUNK < end && !self.map.contains_key(&(chunk + run)) {
+                run += 1;
+            }
+            let first = chunk * CHUNK;
+            let last = ((chunk + run) * CHUNK).min(total.max(first + 1));
+            if last <= first || (last - first) % CHUNK != 0 {
+                // Tail of the disk: read directly without caching.
+                return self.disk.read(sec, &mut buf[dst..]);
+            }
+            let mut tmp = alloc::vec![0u8; ((last - first) * 512) as usize];
+            self.disk.read(first, &mut tmp)?;
+            for k in 0..run {
+                let s = k as usize * CHUNK_BYTES;
+                self.insert(chunk + k, &tmp[s..s + CHUNK_BYTES]);
+            }
+            let from = ((sec - first) * 512) as usize;
+            let len = ((end.min(last) - sec) * 512) as usize;
+            buf[dst..dst + len].copy_from_slice(&tmp[from..from + len]);
+            sec += (len / 512) as u64;
+        }
+        Ok(())
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), ()> {
+        self.disk.write(lba, buf)?;
+        let end = lba + (buf.len() / 512) as u64;
+        let mut sec = lba;
+        while sec < end {
+            let chunk = sec / CHUNK;
+            let off = ((sec % CHUNK) * 512) as usize;
+            let n = ((CHUNK - sec % CHUNK).min(end - sec) * 512) as usize;
+            if let Some(&i) = self.map.get(&chunk) {
+                let src = ((sec - lba) * 512) as usize;
+                self.slots[i].2[off..off + n].copy_from_slice(&buf[src..src + n]);
+            }
+            sec += (n / 512) as u64;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> core::result::Result<(), ()> {
+        self.disk.flush()
+    }
+}
 
 struct Mount {
     /// "/" for the main volume, otherwise "/name".
@@ -97,12 +216,12 @@ fn clock() -> Timestamp {
 }
 
 pub fn open_volume(dev: Disk) -> core::result::Result<Volume, (FsError, Disk)> {
-    match fat32::FatFs::try_mount(dev) {
+    match fat32::FatFs::try_mount(Cached::new(dev)) {
         Ok(mut v) => {
             v.set_clock(clock);
             Ok(v)
         }
-        Err(e) => Err(e),
+        Err((e, c)) => Err((e, c.disk)),
     }
 }
 
