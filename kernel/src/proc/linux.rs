@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::process::Process;
+use super::screen::{self, InputKind, Screen};
 use super::{sched, usermem};
 use crate::arch::idt::TrapFrame;
 use crate::fs;
@@ -33,6 +34,7 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
+const ENODEV: i64 = 19;
 const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
@@ -92,6 +94,10 @@ pub enum Desc {
     Udp { port: u16, remote: Option<(net::Ipv4, u16)>, nonblock: bool },
     PipeRead(Arc<Pipe>),
     PipeWrite(Arc<Pipe>),
+    /// /dev/fb0
+    Fb { screen: Arc<Screen>, pos: u64 },
+    /// /dev/input/event0, event1, mice
+    Input { screen: Arc<Screen>, kind: InputKind, nonblock: bool },
 }
 
 pub type DescRef = Arc<Mutex<Desc>>;
@@ -104,6 +110,8 @@ pub struct LinuxState {
     pub brk: Spin<(u64, u64)>,
     pub cwd: Spin<String>,
     pub exe: String,
+    /// Window for /dev/fb0 and /dev/input, made on first use.
+    pub screen: Spin<Option<Arc<Screen>>>,
 }
 
 impl Drop for Desc {
@@ -233,6 +241,7 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
         brk: Spin::new((image.brk, image.brk)),
         cwd: Spin::new(String::from(cwd)),
         exe: String::from(path),
+        screen: Spin::new(None),
     };
     Ok((state, sp))
 }
@@ -310,7 +319,10 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 fn unmap_range(p: &Process, start: u64, end: u64) {
     let mut a = start;
     while a < end {
-        if let Some(f) = paging::unmap(p.pml4, a) {
+        let borrowed = paging::translate(p.pml4, a).is_some_and(|(_, e)| e & paging::BORROWED != 0);
+        if let Some(f) = paging::unmap(p.pml4, a)
+            && !borrowed
+        {
             pmm::free_frame(f);
         }
         a += PAGE_SIZE;
@@ -357,6 +369,25 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         *next += len + PAGE_SIZE; // a gap between mappings
         s
     };
+    if flags & MAP_ANONYMOUS == 0
+        && let Some(d) = get_fd(p, fd)
+        && let Desc::Fb { screen, .. } = &*d.lock()
+    {
+        // Shared mapping of the screen memory itself.
+        let (phys, pages) = screen.map();
+        let first = off / PAGE_SIZE;
+        let n = (len / PAGE_SIZE).min((pages as u64).saturating_sub(first));
+        if n == 0 {
+            return -EINVAL;
+        }
+        for i in 0..n {
+            let f = phys + (first + i) * PAGE_SIZE;
+            if paging::map(p.pml4, start + i * PAGE_SIZE, f, USER | WRITABLE | NO_EXECUTE | paging::BORROWED).is_err() {
+                return -ENOMEM;
+            }
+        }
+        return start as i64;
+    }
     let writable = prot & 2 != 0 || flags & MAP_ANONYMOUS == 0;
     l.regions.lock().push(Region { start, end: start + len, writable: writable || prot == 0, exec: prot & 4 != 0 });
     if flags & MAP_ANONYMOUS == 0 {
@@ -503,6 +534,33 @@ fn virtual_file(path: &str) -> Option<Desc> {
     Some(Desc::Virtual { data: text.into_bytes(), pos: 0 })
 }
 
+/// The per-process screen, created (and its window opened) on first use.
+fn process_screen(p: &Process) -> Option<Arc<Screen>> {
+    let l = linux(p)?;
+    let mut s = l.screen.lock();
+    if s.is_none() {
+        let name = l.exe.rsplit('/').next().unwrap_or("Linux program");
+        *s = Screen::new(p.pid, String::from(name));
+    }
+    s.clone()
+}
+
+fn graphics_file(p: &Process, path: &str, flags: u64) -> Option<i64> {
+    let kind = match path {
+        "/dev/fb0" | "/dev/fb/0" => None,
+        "/dev/input/event0" => Some(InputKind::Keyboard),
+        "/dev/input/event1" => Some(InputKind::Pointer),
+        "/dev/input/mice" | "/dev/input/mouse0" => Some(InputKind::Mice),
+        _ => return None,
+    };
+    let Some(screen) = process_screen(p) else { return Some(-ENOMEM) };
+    let d = match kind {
+        None => Desc::Fb { screen, pos: 0 },
+        Some(kind) => Desc::Input { screen, kind, nonblock: flags & O_NONBLOCK != 0 },
+    };
+    Some(add_fd(p, d))
+}
+
 const O_ACCMODE: u64 = 3;
 const O_CREAT: u64 = 0x40;
 const O_EXCL: u64 = 0x80;
@@ -518,6 +576,13 @@ fn sys_openat(p: &Process, dirfd: i64, ptr: u64, flags: u64) -> i64 {
     };
     if let Some(d) = virtual_file(&path) {
         return add_fd(p, d);
+    }
+    if let Some(d) = graphics_file(p, &path, flags) {
+        return d;
+    }
+    if path == "/dev/input" {
+        let entries = ["event0", "event1", "mice"].iter().map(|n| (String::from(*n), false)).collect();
+        return add_fd(p, Desc::Dir { path, entries, pos: 0 });
     }
     let writable = flags & O_ACCMODE != 0;
     if fs::is_dir(&path) {
@@ -672,6 +737,35 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
             }
         }
         Desc::PipeWrite(_) => -EBADF,
+        Desc::Fb { screen, pos } => {
+            let b = screen.buf.lock().clone();
+            let px = b.pixels();
+            let bytes = unsafe { core::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 4) };
+            let s = (*pos as usize).min(bytes.len());
+            let n = buf.len().min(bytes.len() - s);
+            buf[..n].copy_from_slice(&bytes[s..s + n]);
+            *pos += n as u64;
+            n as i64
+        }
+        Desc::Input { screen, kind, nonblock } => {
+            let (screen, kind, nb) = (screen.clone(), *kind, *nonblock);
+            drop(g);
+            if buf.len() < 24 && kind != InputKind::Mice {
+                return -EINVAL;
+            }
+            loop {
+                if let Some(n) = screen::read_input(&screen, kind, buf) {
+                    return n as i64;
+                }
+                if screen.closed.load(Ordering::Relaxed) {
+                    return -ENODEV;
+                }
+                if nb {
+                    return -EAGAIN;
+                }
+                sched::sleep_ms(4);
+            }
+        }
     }
 }
 
@@ -698,6 +792,19 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
         }
         Desc::File { .. } | Desc::Dir { .. } | Desc::Virtual { .. } => -EBADF,
         Desc::Null | Desc::Zero | Desc::Random => data.len() as i64,
+        Desc::Fb { screen, pos } => {
+            let b = screen.buf.lock().clone();
+            let len = (b.w * b.h * 4) as usize;
+            let s = (*pos as usize).min(len);
+            let n = data.len().min(len - s);
+            unsafe {
+                let dst = (crate::mem::phys_to_virt(b.phys) as *mut u8).add(s);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), dst, n);
+            }
+            *pos += n as u64;
+            if n == 0 && !data.is_empty() { -28 } else { n as i64 } // ENOSPC
+        }
+        Desc::Input { .. } => data.len() as i64,
         Desc::Tcp { stream: Some(s), .. } => match s.write_all(data, 60_000) {
             Ok(()) => data.len() as i64,
             Err(_) => -EPIPE,
@@ -913,8 +1020,11 @@ fn stat_path(path: &str) -> Result<[u8; 144], i64> {
         };
         return Ok(stat_buf(mode, size, 0, 1));
     }
-    if path == "/" {
+    if path == "/" || path == "/dev/input" {
         return Ok(stat_buf(0o40755, 4096, 0, 2));
+    }
+    if matches!(path, "/dev/fb0" | "/dev/input/event0" | "/dev/input/event1" | "/dev/input/mice") {
+        return Ok(stat_buf(0o20660, 0, 0, 9));
     }
     let e = fs::stat(path).map_err(fs_err)?;
     let ino = path.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211));
@@ -935,6 +1045,8 @@ fn stat_fd(p: &Process, fd: i64) -> Result<[u8; 144], i64> {
         Desc::Virtual { data, .. } => stat_buf(0o100444, data.len() as u64, 0, 4),
         Desc::Console => stat_buf(0o20620, 0, 0, 5),
         Desc::Null | Desc::Zero | Desc::Random => stat_buf(0o20666, 0, 0, 6),
+        Desc::Fb { .. } => stat_buf(0o20660, 0, 0, 9),
+        Desc::Input { .. } => stat_buf(0o20660, 0, 0, 10),
         Desc::Tcp { .. } | Desc::Udp { .. } => stat_buf(0o140777, 0, 0, 7),
         Desc::PipeRead(_) | Desc::PipeWrite(_) => stat_buf(0o10600, 0, 0, 8),
     })
@@ -1236,6 +1348,7 @@ fn ready(p: &Process, fd: i64, events: u16) -> u16 {
         Desc::Udp { port, .. } => (crate::network::udp_pending(*port), true),
         Desc::PipeRead(pp) => (!pp.buf.lock().is_empty() || pp.writers.load(Ordering::Relaxed) == 0, false),
         Desc::PipeWrite(_) => (false, true),
+        Desc::Input { screen, kind, .. } => (screen::has_input(screen, *kind), true),
         _ => (true, true),
     };
     let mut rev = 0;
@@ -1394,7 +1507,7 @@ fn thread_exit(p: &Arc<Process>, code: i64) -> ! {
 
 // --- time & misc --------------------------------------------------------
 
-fn unix_ms() -> u64 {
+pub fn unix_ms() -> u64 {
     let t = crate::arch::rtc::now();
     let ts = fs::Timestamp { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second };
     unix_time(&ts).max(0) as u64 * 1000 + crate::time::uptime_ms() % 1000
@@ -1493,13 +1606,13 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 let on = usermem::read_bytes(pml4, a2, 4).map(|b| b != [0, 0, 0, 0]).unwrap_or(false);
                 if let Some(d) = get_fd(p, a0 as i64) {
                     match &mut *d.lock() {
-                        Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } => *nonblock = on,
+                        Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } => *nonblock = on,
                         _ => {}
                     }
                 }
                 0
             }
-            _ => -ENOTTY,
+            _ => device_ioctl(p, a0 as i64, a1, a2),
         },
         17 => sys_pread(p, a0 as i64, a1, a2, a3),
         18 => -ENOSYS, // pwrite64
@@ -1571,7 +1684,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 1 | 2 => 0,
                 3 => match get_fd(p, a0 as i64) {
                     Some(d) => match &*d.lock() {
-                        Desc::Tcp { nonblock: true, .. } | Desc::Udp { nonblock: true, .. } => 2 | O_NONBLOCK as i64,
+                        Desc::Tcp { nonblock: true, .. } | Desc::Udp { nonblock: true, .. } | Desc::Input { nonblock: true, .. } => 2 | O_NONBLOCK as i64,
                         Desc::File { writable: true, .. } => 2,
                         _ => 2,
                     },
@@ -1580,7 +1693,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 4 => {
                     if let Some(d) = get_fd(p, a0 as i64) {
                         match &mut *d.lock() {
-                            Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } => *nonblock = a2 & O_NONBLOCK != 0,
+                            Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } => *nonblock = a2 & O_NONBLOCK != 0,
                             _ => {}
                         }
                     }
@@ -1836,4 +1949,99 @@ pub fn is_linux(p: &Process) -> bool {
 
 pub fn exe_name(p: &Process) -> String {
     linux(p).map(|l| l.exe.to_string()).unwrap_or_default()
+}
+
+/// ioctls of the framebuffer and input devices.
+fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
+    let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let (screen, kind) = match &*d.lock() {
+        Desc::Fb { screen, .. } => (screen.clone(), None),
+        Desc::Input { screen, kind, .. } => (screen.clone(), Some(*kind)),
+        _ => return -ENOTTY,
+    };
+    let put = |b: &[u8]| if usermem::write_bytes(p.pml4, arg, b) { 0 } else { -EFAULT };
+    let Some(kind) = kind else {
+        return match cmd {
+            0x4600 => put(&screen::var_info(&screen)), // FBIOGET_VSCREENINFO
+            0x4601 => {
+                // FBIOPUT_VSCREENINFO: only the resolution can change.
+                let Some(v) = usermem::read_bytes(p.pml4, arg, 160) else { return -EFAULT };
+                let w = u32::from_le_bytes(v[0..4].try_into().unwrap());
+                let h = u32::from_le_bytes(v[4..8].try_into().unwrap());
+                let bpp = u32::from_le_bytes(v[24..28].try_into().unwrap());
+                if bpp != 32 && bpp != 0 || !screen.set_size(w, h) {
+                    put(&screen::var_info(&screen));
+                    return -EINVAL;
+                }
+                put(&screen::var_info(&screen))
+            }
+            0x4602 => put(&screen::fix_info(&screen)), // FBIOGET_FSCREENINFO
+            0x4606 | 0x4611 => {
+                // FBIOPAN_DISPLAY / FBIOBLANK
+                screen.presents.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+            0x4604 | 0x4605 => 0, // colour maps: true colour only
+            0x40044620 => {
+                // FBIO_WAITFORVSYNC: the desktop draws at about 60 Hz.
+                screen.presents.fetch_add(1, Ordering::Relaxed);
+                sched::sleep_ms(16 - crate::time::uptime_ms() % 16);
+                0
+            }
+            _ => -ENOTTY,
+        };
+    };
+    if kind == InputKind::Mice {
+        return -ENOTTY;
+    }
+    // evdev: _IOC(dir, 'E', nr, size)
+    let (ty, nr, size) = ((cmd >> 8) & 0xff, cmd & 0xff, ((cmd >> 16) & 0x3fff) as usize);
+    if ty != 0x45 {
+        return -ENOTTY;
+    }
+    let bits = |set: &[u16]| {
+        let mut b = alloc::vec![0u8; size];
+        for &i in set {
+            if let Some(x) = b.get_mut(i as usize / 8) {
+                *x |= 1 << (i % 8);
+            }
+        }
+        b
+    };
+    let keyboard = kind == InputKind::Keyboard;
+    match nr {
+        0x01 => put(&0x10001i32.to_le_bytes()), // EVIOCGVERSION
+        0x02 => put(&[0x06, 0, 0x5e, 0x4d, if keyboard { 1 } else { 2 }, 0, 1, 0]), // EVIOCGID: virtual bus
+        0x06 | 0x07 | 0x08 => {
+            // EVIOCGNAME / EVIOCGPHYS / EVIOCGUNIQ
+            let name = if nr == 0x06 { kind.name() } else { "mayos" };
+            let mut b = alloc::vec![0u8; size.min(name.len() + 1)];
+            let n = b.len().saturating_sub(1);
+            b[..n].copy_from_slice(&name.as_bytes()[..n]);
+            if put(&b) == 0 { b.len() as i64 } else { -EFAULT }
+        }
+        0x09 => put(&bits(if keyboard { &[] } else { &[0] })), // EVIOCGPROP: pointer
+        0x18 | 0x19 | 0x1b => put(&alloc::vec![0u8; size]), // key / led / switch state
+        0x20 => put(&bits(if keyboard { &[0, 1] } else { &[0, 1, 2, 3] })),
+        0x21 => {
+            // EV_KEY bits
+            let keys: Vec<u16> = if keyboard { (1..=111).chain([125]).collect() } else { alloc::vec![0x110, 0x111, 0x112] };
+            put(&bits(&keys))
+        }
+        0x22 => put(&bits(if keyboard { &[] } else { &[0, 1, 8] })),
+        0x23 => put(&bits(if keyboard { &[] } else { &[0, 1] })),
+        0x24..=0x3f => put(&alloc::vec![0u8; size]),
+        0x40 | 0x41 if !keyboard => {
+            // EVIOCGABS(ABS_X / ABS_Y): value, min, max, fuzz, flat, resolution
+            let (w, h) = screen.size();
+            let pos = *screen.last_pos.lock();
+            let (v, max) = if nr == 0x40 { (pos.0, w as i32 - 1) } else { (pos.1, h as i32 - 1) };
+            let b: Vec<u8> = [v, 0, max, 0, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+            put(&b)
+        }
+        0x40..=0x7f => -EINVAL,
+        0x90 | 0x91 => 0, // EVIOCGRAB / EVIOCREVOKE
+        0x03 | 0xa0 => 0, // EVIOCSREP / EVIOCSCLOCKID
+        _ => -EINVAL,
+    }
 }

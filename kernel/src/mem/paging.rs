@@ -18,6 +18,9 @@ pub const WRITE_THROUGH: u64 = 1 << 3;
 pub const NO_CACHE: u64 = 1 << 4;
 pub const HUGE: u64 = 1 << 7;
 pub const NO_EXECUTE: u64 = 1 << 63;
+/// Software bit: the page belongs to someone else (a shared buffer) and
+/// must not be freed with the address space.
+pub const BORROWED: u64 = 1 << 9;
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -217,6 +220,8 @@ pub fn destroy_address_space(pml4: u64) {
             let child = e & ADDR_MASK;
             if level > 1 {
                 free_level(child, level - 1);
+            } else if e & BORROWED != 0 {
+                continue;
             }
             pmm::free_frame(child);
         }

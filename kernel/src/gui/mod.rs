@@ -16,6 +16,7 @@ pub mod editor;
 pub mod explorer;
 pub mod imageview;
 pub mod keep_resolution;
+pub mod linuxwin;
 pub mod settings_app;
 pub mod shell;
 pub mod terminal;
@@ -172,6 +173,10 @@ pub extern "C" fn desktop_main(_: usize) {
             if handled > 256 {
                 break;
             }
+        }
+        // Linux programs that opened /dev/fb0 get a window.
+        for screen in crate::proc::screen::take_pending() {
+            wm.open(alloc::boxed::Box::new(linuxwin::LinuxWindow::new(screen)), None);
         }
         let start = crate::time::uptime_ms();
         let t0 = crate::time::uptime_us();

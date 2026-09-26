@@ -585,6 +585,35 @@ impl<'a> Canvas<'a> {
         self.blit_region(src, Rect::new(0, 0, src.w, src.h), x, y);
     }
 
+    /// Draw raw opaque pixels (`sw` x `sh`, row stride `sw`) into `dst`,
+    /// scaled with nearest-neighbour sampling when the sizes differ.
+    pub fn blit_pixels(&mut self, src: &[u32], sw: i32, sh: i32, dst: Rect) {
+        let c = self.abs_clip(dst);
+        if c.is_empty() || sw <= 0 || sh <= 0 || src.len() < (sw * sh) as usize {
+            return;
+        }
+        let (x0, y0) = (dst.x + self.ox, dst.y + self.oy);
+        let fx = ((sw as u64) << 16) / dst.w as u64;
+        let fy = ((sh as u64) << 16) / dst.h as u64;
+        for row in 0..c.h {
+            let sy = ((((c.y + row - y0) as u64) * fy) >> 16).min(sh as u64 - 1) as usize;
+            let srow = &src[sy * sw as usize..(sy + 1) * sw as usize];
+            let d = self.idx(c.x, c.y + row);
+            let out = &mut self.data[d..d + c.w as usize];
+            if dst.w == sw {
+                let sx = (c.x - x0) as usize;
+                for (o, &p) in out.iter_mut().zip(&srow[sx..sx + c.w as usize]) {
+                    *o = p | 0xff00_0000;
+                }
+            } else {
+                for (i, o) in out.iter_mut().enumerate() {
+                    let sx = ((((c.x - x0 + i as i32) as u64) * fx) >> 16).min(sw as u64 - 1) as usize;
+                    *o = srow[sx] | 0xff00_0000;
+                }
+            }
+        }
+    }
+
     /// Copy part of a surface to `(x, y)`.
     pub fn blit_region(&mut self, src: &Surface, from: Rect, x: i32, y: i32) {
         let dst = Rect::new(x, y, from.w, from.h);

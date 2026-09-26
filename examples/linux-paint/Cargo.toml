@@ -1,0 +1,18 @@
+[package]
+name = "linux-paint"
+version = "0.1.0"
+edition = "2024"
+
+# A Linux graphics program: draws on /dev/fb0 and reads the keyboard and
+# mouse from /dev/input, exactly as on a Linux console. MayOS shows it in
+# a window. Build with:
+#   cargo build --release --target x86_64-unknown-linux-musl
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+
+[workspace]

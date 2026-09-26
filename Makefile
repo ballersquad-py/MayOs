@@ -11,6 +11,10 @@ RAMDISK    := $(BUILD)/ramdisk.img
 OVMF       ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /opt/homebrew/share/qemu/edk2-x86_64-code.fd))
 USER_BINS  := hello count cat write ls guess sysinfo
 USER_DIR   := userspace/target/x86_64-unknown-none/release
+# Linux demo programs (examples/), included when Rust's musl target is
+# installed (`rustup target add x86_64-unknown-linux-musl`).
+LINUX_BINS := $(shell rustup target list --installed 2>/dev/null | grep -q x86_64-unknown-linux-musl && echo linux-hello linux-paint)
+USER_BINS  += $(LINUX_BINS)
 
 QEMU       ?= qemu-system-x86_64
 # Sound backend for QEMU: pa (PulseAudio), pipewire, alsa, sdl, dsound
@@ -41,6 +45,10 @@ kernel:
 
 userspace:
 	cd userspace && cargo build --release
+	for b in $(LINUX_BINS); do \
+		(cd examples/$$b && cargo build --release --target x86_64-unknown-linux-musl) && \
+		cp examples/$$b/target/x86_64-unknown-linux-musl/release/$$b $(USER_DIR)/ || exit 1; \
+	done
 
 define make_iso
 	rm -rf $(BUILD)/iso_root

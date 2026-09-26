@@ -37,7 +37,11 @@ Settings app are done.
   threads, networking, time) or C programs built with `musl-gcc -static`.
   Supported: files and directories, `mmap`/`brk` with memory on demand,
   threads (`clone`, `futex`, TLS), TCP/UDP sockets and DNS, pipes, `poll`.
-  Not yet: `fork`/`exec`, signals, graphics. See `examples/linux-hello`.
+  Graphics use the Linux framebuffer: a program that opens `/dev/fb0`
+  gets a window, maps its pixels with `mmap` and reads the keyboard and
+  mouse from `/dev/input/event0`, `event1` (evdev) or `/dev/input/mice`.
+  Try `linux-paint` in the Terminal. Not yet: `fork`/`exec`, signals.
+  See `examples/linux-hello` and `examples/linux-paint`.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
