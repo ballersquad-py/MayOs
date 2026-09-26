@@ -3,3 +3,4 @@ target/
 *.img
 *.iso
 __pycache__/
+*.iso.xz
