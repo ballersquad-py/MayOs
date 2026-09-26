@@ -183,6 +183,9 @@ pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result
         }
     };
     if image.linux {
+        if !path.ends_with("dbus-daemon") {
+            super::linux::ensure_session_bus();
+        }
         let (state, rsp, entry) = match super::linux::setup(pml4, &image, path, args, cwd) {
             Ok(v) => v,
             Err(e) => {

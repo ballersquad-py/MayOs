@@ -59,9 +59,13 @@ Settings app are done.
   Terminal downloads Alpine packages (with their dependencies), unpacks
   them and runs their setup steps; `pkg search`, `pkg list`. For
   example `pkg install netsurf` then `netsurf` gives you the NetSurf web
-  browser (GTK 3). Firefox is on its way: `pkg install firefox` sets it
-  up for MayOS (one process, software drawing, no sandbox); give the VM
-  2 GB of RAM or more and about 1 GB of free disk. Programs with windows use MayOS's built-in **Wayland
+  browser (GTK 3). `pkg install firefox` then `firefox` runs Mozilla
+  Firefox (software WebRender, no sandbox; the first start takes a
+  while). A D-Bus session bus (Alpine's `dbus-daemon`) starts on its own
+  for Linux programs. Give the VM 2 GB of RAM or more and about 1 GB of
+  free disk. Firefox's `libEGL missing` / `No GPUs detected via PCI`
+  messages are expected: there is no GPU driver for Linux programs, so it
+  draws in software. Programs with windows use MayOS's built-in **Wayland
   compositor** (`wl_shm`, `xdg_shell`, keyboard and pointer), so GTK and
   SDL programs appear as normal MayOS windows. Needs about 150 MB of
   disk for NetSurf.

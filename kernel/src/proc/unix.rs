@@ -52,6 +52,16 @@ impl Queue {
         self.data.len()
     }
 
+    /// Bytes (and descriptor batches) ever queued: grows with each write.
+    pub fn written(&self) -> u64 {
+        self.head + self.data.len() as u64 + self.fds.len() as u64
+    }
+
+    /// Copy up to `max` bytes without taking them (MSG_PEEK).
+    pub fn peek(&self, max: usize) -> Vec<u8> {
+        self.data.iter().take(max).copied().collect()
+    }
+
     /// Take up to `max` bytes and the descriptors that came with them.
     pub fn pop(&mut self, max: usize) -> (Vec<u8>, Vec<DescRef>) {
         let n = max.min(self.data.len());
@@ -367,11 +377,13 @@ pub fn shm_names() -> Vec<String> {
 pub struct EventFd {
     pub count: Spin<u64>,
     pub semaphore: bool,
+    /// Number of writes (edge-triggered epoll sees each one).
+    pub writes: core::sync::atomic::AtomicU64,
 }
 
 impl EventFd {
     pub fn new(init: u64, semaphore: bool) -> Arc<EventFd> {
-        Arc::new(EventFd { count: Spin::new(init), semaphore })
+        Arc::new(EventFd { count: Spin::new(init), semaphore, writes: core::sync::atomic::AtomicU64::new(0) })
     }
 
     /// Non-blocking read: the value (or 1 in semaphore mode).
@@ -389,6 +401,7 @@ impl EventFd {
     }
 
     pub fn add(&self, v: u64) {
+        self.writes.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut c = self.count.lock();
         *c = c.saturating_add(v).min(u64::MAX - 1);
     }
@@ -405,6 +418,8 @@ pub struct Interest {
     pub desc: DescRef,
     /// EPOLLONESHOT already fired.
     pub disabled: bool,
+    /// EPOLLET: readiness and write count when last reported.
+    pub last: (u32, u64),
 }
 
 pub struct Epoll {

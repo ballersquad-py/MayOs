@@ -88,6 +88,8 @@ impl Region {
 
 pub struct Pipe {
     buf: Spin<VecDeque<u8>>,
+    /// Bytes ever written (for edge-triggered epoll).
+    written: core::sync::atomic::AtomicU64,
     writers: core::sync::atomic::AtomicUsize,
     readers: core::sync::atomic::AtomicUsize,
 }
@@ -185,6 +187,7 @@ pub struct LinuxState {
 
 impl Drop for Desc {
     fn drop(&mut self) {
+        NONBLOCK.lock().remove(&(self as *const Desc as usize));
         match self {
             Desc::File { path, data: Some(d), dirty: true, .. } => {
                 let _ = fs::write_file(path, d);
@@ -211,6 +214,60 @@ impl Drop for Desc {
 const INTERP_BASE: u64 = 0x0000_7f00_0000_0000;
 
 fn default_env(cwd: &str) -> Vec<String> {
+    let mut env = base_env(cwd);
+    if fs::exists(DBUS_DAEMON) {
+        env.push(alloc::format!("DBUS_SESSION_BUS_ADDRESS=unix:path={}", SESSION_BUS));
+    }
+    env
+}
+
+const DBUS_DAEMON: &str = "/usr/bin/dbus-daemon";
+const SESSION_BUS: &str = "/run/dbus-session";
+
+/// Start a D-Bus session bus (Alpine's dbus-daemon) for Linux programs,
+/// if it is installed and not running yet. GTK programs and Firefox look
+/// for one; without it GLib tries to "autolaunch" through X11.
+pub fn ensure_session_bus() {
+    static STARTED_AT: Spin<u64> = Spin::new(0);
+    if unix::is_bound(SESSION_BUS) || !fs::exists(DBUS_DAEMON) {
+        return;
+    }
+    {
+        let mut t = STARTED_AT.lock();
+        let now = crate::time::uptime_ms();
+        if *t != 0 && now - *t < 10_000 {
+            return; // being started
+        }
+        *t = now;
+    }
+    let _ = fs::create_dir("/run");
+    // Our own configuration: a session bus without activatable services
+    // (their launchers, like the accessibility bus, are not useful here,
+    // and a lookup then fails at once instead of timing out).
+    let conf = alloc::format!(
+        "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+         <busconfig>\n  <type>session</type>\n  <listen>unix:path={}</listen>\n  <auth>EXTERNAL</auth>\n\
+         \x20 <policy context=\"default\">\n    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n</busconfig>\n",
+        SESSION_BUS
+    );
+    let conf_path = "/run/dbus-session.conf";
+    if fs::write_file(conf_path, conf.as_bytes()).is_err() {
+        return;
+    }
+    let args = alloc::format!("--config-file={} --nofork --nopidfile --nosyslog", conf_path);
+    if super::process::spawn(DBUS_DAEMON, &args, "/", super::process::Console::new()).is_err() {
+        return;
+    }
+    // Give it a moment to start listening.
+    for _ in 0..300 {
+        if unix::is_bound(SESSION_BUS) {
+            return;
+        }
+        sched::sleep_ms(10);
+    }
+}
+
+fn base_env(cwd: &str) -> Vec<String> {
     alloc::vec![
         String::from("PATH=/bin:/usr/bin:/sbin:/usr/sbin"),
         String::from("HOME=/home"),
@@ -421,11 +478,6 @@ pub fn fault_in(addr: u64, write: bool) -> bool {
                 n += got as usize;
             }
         }
-        // Another thread may have brought the page in meanwhile.
-        if paging::translate(p.pml4(), page).is_some() {
-            pmm::free_frame(f);
-            return true;
-        }
     }
     let mut flags = USER;
     if r.writable {
@@ -433,6 +485,15 @@ pub fn fault_in(addr: u64, write: bool) -> bool {
     }
     if !r.exec {
         flags |= NO_EXECUTE;
+    }
+    // Faults run with interrupts on, so another thread may have brought
+    // the page in meanwhile (and already written to it): check and map
+    // as one step, or its data would be replaced by our fresh page.
+    static FAULT_LOCK: Spin<()> = Spin::new(());
+    let _g = FAULT_LOCK.lock();
+    if paging::translate(p.pml4(), page).is_some() {
+        pmm::free_frame(f);
+        return true;
     }
     if paging::map(p.pml4(), page, f, flags).is_err() {
         pmm::free_frame(f);
@@ -907,6 +968,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
         }
         Desc::PipeRead(pipe) => {
             let pipe = pipe.clone();
+            let nb = is_nonblock(&g);
             drop(g);
             loop {
                 {
@@ -921,6 +983,12 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 }
                 if pipe.writers.load(Ordering::Relaxed) == 0 {
                     return 0;
+                }
+                if nb {
+                    return -EAGAIN;
+                }
+                if signal::interrupted(p) {
+                    return -EINTR;
                 }
                 sched::sleep_ms(2);
             }
@@ -1052,7 +1120,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             if n == 0 && !data.is_empty() { -28 } else { n as i64 } // ENOSPC
         }
         Desc::Input { .. } => data.len() as i64,
-        Desc::Unix { ep: Some(ep), nonblock, .. } => unix_send(ep, *nonblock, data, Vec::new()),
+        Desc::Unix { ep: Some(ep), nonblock, .. } => unix_send_flags(ep, *nonblock, data, Vec::new(), 0),
         Desc::Unix { .. } => -ENOTCONN,
         Desc::Memfd { shm, pos } => {
             let n = shm.write_at(*pos, data);
@@ -1079,9 +1147,10 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
         Desc::Udp { .. } => -107,
         Desc::PipeWrite(pipe) => {
             if pipe.readers.load(Ordering::Relaxed) == 0 {
-                return -EPIPE;
+                return epipe(p, 0);
             }
             pipe.buf.lock().extend(data.iter().copied());
+            pipe.written.fetch_add(data.len() as u64, Ordering::Relaxed);
             data.len() as i64
         }
         Desc::PipeRead(_) => -EBADF,
@@ -1241,7 +1310,7 @@ fn sys_dup(p: &Process, fd: i64, to: Option<i64>, min: usize) -> i64 {
 }
 
 fn sys_pipe(p: &Process, ptr: u64) -> i64 {
-    let pipe = Arc::new(Pipe { buf: Spin::new(VecDeque::new()), writers: 1.into(), readers: 1.into() });
+    let pipe = Arc::new(Pipe { buf: Spin::new(VecDeque::new()), written: 0.into(), writers: 1.into(), readers: 1.into() });
     let r = add_fd(p, Desc::PipeRead(pipe.clone()));
     let w = add_fd(p, Desc::PipeWrite(pipe));
     if !usermem::write_u32(p.pml4(), ptr, r as u32) || !usermem::write_u32(p.pml4(), ptr + 4, w as u32) {
@@ -1443,12 +1512,31 @@ fn write_sockaddr_un(p: &Process, ptr: u64, lenp: u64, path: &str) -> bool {
 }
 
 /// Wait for bytes on a Unix socket's queue.
+const MSG_PEEK: u64 = 0x2;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_NOSIGNAL: u64 = 0x4000;
+const SIGPIPE: u64 = 13;
+
+/// EPIPE, with SIGPIPE unless the caller asked for none.
+fn epipe(p: &Process, flags: u64) -> i64 {
+    if flags & MSG_NOSIGNAL == 0 {
+        signal::raise_current(p, SIGPIPE);
+    }
+    -EPIPE
+}
+
 fn unix_wait(rx: &unix::QueueRef, max: usize, nonblock: bool) -> Result<(Vec<u8>, Vec<DescRef>), i64> {
+    unix_recv(None, rx, max, nonblock, false)
+}
+
+/// Receive from a Unix socket queue: waits unless `nonblock`, returns
+/// EINTR for a signal, and leaves the data in place for MSG_PEEK.
+fn unix_recv(p: Option<&Process>, rx: &unix::QueueRef, max: usize, nonblock: bool, peek: bool) -> Result<(Vec<u8>, Vec<DescRef>), i64> {
     loop {
         {
             let mut q = rx.lock();
             if !q.is_empty() {
-                return Ok(q.pop(max));
+                return Ok(if peek { (q.peek(max), Vec::new()) } else { q.pop(max) });
             }
             if q.closed {
                 return Ok((Vec::new(), Vec::new()));
@@ -1457,17 +1545,37 @@ fn unix_wait(rx: &unix::QueueRef, max: usize, nonblock: bool) -> Result<(Vec<u8>
         if nonblock {
             return Err(-EAGAIN);
         }
+        let interrupted = match p {
+            Some(p) => signal::interrupted(p),
+            None => sched::current_process().is_some_and(|p| signal::interrupted(&p)),
+        };
+        if interrupted {
+            return Err(-EINTR);
+        }
         sched::sleep_ms(1);
     }
 }
 
-fn unix_send(ep: &Endpoint, nonblock: bool, data: &[u8], mut fds: Vec<DescRef>) -> i64 {
+fn unix_send(ep: &Endpoint, nonblock: bool, data: &[u8], fds: Vec<DescRef>) -> i64 {
+    unix_send_flags(ep, nonblock, data, fds, MSG_NOSIGNAL)
+}
+
+fn unix_send_flags(ep: &Endpoint, nonblock: bool, data: &[u8], mut fds: Vec<DescRef>, flags: u64) -> i64 {
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     loop {
         match ep.send(data, core::mem::take(&mut fds)) {
-            None => return -EPIPE,
+            None => {
+                return match sched::current_process() {
+                    Some(p) => epipe(&p, flags),
+                    None => -EPIPE,
+                };
+            }
             Some(0) if !data.is_empty() => {
                 if nonblock {
                     return -EAGAIN;
+                }
+                if sched::current_process().is_some_and(|p| signal::interrupted(&p)) {
+                    return -EINTR;
                 }
                 sched::sleep_ms(1);
             }
@@ -1617,7 +1725,7 @@ fn sys_accept(p: &Process, fd: i64, ptr: u64, lenptr: u64, flags: u64) -> i64 {
     r
 }
 
-fn sys_sendto(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alen: u64) -> i64 {
+fn sys_sendto(p: &Process, fd: i64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     let Some(data) = usermem::read_bytes(p.pml4(), buf, len) else { return -EFAULT };
     if addr != 0 {
@@ -1630,10 +1738,16 @@ fn sys_sendto(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alen: u64) ->
             return len as i64;
         }
     }
+    {
+        let g = d.lock();
+        if let Desc::Unix { ep: Some(ep), nonblock, .. } = &*g {
+            return unix_send_flags(ep, *nonblock, &data, Vec::new(), flags);
+        }
+    }
     write_desc(p, &d, &data)
 }
 
-fn sys_recvfrom(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alenp: u64) -> i64 {
+fn sys_recvfrom(p: &Process, fd: i64, buf: u64, len: u64, flags: u64, addr: u64, alenp: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     let udp = match &*d.lock() {
         Desc::Udp { port, nonblock, .. } => Some((*port, *nonblock)),
@@ -1652,6 +1766,25 @@ fn sys_recvfrom(p: &Process, fd: i64, buf: u64, len: u64, addr: u64, alenp: u64)
             None => -EAGAIN,
         };
     }
+    let unix = match &*d.lock() {
+        Desc::Unix { ep: Some(ep), nonblock, .. } => Some((ep.rx.clone(), *nonblock)),
+        _ => None,
+    };
+    if let Some((rx, nb)) = unix {
+        let r = unix_recv(Some(p), &rx, (len as usize).min(4 << 20), nb || flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0);
+        return match r {
+            Ok((bytes, _fds)) => {
+                if !usermem::write_bytes(p.pml4(), buf, &bytes) {
+                    return -EFAULT;
+                }
+                if alenp != 0 {
+                    usermem::write_u32(p.pml4(), alenp, 0);
+                }
+                bytes.len() as i64
+            }
+            Err(e) => e,
+        };
+    }
     sys_read(p, fd, buf, len)
 }
 
@@ -1664,7 +1797,7 @@ fn msghdr(p: &Process, ptr: u64) -> Option<(u64, u64, Vec<(u64, u64)>)> {
     Some((name, namelen, iovecs(p, iov, iovlen)?))
 }
 
-fn sys_sendmsg(p: &Process, fd: i64, ptr: u64) -> i64 {
+fn sys_sendmsg(p: &Process, fd: i64, ptr: u64, flags: u64) -> i64 {
     let Some((name, namelen, vecs)) = msghdr(p, ptr) else { return -EFAULT };
     let mut data = Vec::new();
     for (b, l) in vecs {
@@ -1706,7 +1839,7 @@ fn sys_sendmsg(p: &Process, fd: i64, ptr: u64) -> i64 {
         }
         let g = d.lock();
         return match &*g {
-            Desc::Unix { ep: Some(ep), nonblock, .. } => unix_send(ep, *nonblock, &data, fds),
+            Desc::Unix { ep: Some(ep), nonblock, .. } => unix_send_flags(ep, *nonblock, &data, fds, flags),
             _ => -ENOTCONN,
         };
     }
@@ -1733,9 +1866,8 @@ fn sys_recvmsg(p: &Process, fd: i64, ptr: u64, flags: u64) -> i64 {
         _ => None,
     };
     if let Some((rx, nb)) = unix_rx {
-        const MSG_DONTWAIT: u64 = 0x40;
         const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
-        let (data, fds) = match unix_wait(&rx, total.min(4 << 20) as usize, nb || flags & MSG_DONTWAIT != 0) {
+        let (data, fds) = match unix_recv(Some(p), &rx, total.min(4 << 20) as usize, nb || flags & MSG_DONTWAIT != 0, flags & MSG_PEEK != 0) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -1872,6 +2004,7 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
     const POLLIN: u16 = 1;
     const POLLOUT: u16 = 4;
     const POLLHUP: u16 = 0x10;
+    const POLLERR: u16 = 8;
     let Some(g) = d.try_lock() else { return 0 };
     let mut hup = false;
     let (r, w) = match &*g {
@@ -1884,7 +2017,13 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
             hup = pp.writers.load(Ordering::Relaxed) == 0;
             (!pp.buf.lock().is_empty() || hup, false)
         }
-        Desc::PipeWrite(_) => (false, true),
+        Desc::PipeWrite(pp) => {
+            // No reader left: POLLERR, like Linux.
+            if pp.readers.load(Ordering::Relaxed) == 0 {
+                return POLLERR | if events & POLLOUT != 0 { POLLOUT } else { 0 };
+            }
+            (false, true)
+        }
         Desc::Input { screen, kind, .. } => (screen::has_input(screen, *kind), true),
         Desc::Unix { ep: Some(ep), .. } => {
             hup = ep.hung_up();
@@ -1936,7 +2075,7 @@ fn sys_epoll_ctl(p: &Process, epfd: i64, op: u64, fd: i32, evp: u64) -> i64 {
                 return -EEXIST;
             }
             let Some(desc) = get_fd(p, fd as i64) else { return -EBADF };
-            list.push(unix::Interest { fd, events, data, desc, disabled: false });
+            list.push(unix::Interest { fd, events, data, desc, disabled: false, last: (0, 0) });
             0
         }
         2 => match pos {
@@ -1951,6 +2090,7 @@ fn sys_epoll_ctl(p: &Process, epfd: i64, op: u64, fd: i32, evp: u64) -> i64 {
                 list[i].events = events;
                 list[i].data = data;
                 list[i].disabled = false;
+                list[i].last = (0, 0);
                 0
             }
             None => -ENOENT,
@@ -1972,22 +2112,50 @@ fn sys_epoll_wait(p: &Process, epfd: i64, out: u64, max: i32, timeout_ms: i64) -
     }
     let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
     loop {
-        let items: Vec<(usize, DescRef, u32, u64)> =
-            ep.list.lock().iter().enumerate().filter(|(_, i)| !i.disabled).map(|(k, i)| (k, i.desc.clone(), i.events, i.data)).collect();
+        let items: Vec<(usize, DescRef, u32, u64, (u32, u64))> =
+            ep.list.lock().iter().enumerate().filter(|(_, i)| !i.disabled).map(|(k, i)| (k, i.desc.clone(), i.events, i.data, i.last)).collect();
         let mut buf = Vec::new();
         let mut fired = Vec::new();
-        for (k, d, events, data) in items {
+        let mut seen: Vec<(usize, (u32, u64))> = Vec::new();
+        for (k, d, events, data, last) in items {
             if buf.len() / 12 >= max as usize {
                 break;
             }
             // EPOLLIN 1, EPOLLOUT 4, EPOLLERR 8, EPOLLHUP 0x10, EPOLLRDHUP 0x2000
-            let rev = desc_ready(p, &d, (events & 0xffff) as u16 | 0x18) as u32;
+            let mut rev = desc_ready(p, &d, (events & 0xffff) as u16 | 0x18) as u32;
+            // EPOLLRDHUP: the peer closed (reported with EPOLLHUP here).
+            if rev & 0x10 != 0 {
+                rev |= 0x2000;
+            }
             let rev = rev & (events | 0x18);
+            const EPOLLET: u32 = 1 << 31;
+            if events & EPOLLET != 0
+                && let Some(writes) = write_count(&d)
+            {
+                // Edge-triggered: only when readiness appears or new data
+                // arrives since the last report. (Descriptors without a
+                // write count stay level-triggered: never a missed event.)
+                let now = (rev, writes);
+                if now != last {
+                    seen.push((k, now));
+                }
+                if rev == 0 || rev & !last.0 == 0 && writes == last.1 {
+                    continue;
+                }
+            }
             if rev != 0 {
                 buf.extend_from_slice(&rev.to_le_bytes());
                 buf.extend_from_slice(&data.to_le_bytes());
                 if events & (1 << 30) != 0 {
                     fired.push(k); // EPOLLONESHOT
+                }
+            }
+        }
+        if !seen.is_empty() {
+            let mut list = ep.list.lock();
+            for (k, now) in seen {
+                if let Some(i) = list.get_mut(k) {
+                    i.last = now;
                 }
             }
         }
@@ -2078,9 +2246,10 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
     match cmd {
         0 | 9 => {
             // FUTEX_WAIT(_BITSET)
-            let Some(b) = usermem::read_bytes(p.pml4(), addr, 4) else { return -EFAULT };
-            if u32::from_le_bytes(b.try_into().unwrap()) != val as u32 {
-                return -EAGAIN;
+            // Bring the page in first (that may sleep), then compare and
+            // queue under the futex lock so a wake in between is not lost.
+            if usermem::read_bytes(p.pml4(), addr, 4).is_none() {
+                return -EFAULT;
             }
             let deadline = match timespec_ms(p, tptr) {
                 Some(ms) if cmd == 9 => {
@@ -2092,7 +2261,14 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 None => u64::MAX,
             };
             let woken = Arc::new(AtomicBool::new(false));
-            FUTEX.lock().push(Waiter { pml4: p.pml4(), addr, woken: woken.clone() });
+            {
+                let mut q = FUTEX.lock();
+                let Some(b) = usermem::read_bytes(p.pml4(), addr, 4) else { return -EFAULT };
+                if u32::from_le_bytes(b.try_into().unwrap()) != val as u32 {
+                    return -EAGAIN;
+                }
+                q.push(Waiter { pml4: p.pml4(), addr, woken: woken.clone() });
+            }
             loop {
                 if woken.load(Ordering::Acquire) {
                     return 0;
@@ -2228,6 +2404,7 @@ fn sys_uname(p: &Process, ptr: u64) -> i64 {
 /// Log every Linux system call to the serial port (`linuxtrace on`).
 pub static TRACE: AtomicBool = AtomicBool::new(false);
 
+
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
     let mut exited = syscall_inner(p, f);
@@ -2235,7 +2412,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         exited = signal::deliver(p, f);
     }
     if TRACE.load(Ordering::Relaxed) {
-        crate::kprintln!("[{}] sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {}", p.pid, nr, args[0], args[1], args[2], args[3], f.rax as i64);
+        crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], f.rax as i64);
     }
     exited
 }
@@ -2314,13 +2491,13 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             0x5421 => {
                 // FIONBIO
                 let on = usermem::read_bytes(pml4, a2, 4).map(|b| b != [0, 0, 0, 0]).unwrap_or(false);
-                if let Some(d) = get_fd(p, a0 as i64) {
-                    match &mut *d.lock() {
-                        Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } => *nonblock = on,
-                        _ => {}
+                match get_fd(p, a0 as i64) {
+                    Some(d) => {
+                        set_nonblock(&mut d.lock(), on);
+                        0
                     }
+                    None => -EBADF,
                 }
-                0
             }
             _ => device_ioctl(p, a0 as i64, a1, a2),
         },
@@ -2337,7 +2514,29 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             0
         }
         25 => sys_mremap(p, a0, a1, a2, a3),
-        28 => 0,       // madvise
+        28 => {
+            // madvise: MADV_DONTNEED / MADV_REMOVE drop the pages, which then
+            // read back as zeros (or from the file) like on Linux. Allocators
+            // (Scudo, jemalloc) rely on this.
+            if matches!(a2, 4 | 9) && a0 & (PAGE_SIZE - 1) == 0 {
+                let end = a0 + a1.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+                let regions = linux(p).map(|l| l.regions.lock().clone()).unwrap_or_default();
+                let mut a = a0;
+                while a < end {
+                    // Only pages that come back on the next touch; shared
+                    // memory keeps its pages.
+                    let demand = regions.iter().any(|r| a >= r.start && a < r.end);
+                    let borrowed = paging::translate(p.pml4(), a).is_some_and(|(_, e)| e & paging::BORROWED != 0);
+                    if demand && !borrowed
+                        && let Some(f) = paging::unmap(p.pml4(), a)
+                    {
+                        pmm::free_frame(f);
+                    }
+                    a += PAGE_SIZE;
+                }
+            }
+            0
+        }
         32 => sys_dup(p, a0 as i64, None, 0),
         33 => sys_dup(p, a0 as i64, Some(a1 as i64), 0),
         35 => match timespec_ms(p, a0) {
@@ -2348,9 +2547,9 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         41 => sys_socket(p, a0, a1),
         42 => sys_connect(p, a0 as i64, a1, a2),
         43 => sys_accept(p, a0 as i64, a1, a2, 0),
-        44 => sys_sendto(p, a0 as i64, a1, a2, a4, a5),
-        45 => sys_recvfrom(p, a0 as i64, a1, a2, a4, a5),
-        46 => sys_sendmsg(p, a0 as i64, a1),
+        44 => sys_sendto(p, a0 as i64, a1, a2, a3, a4, a5),
+        45 => sys_recvfrom(p, a0 as i64, a1, a2, a3, a4, a5),
+        46 => sys_sendmsg(p, a0 as i64, a1, a2),
         47 => sys_recvmsg(p, a0 as i64, a1, a2),
         48 => {
             // shutdown: the peer sees end of file once the writing side goes.
@@ -2374,16 +2573,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let cred: Vec<u8> = [p.pid as u32, 1000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect();
             if usermem::write_bytes(pml4, a3, &cred) && usermem::write_u32(pml4, a4, 12) { 0 } else { -EFAULT }
         }
-        55 => {
-            // getsockopt: report "no error" / zero.
-            if a3 != 0 {
-                usermem::write_u32(pml4, a3, 0);
-            }
-            if a4 != 0 {
-                usermem::write_u32(pml4, a4, 4);
-            }
-            0
-        }
+        55 => sys_getsockopt(p, a0 as i64, a1, a2, a3, a4),
         56 => sys_clone(p, f),
         57 => sys_fork(p, f, 0, 0, 0, 0, 0),
         58 => sys_fork(p, f, 0x4000, 0, 0, 0, 0), // vfork
@@ -2474,26 +2664,30 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     0
                 }
                 3 => match get_fd(p, a0 as i64) {
-                    Some(d) => match &*d.lock() {
-                        Desc::Tcp { nonblock: true, .. } | Desc::Udp { nonblock: true, .. } | Desc::Input { nonblock: true, .. } => 2 | O_NONBLOCK as i64,
-                        Desc::File { writable: true, .. } => 2,
-                        _ => 2,
-                    },
+                    // F_GETFL
+                    Some(d) => {
+                        let g = d.lock();
+                        let mode = match &*g {
+                            Desc::File { writable: false, .. } | Desc::PipeRead(_) | Desc::Dir { .. } | Desc::Virtual { .. } => 0,
+                            Desc::PipeWrite(_) => 1,
+                            _ => 2,
+                        };
+                        mode | if is_nonblock(&g) { O_NONBLOCK as i64 } else { 0 }
+                    }
                     None => -EBADF,
                 },
                 5 | 36 => {
                     // F_GETLK / F_OFD_GETLK: nobody else holds a lock.
                     if usermem::write_bytes(pml4, a2, &2u16.to_le_bytes()) { 0 } else { -EFAULT }
                 }
-                4 => {
-                    if let Some(d) = get_fd(p, a0 as i64) {
-                        match &mut *d.lock() {
-                            Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } => *nonblock = a2 & O_NONBLOCK != 0,
-                            _ => {}
-                        }
+                4 => match get_fd(p, a0 as i64) {
+                    // F_SETFL: O_NONBLOCK is the flag that matters
+                    Some(d) => {
+                        set_nonblock(&mut d.lock(), a2 & O_NONBLOCK != 0);
+                        0
                     }
-                    0
-                }
+                    None => -EBADF,
+                },
                 _ => 0,
             }
         }
@@ -2631,6 +2825,16 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     sched::set_fs_base(a1);
                     0
                 }
+                0x1001 => {
+                    // ARCH_SET_GS (Firefox's wasm sandboxes address memory through GS)
+                    if a1 >= 0x0000_8000_0000_0000 {
+                        -EPERM
+                    } else {
+                        sched::set_gs_base(a1);
+                        0
+                    }
+                }
+                0x1004 => if usermem::write_u64(pml4, a1, sched::gs_base()) { 0 } else { -EFAULT }, // ARCH_GET_GS
                 0x1003 => {
                     let v = unsafe { crate::arch::cpu::rdmsr(crate::arch::cpu::MSR_FS_BASE) };
                     if usermem::write_u64(pml4, a1, v) { 0 } else { -EFAULT }
@@ -2766,6 +2970,15 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         293 => {
             let r = sys_pipe(p, a0);
+            if r == 0 && a1 & O_NONBLOCK != 0
+                && let Some(b) = usermem::read_bytes(pml4, a0, 8)
+            {
+                for k in [0usize, 4] {
+                    if let Some(d) = get_fd(p, u32::from_le_bytes(b[k..k + 4].try_into().unwrap()) as i64) {
+                        set_nonblock(&mut d.lock(), true);
+                    }
+                }
+            }
             if r == 0 && a1 & O_CLOEXEC != 0
                 && let (Some(l), Some(b)) = (linux(p), usermem::read_bytes(pml4, a0, 8))
             {
@@ -2813,6 +3026,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             0
         }
         40 => sys_sendfile(p, a0 as i64, a1 as i64, a2, a3),
+        187 => 0, // readahead
         73 => if get_fd(p, a0 as i64).is_some() { 0 } else { -EBADF }, // flock: one user
         76 => match path_at(p, -100, a0) {
             // truncate(path, length)
@@ -2949,7 +3163,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             // sendmmsg(fd, msgvec, n, flags): struct mmsghdr is 64 bytes
             let mut sent = 0;
             for i in 0..a2.min(1024) {
-                let r = sys_sendmsg(p, a0 as i64, a1 + i * 64);
+                let r = sys_sendmsg(p, a0 as i64, a1 + i * 64, a3);
                 if r < 0 {
                     if sent == 0 {
                         sent = r;
@@ -3663,4 +3877,70 @@ fn proc_file(p: &Process, path: &str) -> Option<Desc> {
         _ => return None,
     };
     Some(Desc::Virtual { data: text.into_bytes(), pos: 0 })
+}
+
+/// getsockopt: the values programs check (Firefox's IPC insists on a
+/// positive SO_SNDBUF; GLib reads SO_PEERCRED).
+fn sys_getsockopt(p: &Process, fd: i64, level: u64, name: u64, val: u64, lenp: u64) -> i64 {
+    let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let (domain, ty) = match &*d.lock() {
+        Desc::Unix { .. } => (1u32, 1u32),
+        Desc::Tcp { .. } => (2, 1),
+        Desc::Udp { .. } => (2, 2),
+        _ => return -ENOTSOCK,
+    };
+    let v: Vec<u8> = match (level, name) {
+        (1, 17) => {
+            // SO_PEERCRED: struct ucred { pid, uid, gid }
+            [p.pid as u32, 1000, 1000].iter().flat_map(|x| x.to_le_bytes()).collect()
+        }
+        (1, 3) => ty.to_le_bytes().to_vec(),               // SO_TYPE
+        (1, 39) => domain.to_le_bytes().to_vec(),          // SO_DOMAIN
+        (1, 7) | (1, 8) => 212_992u32.to_le_bytes().to_vec(), // SO_SNDBUF / SO_RCVBUF
+        (1, 30) => 0u32.to_le_bytes().to_vec(),            // SO_ACCEPTCONN
+        _ => 0u32.to_le_bytes().to_vec(),                  // SO_ERROR and the rest
+    };
+    let Some(len) = (if lenp != 0 { usermem::read_bytes(p.pml4(), lenp, 4) } else { None }) else { return -EFAULT };
+    let room = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    let n = room.min(v.len());
+    if !usermem::write_bytes(p.pml4(), val, &v[..n]) || !usermem::write_u32(p.pml4(), lenp, n as u32) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// How much has been written to `d` so far (edge-triggered epoll).
+fn write_count(d: &DescRef) -> Option<u64> {
+    let g = d.try_lock()?;
+    match &*g {
+        Desc::EventFd { ev, .. } => Some(ev.writes.load(Ordering::Relaxed)),
+        Desc::PipeRead(p) => Some(p.written.load(Ordering::Relaxed)),
+        Desc::Unix { ep: Some(ep), .. } => Some(ep.rx.lock().written()),
+        _ => None,
+    }
+}
+
+/// O_NONBLOCK of descriptors without a flag of their own (pipes, files),
+/// by the address of their `Desc`.
+static NONBLOCK: Spin<alloc::collections::BTreeSet<usize>> = Spin::new(alloc::collections::BTreeSet::new());
+
+fn is_nonblock(d: &Desc) -> bool {
+    match d {
+        Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } | Desc::Unix { nonblock, .. } | Desc::EventFd { nonblock, .. } | Desc::TimerFd { nonblock, .. } => *nonblock,
+        _ => NONBLOCK.lock().contains(&(d as *const Desc as usize)),
+    }
+}
+
+fn set_nonblock(d: &mut Desc, on: bool) {
+    match d {
+        Desc::Tcp { nonblock, .. } | Desc::Udp { nonblock, .. } | Desc::Input { nonblock, .. } | Desc::Unix { nonblock, .. } | Desc::EventFd { nonblock, .. } | Desc::TimerFd { nonblock, .. } => *nonblock = on,
+        _ => {
+            let key = d as *const Desc as usize;
+            if on {
+                NONBLOCK.lock().insert(key);
+            } else {
+                NONBLOCK.lock().remove(&key);
+            }
+        }
+    }
 }

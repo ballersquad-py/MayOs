@@ -12,6 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
@@ -34,6 +39,94 @@ static void on_chld(int sig) { (void)sig; got_chld = 1; }
 static void on_segv(int sig) { (void)sig; siglongjmp(jb, 1); }
 
 static void *thread_fn(void *arg) { (void)arg; return (void *)42; }
+static volatile sig_atomic_t got_pipe;
+static void on_pipe(int s) { (void)s; got_pipe = 1; }
+static void on_usr2(int s) { (void)s; }
+static pthread_t main_thread;
+static void *kick(void *arg) { (void)arg; usleep(50000); pthread_kill(main_thread, SIGUSR2); return 0; }
+
+static void sockets(void) {
+    int sv[2];
+    char b[16];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+    CHECK((fcntl(sv[0], F_GETFL) & O_NONBLOCK) && read(sv[0], b, 1) == -1 && errno == EAGAIN, "unix O_NONBLOCK via fcntl");
+    CHECK(recv(sv[1], b, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN, "recv MSG_DONTWAIT");
+    int one = 1;
+    ioctl(sv[1], FIONBIO, &one);
+    CHECK(read(sv[1], b, 1) == -1 && errno == EAGAIN, "FIONBIO");
+    write(sv[1], "hello", 5);
+    CHECK(recv(sv[0], b, 5, MSG_PEEK) == 5 && read(sv[0], b, 16) == 5 && !memcmp(b, "hello", 5), "MSG_PEEK");
+
+    int pp[2];
+    pipe2(pp, O_NONBLOCK);
+    CHECK(read(pp[0], b, 1) == -1 && errno == EAGAIN, "pipe2 O_NONBLOCK");
+    int q[2];
+    pipe(q);
+    fcntl(q[0], F_SETFL, O_NONBLOCK);
+    CHECK(read(q[0], b, 1) == -1 && errno == EAGAIN && (fcntl(q[0], F_GETFL) & O_NONBLOCK), "pipe fcntl O_NONBLOCK");
+
+    // Listening socket, accept4(SOCK_NONBLOCK)
+    int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_un a = {0};
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, "/tmp/sigtest.sock");
+    unlink(a.sun_path);
+    bind(ls, (struct sockaddr *)&a, sizeof a);
+    listen(ls, 4);
+    CHECK(accept4(ls, 0, 0, SOCK_NONBLOCK) == -1 && errno == EAGAIN, "accept on nonblocking listener");
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    int s = accept4(ls, 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    CHECK(s >= 0 && read(s, b, 1) == -1 && errno == EAGAIN && (fcntl(s, F_GETFL) & O_NONBLOCK), "accept4 SOCK_NONBLOCK");
+
+    // epoll, level-triggered, on a Unix socket
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLRDHUP, .data.fd = s}, out[4];
+    epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev);
+    CHECK(epoll_wait(ep, out, 4, 0) == 0, "epoll: nothing yet");
+    write(c, "x", 1);
+    CHECK(epoll_wait(ep, out, 4, 1000) == 1 && (out[0].events & EPOLLIN), "epoll: unix socket readable");
+    CHECK(epoll_wait(ep, out, 4, 0) == 1, "epoll: level-triggered repeats");
+    read(s, b, 1);
+    close(c);
+    CHECK(epoll_wait(ep, out, 4, 1000) == 1 && (out[0].events & EPOLLRDHUP), "epoll: EPOLLRDHUP on peer close");
+
+    // epoll, edge-triggered, on an eventfd
+    int efd = eventfd(0, EFD_NONBLOCK);
+    struct epoll_event e2 = {.events = EPOLLIN | EPOLLET, .data.fd = efd};
+    int ep2 = epoll_create1(0);
+    epoll_ctl(ep2, EPOLL_CTL_ADD, efd, &e2);
+    uint64_t v = 1;
+    write(efd, &v, 8);
+    CHECK(epoll_wait(ep2, out, 4, 1000) == 1, "epoll ET: first write");
+    CHECK(epoll_wait(ep2, out, 4, 0) == 0, "epoll ET: no repeat without new data");
+    write(efd, &v, 8);
+    CHECK(epoll_wait(ep2, out, 4, 1000) == 1, "epoll ET: new write re-triggers");
+
+    // SIGPIPE / EPIPE
+    signal(SIGPIPE, on_pipe);
+    int r[2];
+    pipe(r);
+    close(r[0]);
+    CHECK(write(r[1], "x", 1) == -1 && errno == EPIPE && got_pipe, "SIGPIPE on a closed pipe");
+    got_pipe = 0;
+    CHECK(send(sv[0], "x", 1, MSG_NOSIGNAL) == 1 && !got_pipe, "send MSG_NOSIGNAL");
+    signal(SIGPIPE, SIG_DFL);
+
+    // EINTR from a blocking read
+    struct sigaction sa2 = {0};
+    sa2.sa_handler = on_usr2;
+    sigaction(SIGUSR2, &sa2, 0);
+    int bl[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, bl);
+    main_thread = pthread_self();
+    pthread_t k;
+    pthread_create(&k, 0, kick, 0);
+    CHECK(read(bl[0], b, 1) == -1 && errno == EINTR, "EINTR from a blocking read");
+    pthread_join(k, 0);
+    unlink(a.sun_path);
+}
 
 int main(int argc, char **argv) {
     int only = argc > 1 ? atoi(argv[1]) : 0;
@@ -162,6 +255,9 @@ int main(int argc, char **argv) {
     pf = open("/proc/self/maps", O_RDONLY);
     CHECK(pf >= 0 && read(pf, pb, 255) > 0 && strchr(pb, '-'), "/proc/self/maps");
 
+    }
+    PART(7) {
+    sockets();
     }
     // nanosleep interrupted by a signal from another process
     printf("%s\n", failures ? "SIGNALS FAILED" : "SIGNALS PASSED");

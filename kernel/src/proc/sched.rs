@@ -37,6 +37,8 @@ pub struct Thread {
     pub cpu_ms: u64,
     /// Thread-local storage pointer (FS base) of Linux threads.
     fs_base: u64,
+    /// GS base of Linux threads (arch_prctl ARCH_SET_GS).
+    gs_base: u64,
     fpu: Box<cpu::FpuState>,
     /// Linux `set_tid_address`/CLONE_CHILD_CLEARTID: zeroed and woken at exit.
     pub clear_child_tid: u64,
@@ -77,6 +79,7 @@ pub fn init() {
         pml4: crate::mem::paging::kernel_pml4(),
         cpu_ms: 0,
         fs_base: 0,
+        gs_base: 0,
         fpu: Box::new(cpu::fpu_initial()),
         clear_child_tid: 0,
     }));
@@ -128,6 +131,7 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         pml4,
         cpu_ms: 0,
         fs_base,
+        gs_base: 0,
         fpu: Box::new(fpu),
         clear_child_tid: 0,
     }));
@@ -141,7 +145,27 @@ pub fn spawn_user_frame(process: Arc<Process>, frame: idt::TrapFrame, fs_base: u
     // The child starts with the parent's floating-point state.
     let mut fpu = cpu::fpu_initial();
     cpu::fxsave(&mut fpu);
-    add_thread_with(&name, |_| frame, Some(process), fs_base, fpu)
+    let gs = gs_base();
+    let id = add_thread_with(&name, |_| frame, Some(process), fs_base, fpu);
+    // The new thread inherits the GS base.
+    let mut s = SCHED.lock();
+    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+        t.gs_base = gs;
+    }
+    id
+}
+
+/// Set the calling thread's GS base.
+pub fn set_gs_base(v: u64) {
+    let mut s = SCHED.lock();
+    let c = s.current;
+    s.threads[c].gs_base = v;
+    unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, v) };
+}
+
+pub fn gs_base() -> u64 {
+    let s = SCHED.lock();
+    s.threads[s.current].gs_base
 }
 
 /// Set the calling thread's FS base (thread-local storage).
@@ -292,6 +316,9 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         if s.threads[next].fs_base != s.threads[cur].fs_base {
             unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, s.threads[next].fs_base) };
         }
+        if s.threads[next].gs_base != s.threads[cur].gs_base {
+            unsafe { cpu::wrmsr(cpu::MSR_GS_BASE, s.threads[next].gs_base) };
+        }
     }
     s.current = next;
     s.slice_start = now;
@@ -369,7 +396,9 @@ pub fn switch_address_space(pml4: u64) {
     let c = s.current;
     s.threads[c].pml4 = pml4;
     s.threads[c].fs_base = 0;
+    s.threads[c].gs_base = 0;
     unsafe {
+        cpu::wrmsr(cpu::MSR_GS_BASE, 0);
         cpu::write_cr3(pml4);
         cpu::wrmsr(cpu::MSR_FS_BASE, 0);
     }

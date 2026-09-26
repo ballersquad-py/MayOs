@@ -191,6 +191,19 @@ pub fn send(t: &Arc<Process>, tid: Option<u64>, sig: u64, code: i32, from_pid: u
     }
 }
 
+/// Queue `sig` for the current thread (delivered on the way out of the
+/// system call, e.g. SIGPIPE after writing to a closed pipe).
+pub fn raise_current(p: &Process, sig: u64) {
+    let Some(st) = state(p) else { return };
+    let tid = sched::current_id();
+    let mut s = st.lock();
+    if matches!(disposition(&s, sig), Disposition::Ignore) {
+        return;
+    }
+    s.info[sig as usize - 1] = Info { code: SI_USER, value: p.pid };
+    s.thread(tid).pending |= bit(sig);
+}
+
 /// True if the current thread has a signal it should be interrupted for.
 pub fn interrupted(p: &Process) -> bool {
     let Some(st) = state(p) else { return false };

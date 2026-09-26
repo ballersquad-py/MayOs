@@ -82,6 +82,14 @@ pub fn job(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
 
 // --- index ---------------------------------------------------------------
 
+fn firefox_setup() {
+    for dir in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
+        if fs::exists(dir) {
+            firefox_prefs(dir);
+        }
+    }
+}
+
 /// Defaults that suit MayOS: one process, software drawing, no sandbox,
 /// no telemetry or updates.
 fn firefox_prefs(dir: &str) {
@@ -104,6 +112,8 @@ pref("app.update.enabled", false);
 pref("toolkit.telemetry.enabled", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);
 pref("browser.sessionstore.resume_from_crash", false);
+// No accessibility bus: MayOS has no D-Bus session (and no screen reader).
+pref("accessibility.force_disabled", 1);
 "#;
     let pdir = format!("{}/defaults/pref", dir);
     let _ = mkdirs(&pdir);
@@ -238,7 +248,7 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
     // Things GTK programs need at run time but do not list.
-    let extras = [("fontconfig", "font-dejavu"), ("gdk-pixbuf", "shared-mime-info"), ("gtk+3.0", "gsettings-desktop-schemas"), ("gtk+3.0", "hicolor-icon-theme")];
+    let extras = [("fontconfig", "font-dejavu"), ("gdk-pixbuf", "shared-mime-info"), ("gtk+3.0", "gsettings-desktop-schemas"), ("gtk+3.0", "hicolor-icon-theme"), ("firefox", "dbus"), ("firefox-esr", "dbus")];
     while let Some(n) = want.pop() {
         let dep = n.trim_start_matches('!');
         if n.starts_with('!') {
@@ -279,6 +289,8 @@ fn install(names: &[&str], c: &Console, cancel: &AtomicBool) -> Result<(), Strin
     let todo: Vec<&Pkg> = all.iter().map(|n| &idx.pkgs[n]).filter(|p| have.get(&p.name) != Some(&p.version)).collect();
     if todo.is_empty() {
         say(c, "Everything is already installed.\n");
+        // Refresh the MayOS settings of an existing Firefox.
+        firefox_setup();
         return Ok(());
     }
     let total: u64 = todo.iter().map(|p| p.size).sum();
@@ -351,11 +363,7 @@ fn install(names: &[&str], c: &Console, cancel: &AtomicBool) -> Result<(), Strin
     }
     say(c, "Done.\n");
     let hint: Vec<String> = names.iter().filter_map(|n| idx.pkgs.get(*n)).map(|p| p.name.clone()).collect();
-    for dir in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
-        if fs::exists(dir) {
-            firefox_prefs(dir);
-        }
-    }
+    firefox_setup();
     if hint.iter().any(|n| n.starts_with("firefox")) {
         say(c, "Start Firefox with: firefox  (first start takes a while)\n");
     }

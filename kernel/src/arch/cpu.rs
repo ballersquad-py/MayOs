@@ -124,6 +124,7 @@ pub const MSR_LSTAR: u32 = 0xc000_0082;
 pub const MSR_SFMASK: u32 = 0xc000_0084;
 
 pub const MSR_FS_BASE: u32 = 0xc000_0100;
+pub const MSR_GS_BASE: u32 = 0xc000_0101;
 
 /// Saved x87/SSE register state (`fxsave` format).
 #[repr(C, align(16))]
