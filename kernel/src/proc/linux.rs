@@ -2136,6 +2136,19 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 }
                 _ => -ENOTTY,
             },
+            0x541b => {
+                // FIONREAD: bytes waiting
+                let n = match get_fd(p, a0 as i64) {
+                    Some(d) => match &*d.lock() {
+                        Desc::Unix { ep: Some(ep), .. } => ep.rx.lock().len(),
+                        Desc::PipeRead(pp) => pp.buf.lock().len(),
+                        Desc::Console => p.console.has_input() as usize,
+                        _ => 0,
+                    },
+                    None => usize::MAX,
+                };
+                if n == usize::MAX { -EBADF } else if usermem::write_u32(pml4, a2, n as u32) { 0 } else { -EFAULT }
+            }
             0x5421 => {
                 // FIONBIO
                 let on = usermem::read_bytes(pml4, a2, 4).map(|b| b != [0, 0, 0, 0]).unwrap_or(false);
