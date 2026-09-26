@@ -518,6 +518,10 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {}", t.id, pid, state, t.cpu_ms, t.name);
             }
         }
+        "sysprof" => {
+            // Where Linux programs spend kernel time; "sysprof reset" clears.
+            let _ = write!(out, "{}", crate::proc::linux::prof_report(args.first() == Some(&"reset")));
+        }
         "threads" => {
             // What every thread of a Linux program is doing right now.
             let filter = args.first().copied().unwrap_or("");

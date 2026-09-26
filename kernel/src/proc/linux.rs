@@ -464,6 +464,14 @@ fn linux(p: &Process) -> Option<&LinuxState> {
 /// Map a page of a demand region if `addr` is in one. Used by the page
 /// fault handler and by system calls touching user memory.
 pub fn fault_in(addr: u64, write: bool) -> bool {
+    let t0 = crate::time::uptime_us();
+    let r = fault_in_inner(addr, write);
+    PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    FAULT_US.fetch_add(crate::time::uptime_us().saturating_sub(t0), Ordering::Relaxed);
+    r
+}
+
+fn fault_in_inner(addr: u64, write: bool) -> bool {
     let Some(p) = sched::current_process() else { return false };
     let Some(l) = linux(&p) else { return false };
     let page = addr & !(PAGE_SIZE - 1);
@@ -2481,10 +2489,39 @@ fn sys_uname(p: &Process, ptr: u64) -> i64 {
 pub static TRACE: AtomicBool = AtomicBool::new(false);
 
 
+const PROF_N: usize = 512;
+static PROF_COUNT: [core::sync::atomic::AtomicU64; PROF_N] = [const { core::sync::atomic::AtomicU64::new(0) }; PROF_N];
+static PROF_US: [core::sync::atomic::AtomicU64; PROF_N] = [const { core::sync::atomic::AtomicU64::new(0) }; PROF_N];
+pub static PAGE_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FAULT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `sysprof`: per-syscall counts and total time since the last reset.
+pub fn prof_report(reset: bool) -> String {
+    let mut v: Vec<(u64, u64, usize)> = (0..PROF_N)
+        .map(|i| (PROF_US[i].load(Ordering::Relaxed), PROF_COUNT[i].load(Ordering::Relaxed), i))
+        .filter(|x| x.1 > 0).collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = alloc::format!("page faults {}  {} ms\n", PAGE_FAULTS.load(Ordering::Relaxed), FAULT_US.load(Ordering::Relaxed) / 1000);
+    for (us, n, i) in v.iter().take(14) {
+        out.push_str(&alloc::format!("{:<16} {:>8} calls {:>8} ms\n", syscall_name(*i as u64), n, us / 1000));
+    }
+    if reset {
+        for i in 0..PROF_N { PROF_US[i].store(0, Ordering::Relaxed); PROF_COUNT[i].store(0, Ordering::Relaxed); }
+        PAGE_FAULTS.store(0, Ordering::Relaxed); FAULT_US.store(0, Ordering::Relaxed);
+    }
+    out
+}
+
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
     sched::set_syscall(nr, f.rdi, f.rsi);
+    let t0 = crate::time::uptime_us();
     let mut exited = syscall_inner(p, f);
+    let dt = crate::time::uptime_us().saturating_sub(t0);
+    if (nr as usize) < PROF_N {
+        PROF_COUNT[nr as usize].fetch_add(1, Ordering::Relaxed);
+        PROF_US[nr as usize].fetch_add(dt, Ordering::Relaxed);
+    }
     sched::set_syscall(sched::NO_SYSCALL, 0, 0);
     if !exited && nr != 15 {
         exited = signal::deliver(p, f);
