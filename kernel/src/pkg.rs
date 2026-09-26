@@ -116,6 +116,18 @@ pref("accessibility.force_disabled", 1);
 pref("webgl.force-enabled", true);
 pref("webgl.disabled", false);
 pref("media.autoplay.blocking_policy", 0);
+// Speed: files are rewritten whole on MayOS, and drawing is in software.
+pref("browser.cache.disk.enable", false);
+pref("browser.cache.memory.enable", true);
+pref("browser.sessionstore.interval", 600000);
+pref("layout.frame_rate", 30);
+pref("general.smoothScroll", false);
+pref("toolkit.cosmeticAnimations.enabled", false);
+pref("ui.prefersReducedMotion", 1);
+pref("network.prefetch-next", false);
+pref("browser.newtabpage.activity-stream.feeds.topsites", false);
+pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+pref("browser.startup.preXulSkeletonUI", false);
 "#;
     let pdir = format!("{}/defaults/pref", dir);
     let _ = mkdirs(&pdir);

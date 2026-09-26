@@ -2782,6 +2782,9 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 if due
                     && let Desc::File { path, data: Some(data), dirty, .. } = &mut *g
                     && *dirty
+                    // Large files (databases) are written back on close
+                    // only: a rewrite blocks every file access meanwhile.
+                    && data.len() <= 256 * 1024
                 {
                     let _ = fs::write_file(path, data);
                     *dirty = false;
