@@ -17,6 +17,7 @@ mod input;
 mod interrupts;
 mod mem;
 mod network;
+mod pkg;
 mod power;
 mod proc;
 mod selftest;

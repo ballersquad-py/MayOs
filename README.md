@@ -49,6 +49,14 @@ Settings app are done.
   delivered yet (fatal ones end the process). `linuxtrace on` logs every
   Linux system call to the serial port. See `examples/linux-hello` and
   `examples/linux-paint`.
+- **Linux software from Alpine Linux**: `pkg install <name>` in the
+  Terminal downloads Alpine packages (with their dependencies), unpacks
+  them and runs their setup steps; `pkg search`, `pkg list`. For
+  example `pkg install netsurf` then `netsurf` gives you the NetSurf web
+  browser (GTK 3). Programs with windows use MayOS's built-in **Wayland
+  compositor** (`wl_shm`, `xdg_shell`, keyboard and pointer), so GTK and
+  SDL programs appear as normal MayOS windows. Needs about 150 MB of
+  disk for NetSurf.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).

@@ -21,15 +21,31 @@ struct FreeBlock {
     next: *mut FreeBlock,
 }
 
+/// Small blocks come from per-size free lists (O(1) allocate and free),
+/// refilled in chunks from the main list; everything else uses the
+/// address-ordered main list.
+const CLASSES: [usize; 14] = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
+const CHUNK: usize = 64 * 1024;
+
 struct Heap {
     head: *mut FreeBlock,
     total: usize,
     used: usize,
+    /// Free small blocks per class (singly linked through their first word).
+    small: [*mut usize; CLASSES.len()],
+}
+
+fn class_of(layout: Layout) -> Option<usize> {
+    if layout.align() > 16 {
+        return None;
+    }
+    let size = layout.size().max(1);
+    CLASSES.iter().position(|&c| c >= size)
 }
 
 unsafe impl Send for Heap {}
 
-static HEAP: Spin<Heap> = Spin::new(Heap { head: null_mut(), total: 0, used: 0 });
+static HEAP: Spin<Heap> = Spin::new(Heap { head: null_mut(), total: 0, used: 0, small: [null_mut(); CLASSES.len()] });
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
@@ -111,6 +127,33 @@ impl Heap {
         }
     }
 
+    unsafe fn alloc_small(&mut self, class: usize) -> *mut u8 {
+        unsafe {
+            if self.small[class].is_null() {
+                // Carve a chunk into blocks of this class.
+                let chunk = self.try_alloc(Layout::from_size_align_unchecked(CHUNK, 16));
+                let chunk = if chunk.is_null() && self.grow(CHUNK + HEADER * 2) {
+                    self.try_alloc(Layout::from_size_align_unchecked(CHUNK, 16))
+                } else {
+                    chunk
+                };
+                if chunk.is_null() {
+                    return null_mut();
+                }
+                let size = CLASSES[class];
+                let n = CHUNK / size;
+                for i in (0..n).rev() {
+                    let b = chunk.add(i * size) as *mut usize;
+                    *b = self.small[class] as usize;
+                    self.small[class] = b;
+                }
+            }
+            let b = self.small[class];
+            self.small[class] = *b as *mut usize;
+            b as *mut u8
+        }
+    }
+
     fn grow(&mut self, at_least: usize) -> bool {
         let bytes = align_up(at_least.max(GROW_MIN), PAGE_SIZE as usize);
         let pages = bytes / PAGE_SIZE as usize;
@@ -131,6 +174,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut h = HEAP.lock();
         unsafe {
+            if let Some(c) = class_of(layout) {
+                return h.alloc_small(c);
+            }
             let p = h.try_alloc(layout);
             if !p.is_null() {
                 return p;
@@ -142,9 +188,15 @@ unsafe impl GlobalAlloc for KernelAllocator {
         null_mut()
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let mut h = HEAP.lock();
         unsafe {
+            if let Some(c) = class_of(layout) {
+                let b = ptr as *mut usize;
+                *b = h.small[c] as usize;
+                h.small[c] = b;
+                return;
+            }
             let hdr = (ptr as usize - HEADER) as *const usize;
             let start = *hdr;
             let size = *hdr.add(1);

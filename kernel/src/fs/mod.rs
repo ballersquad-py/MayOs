@@ -326,6 +326,32 @@ fn cmp_names(a: &str, b: &str) -> core::cmp::Ordering {
     la.cmp(lb)
 }
 
+/// Start of a link stub: FAT32 has no symbolic links, so `pkg` stores
+/// links to big files as small files holding the target path.
+pub const LINK_MAGIC: &[u8] = b"\x7fMAYOS-LINK\n";
+
+/// Follow link stubs (up to 8 deep); other paths come back unchanged.
+pub fn resolve_link(path: &str) -> String {
+    let mut p = String::from(path);
+    for _ in 0..8 {
+        match stat(&p) {
+            Ok(e) if !e.is_dir && (e.size as usize) < 1024 && e.size as usize >= LINK_MAGIC.len() => {}
+            _ => return p,
+        }
+        let Ok(d) = read_file(&p) else { return p };
+        if !d.starts_with(LINK_MAGIC) {
+            return p;
+        }
+        let t = String::from_utf8_lossy(&d[LINK_MAGIC.len()..]).trim().to_string();
+        let dir = match p.rfind('/') {
+            Some(0) | None => String::from("/"),
+            Some(i) => String::from(&p[..i]),
+        };
+        p = normalize(&dir, &t);
+    }
+    p
+}
+
 pub fn read_file(path: &str) -> Result<Vec<u8>> {
     with(path, |v, inner| v.read_file(inner))
 }

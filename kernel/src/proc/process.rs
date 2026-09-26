@@ -144,9 +144,36 @@ pub fn children(pid: u64) -> Vec<Arc<Process>> {
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static TABLE: Spin<Vec<Arc<Process>>> = Spin::new(Vec::new());
 
+/// `#!` scripts run their interpreter: (program bytes, path, arguments).
+fn script_or_elf(data: Vec<u8>, path: &str, args: &str) -> Result<(Vec<u8>, String, String), String> {
+    if !data.starts_with(b"#!") {
+        return Ok((data, String::from(path), String::from(args)));
+    }
+    let end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len()).min(256);
+    let line = String::from(String::from_utf8_lossy(&data[2..end]).trim());
+    let (interp, arg) = match line.split_once([' ', '\t']) {
+        Some((i, a)) => (String::from(i), String::from(a.trim())),
+        None => (line.clone(), String::new()),
+    };
+    let mut new_args = String::new();
+    if !arg.is_empty() {
+        new_args.push_str(&arg);
+        new_args.push(' ');
+    }
+    new_args.push_str(path);
+    if !args.is_empty() {
+        new_args.push(' ');
+        new_args.push_str(args);
+    }
+    let bytes = crate::fs::read_file(&crate::fs::resolve_link(&interp)).map_err(|e| alloc::format!("{}: {}", interp, e))?;
+    Ok((bytes, interp, new_args))
+}
+
 /// Load an executable from the file system and start it.
 pub fn spawn(path: &str, args: &str, cwd: &str, console: Arc<Console>) -> Result<Arc<Process>, String> {
-    let data = crate::fs::read_file(path).map_err(|e| alloc::format!("{}: {}", path, e))?;
+    let data = crate::fs::read_file(&crate::fs::resolve_link(path)).map_err(|e| alloc::format!("{}: {}", path, e))?;
+    let data = script_or_elf(data, path, args)?;
+    let (data, path, args) = (data.0, data.1.as_str(), data.2.as_str());
     let pml4 = paging::new_address_space().ok_or("out of memory")?;
     let image = match elf::load(pml4, &data) {
         Ok(i) => i,

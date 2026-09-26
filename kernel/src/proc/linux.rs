@@ -164,6 +164,9 @@ fn default_env(cwd: &str) -> Vec<String> {
         String::from("TERM=xterm"),
         String::from("XDG_RUNTIME_DIR=/run"),
         String::from("WAYLAND_DISPLAY=wayland-0"),
+        String::from("GDK_BACKEND=wayland"),
+        String::from("NO_AT_BRIDGE=1"),
+        String::from("XDG_DATA_DIRS=/usr/share"),
         alloc::format!("PWD={}", cwd),
     ]
 }
@@ -171,7 +174,7 @@ fn default_env(cwd: &str) -> Vec<String> {
 /// Load the program's dynamic linker, if it names one: (entry, AT_BASE).
 fn load_interp(pml4: u64, image: &super::elf::LoadedImage) -> Result<(u64, u64), String> {
     let Some(path) = &image.interp else { return Ok((image.entry, 0)) };
-    let data = fs::read_file(path).map_err(|e| alloc::format!("dynamic linker {}: {} (copy it from the Linux distribution the program comes from)", path, e))?;
+    let data = fs::read_file(&fs::resolve_link(path)).map_err(|e| alloc::format!("dynamic linker {}: {} (copy it from the Linux distribution the program comes from)", path, e))?;
     let li = super::elf::load_at(pml4, &data, INTERP_BASE)?;
     Ok((li.entry, INTERP_BASE))
 }
@@ -713,7 +716,7 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
             dirty: flags & O_TRUNC != 0 || !exists,
         }
     } else {
-        match fs::open(&path) {
+        match fs::open(&fs::resolve_link(&path)) {
             Ok(f) => Desc::File { size: f.size, path, data: None, file: Some(f), pos: 0, writable: false, append: false, dirty: false },
             Err(e) => return fs_err(e),
         }
@@ -1161,6 +1164,8 @@ fn stat_buf(mode: u32, size: u64, mtime: i64, ino: u64) -> [u8; 144] {
 }
 
 fn stat_path(path: &str) -> Result<[u8; 144], i64> {
+    let resolved = fs::resolve_link(path);
+    let path = resolved.as_str();
     if let Some(d) = virtual_file(path) {
         let (mode, size) = match &d {
             Desc::Virtual { data, .. } => (0o100444, data.len() as u64),
@@ -2500,6 +2505,46 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             return true;
         }
         257 => sys_openat(p, a0 as i32 as i64, a1, a2),
+        332 => {
+            // statx(dirfd, path, flags, mask, buf), built from the stat data
+            const AT_EMPTY_PATH: u64 = 0x1000;
+            let r = if a2 & AT_EMPTY_PATH != 0 && usermem::read_cstr(pml4, a1, 2).map(|s| s.is_empty()).unwrap_or(false) {
+                stat_fd(p, a0 as i32 as i64)
+            } else {
+                path_at(p, a0 as i32 as i64, a1).and_then(|path| stat_path(&path))
+            };
+            match r {
+                Ok(st) => {
+                    let g8 = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap());
+                    let g4 = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap());
+                    let mut x = [0u8; 256];
+                    let mut put = |o: usize, v: &[u8]| x[o..o + v.len()].copy_from_slice(v);
+                    put(0, &0x7ffu32.to_le_bytes()); // STATX_BASIC_STATS
+                    put(4, &4096u32.to_le_bytes());
+                    put(16, &(g8(16) as u32).to_le_bytes());
+                    put(20, &g4(28).to_le_bytes());
+                    put(24, &g4(32).to_le_bytes());
+                    put(28, &(g4(24) as u16).to_le_bytes());
+                    put(32, &g8(8).to_le_bytes());
+                    put(40, &g8(48).to_le_bytes());
+                    put(48, &g8(64).to_le_bytes());
+                    for o in [64usize, 80, 96, 112] {
+                        put(o, &g8(88).to_le_bytes());
+                    }
+                    put(140, &1u32.to_le_bytes()); // dev minor
+                    if usermem::write_bytes(pml4, a4, &x) { 0 } else { -EFAULT }
+                }
+                Err(e) => e,
+            }
+        }
+        118 | 120 => {
+            // getresuid / getresgid: one user
+            for ptr in [a0, a1, a2] {
+                usermem::write_u32(pml4, ptr, 1000);
+            }
+            0
+        }
+        157 | 221 | 324 => 0, // prctl, fadvise64, membarrier
         262 => {
             // newfstatat
             const AT_EMPTY_PATH: u64 = 0x1000;
@@ -2524,6 +2569,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         273 => 0, // set_robust_list
         288 => sys_accept(p, a0 as i64, a1, a2, a3),
+        86 | 88 | 265 | 266 => -EPERM, // link / symlink: FAT32 has none
         292 => {
             let r = sys_dup(p, a0 as i64, Some(a1 as i64), 0);
             if r >= 0 && a2 & O_CLOEXEC != 0
@@ -2754,7 +2800,7 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     let mut path = path_at(p, dirfd, pathp)?;
     let mut argv = read_strv(p.pml4(), argvp)?;
     let env = read_strv(p.pml4(), envp)?;
-    let mut data = fs::read_file(&path).map_err(fs_err)?;
+    let mut data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;
     // Scripts: "#!interpreter [one argument]".
     for _ in 0..4 {
         if !data.starts_with(b"#!") {
@@ -2775,7 +2821,7 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
         path = interp;
-        data = fs::read_file(&path).map_err(fs_err)?;
+        data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;
     }
     if !super::elf::is_elf(&data) {
         return Err(-ENOEXEC);

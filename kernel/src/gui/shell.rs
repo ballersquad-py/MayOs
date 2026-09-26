@@ -44,6 +44,7 @@ const HELP: &[(&str, &str)] = &[
     ("perf", "speed of this machine, frame rate, sound glitches"),
     ("free", "memory usage"),
     ("vbench <video>", "how fast this machine decodes a video"),
+    ("pkg install <name>", "install Linux software (Alpine packages), e.g. netsurf"),
     ("ps", "list threads and processes"),
     ("kill <pid>", "stop a process"),
     ("uptime / date", "time since boot / current date"),
@@ -529,6 +530,7 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             crate::proc::linux::TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
             let _ = writeln!(out, "Linux system call log on the serial port: {}", if on { "on" } else { "off" });
         }
+        "pkg" => term.start_job("pkg", args.join(" "), crate::pkg::job),
         "vbench" => match args.first() {
             Some(f) => match vbench(&abs(f)) {
                 Ok(msg) => {
@@ -862,7 +864,7 @@ pub fn find_program(cwd: &str, name: &str) -> Option<String> {
     let candidates = if name.contains('/') {
         alloc::vec![fs::normalize(cwd, name)]
     } else {
-        alloc::vec![fs::join("/bin", name), fs::normalize(cwd, name)]
+        alloc::vec![fs::join("/bin", name), fs::join("/usr/bin", name), fs::join("/usr/sbin", name), fs::join("/sbin", name), fs::normalize(cwd, name)]
     };
     candidates.into_iter().find(|p| fs::stat(p).map(|e| !e.is_dir).unwrap_or(false))
 }
