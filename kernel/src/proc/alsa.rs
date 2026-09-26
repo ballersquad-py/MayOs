@@ -429,6 +429,15 @@ impl State {
         }
     }
 
+    /// Frames until a frame written now is heard: our queue plus the
+    /// sound card's DMA queue (so programs keep audio and video in sync).
+    fn delay(&self) -> u64 {
+        match &self.stream {
+            Some(_) => self.queued() + crate::audio::latency_frames() * self.rate as u64 / 48000,
+            None => 0,
+        }
+    }
+
     fn hw(&self) -> u64 {
         self.appl.saturating_sub(self.queued())
     }
@@ -540,7 +549,7 @@ impl Pcm {
         b[32..40].copy_from_slice(&((now % 1_000_000) * 1000).to_le_bytes());
         b[40..48].copy_from_slice(&s.appl.to_le_bytes());
         b[48..56].copy_from_slice(&s.hw().to_le_bytes());
-        b[56..64].copy_from_slice(&s.queued().to_le_bytes());
+        b[56..64].copy_from_slice(&s.delay().to_le_bytes());
         b[64..72].copy_from_slice(&s.avail().to_le_bytes());
         b[72..80].copy_from_slice(&s.avail().to_le_bytes());
         b
@@ -630,7 +639,7 @@ pub fn pcm_ioctl(pcm: &Arc<Pcm>, pml4: u64, cmd: u64, arg: u64, nonblock: bool) 
         0x8098_4120 | 0xc098_4124 => put(pml4, arg, &pcm.status()), // STATUS, STATUS_EXT
         0x8008_4121 => {
             // DELAY
-            let d = pcm.st.lock().queued();
+            let d = pcm.st.lock().delay();
             put(pml4, arg, &d.to_le_bytes())
         }
         0x4122 => 0, // HWSYNC

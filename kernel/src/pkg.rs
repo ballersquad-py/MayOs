@@ -82,6 +82,15 @@ pub fn job(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
 
 // --- index ---------------------------------------------------------------
 
+/// Rewrite Firefox's MayOS prefs once per boot when it starts, so pref
+/// updates arrive with a new MayOS without reinstalling Firefox.
+pub fn firefox_setup_once() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        firefox_setup();
+    }
+}
+
 fn firefox_setup() {
     for dir in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
         if fs::exists(dir) {
@@ -115,6 +124,10 @@ pref("accessibility.force_disabled", 1);
 // WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.
 pref("webgl.force-enabled", true);
 pref("webgl.disabled", false);
+// Run WebGL in the page's own process: out of process, every GL call that
+// returns a value is a synchronous IPC round trip (hundreds per frame).
+pref("webgl.out-of-process", false);
+pref("webgl.out-of-process.force", false);
 pref("media.autoplay.blocking_policy", 0);
 // Speed: files are rewritten whole on MayOS, and drawing is in software.
 pref("browser.cache.disk.enable", false);

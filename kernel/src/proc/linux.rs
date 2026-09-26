@@ -317,6 +317,9 @@ fn load_interp(pml4: u64, image: &super::elf::LoadedImage) -> Result<(u64, u64),
 pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str, cwd: &str) -> Result<(LinuxState, u64, u64), String> {
     let mut argv: Vec<String> = alloc::vec![String::from(path)];
     argv.extend(split_args(args));
+    if path.contains("firefox") {
+        crate::pkg::firefox_setup_once();
+    }
     let (entry, at_base) = load_interp(pml4, image)?;
     let (rsp, stack) = build_stack(pml4, image, at_base, &argv, &default_env(cwd), path)?;
     let state = LinuxState {
@@ -3622,6 +3625,9 @@ fn read_strv(pml4: u64, mut ptr: u64) -> Result<Vec<String>, i64> {
 fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp: u64, envp: u64) -> Result<(), i64> {
     let l = linux(p).ok_or(-ENOSYS)?;
     let mut path = path_at(p, dirfd, pathp)?;
+    if path.contains("firefox") {
+        crate::pkg::firefox_setup_once();
+    }
     let mut argv = read_strv(p.pml4(), argvp)?;
     let env = read_strv(p.pml4(), envp)?;
     let mut data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;

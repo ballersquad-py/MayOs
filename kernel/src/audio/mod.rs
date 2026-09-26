@@ -118,10 +118,10 @@ pub fn glitch_stats() -> (u64, u64, u64) {
     (STARVED.load(Ordering::Relaxed), UNDERRUNS.load(Ordering::Relaxed), MAX_GAP_MS.load(Ordering::Relaxed))
 }
 
-/// Buffers mixed ahead of the hardware (16 x 21 ms). VirtualBox's AC'97
+/// Buffers mixed ahead of the hardware (8 x 21 ms). VirtualBox's AC'97
 /// prefetches well ahead of what it plays; with a short queue it keeps
 /// hitting the end, stopping and restarting, which you hear as dropouts.
-const AHEAD: u8 = 16;
+const AHEAD: u8 = 8;
 
 pub fn init(dev: Ac97, name: &str) {
     DEVICE_NAME.set(String::from(name));
