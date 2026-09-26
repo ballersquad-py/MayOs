@@ -62,8 +62,16 @@ impl BochsVga {
             crate::drivers::vmware_svga::fail(alloc::format!("framebuffer BAR {:#x} unusable", fb_phys));
             return None;
         }
+        // VirtualBox reuses DISPI index 0x0a for its own purposes, so size
+        // VRAM from the PCI BAR as well and take the larger answer.
         let vram_64k = read(REG_VIDEO_MEMORY_64K) as usize;
-        let vram = if vram_64k != 0 { vram_64k * 64 * 1024 } else { 16 * 1024 * 1024 };
+        let orig = pci.read32(0x10);
+        pci.write32(0x10, 0xffff_ffff);
+        let mask = pci.read32(0x10) & !0xf;
+        pci.write32(0x10, orig);
+        let bar_size = if mask != 0 { (!mask).wrapping_add(1) as usize } else { 0 };
+        let vram = (vram_64k * 64 * 1024).max(bar_size);
+        let vram = if vram < 4 * 1024 * 1024 { 16 * 1024 * 1024 } else { vram };
         // Map all of VRAM once, so every mode we accept is already mapped.
         let fb_len = vram.min(256 * 1024 * 1024);
         let Some(fb_virt) = paging::map_framebuffer(fb_phys, fb_len) else {
