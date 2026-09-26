@@ -2539,6 +2539,13 @@ fn sleep_interruptible(p: &Process, ms: u64) -> bool {
 /// add the TSC uptime (cheap, and never goes backwards).
 static BOOT_UNIX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Names Linux threads gave themselves (prctl PR_SET_NAME), by thread id.
+pub static THREAD_NAMES: Spin<alloc::collections::BTreeMap<u64, String>> = Spin::new(alloc::collections::BTreeMap::new());
+
+pub fn thread_name(tid: u64) -> Option<String> {
+    THREAD_NAMES.lock().get(&tid).cloned()
+}
+
 pub fn unix_us() -> u64 {
     let mut b = BOOT_UNIX_US.load(Ordering::Relaxed);
     if b == 0 {
@@ -3175,6 +3182,21 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 usermem::write_u32(pml4, ptr, 1000);
             }
             0
+        }
+        157 if a0 == 15 => {
+            // PR_SET_NAME: thread names (shown by the `threads` command)
+            if let Some(n) = usermem::read_cstr(pml4, a1, 16) {
+                THREAD_NAMES.lock().insert(sched::current_id(), n);
+            }
+            0
+        }
+        157 if a0 == 16 => {
+            // PR_GET_NAME
+            let n = THREAD_NAMES.lock().get(&sched::current_id()).cloned().unwrap_or_else(|| String::from("thread"));
+            let mut b = [0u8; 16];
+            let k = n.len().min(15);
+            b[..k].copy_from_slice(&n.as_bytes()[..k]);
+            if usermem::write_bytes(pml4, a1, &b) { 0 } else { -EFAULT }
         }
         157 | 221 | 324 => 0, // prctl, fadvise64, membarrier
         262 => {

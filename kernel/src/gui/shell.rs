@@ -525,8 +525,15 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
         "threads" => {
             // What every thread of a Linux program is doing right now.
             let filter = args.first().copied().unwrap_or("");
-            let _ = writeln!(out, "{}  TID   PID  STATE      CPU(ms)  IN{}", C_HEAD, C_OFF);
-            for t in crate::proc::sched::list() {
+            let _ = writeln!(out, "{}  TID   PID  STATE      CPU(ms)  NAME            IN{}", C_HEAD, C_OFF);
+            // Busiest first; the top 25 fit on one screen.
+            let mut all = crate::proc::sched::list();
+            all.sort_by(|a, b| b.cpu_ms.cmp(&a.cpu_ms));
+            let mut shown = 0;
+            for t in all {
+                if shown >= 25 {
+                    break;
+                }
                 let Some(pid) = t.pid else { continue };
                 let exe = crate::proc::process::find(pid).map(|p| crate::proc::linux::exe_name(&p)).unwrap_or_default();
                 if !filter.is_empty() && !exe.contains(filter) {
@@ -544,7 +551,9 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 } else {
                     format!("{}({:#x}, {:#x})", crate::proc::linux::syscall_name(nr), a0, a1)
                 };
-                let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {}", t.id, pid, state, t.cpu_ms, what);
+                shown += 1;
+                let tname = crate::proc::linux::thread_name(t.id).unwrap_or_default();
+                let _ = writeln!(out, "{:>5} {:>5}  {:<9} {:>8}  {:<15} {}", t.id, pid, state, t.cpu_ms, tname, what);
             }
         }
         "gpuinfo" => {
