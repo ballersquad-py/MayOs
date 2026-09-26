@@ -262,11 +262,20 @@ pub fn exit_current_process(code: i64, message: Option<&str>) {
 }
 
 fn finish(p: &Arc<Process>, code: i64) {
-    {
+    let first = {
         let mut e = p.exit_code.lock();
-        if e.is_none() {
+        let first = e.is_none();
+        if first {
             *e = Some(code);
         }
+        first
+    };
+    // Linux parents hear about it through SIGCHLD.
+    if first && p.parent != 0
+        && let Some(parent) = find(p.parent)
+        && parent.linux.is_some()
+    {
+        super::signal::send(&parent, None, 17, 1, p.pid);
     }
     // Descriptors go now (so pipe readers see the end), not when the
     // parent collects the exit code. Before the threads stop: closing a

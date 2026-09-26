@@ -187,6 +187,18 @@ pub fn process_thread_count(pid: u64) -> usize {
     s.threads.iter().filter(|t| t.state != State::Dead && t.process.as_ref().map(|p| p.pid == pid).unwrap_or(false)).count()
 }
 
+/// CPU time used by all threads of a process.
+pub fn process_cpu_ms(pid: u64) -> u64 {
+    let s = SCHED.lock();
+    s.threads.iter().filter(|t| t.process.as_ref().is_some_and(|p| p.pid == pid)).map(|t| t.cpu_ms).sum()
+}
+
+/// Thread ids of a process.
+pub fn process_thread_ids(pid: u64) -> Vec<u64> {
+    let s = SCHED.lock();
+    s.threads.iter().filter(|t| t.state != State::Dead && t.process.as_ref().is_some_and(|p| p.pid == pid)).map(|t| t.id).collect()
+}
+
 pub fn spawn_kernel(name: &str, entry: extern "C" fn(usize), arg: usize) -> u64 {
     add_thread(
         name,

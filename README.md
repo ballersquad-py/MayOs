@@ -45,15 +45,23 @@ Settings app are done.
   pipes, so shells run pipelines. Dynamically linked programs load their
   dynamic linker: copy e.g. Alpine Linux's `/lib/ld-musl-x86_64.so.1`
   (also as `/lib/libc.musl-x86_64.so.1`) and the libraries a program
-  needs into `/lib`. Alpine's BusyBox runs as is. Signals are not
-  delivered yet (fatal ones end the process). `linuxtrace on` logs every
+  needs into `/lib`. Alpine's BusyBox runs as is. Signals work: handlers
+  (`sigaction` with `SA_SIGINFO`, `SA_ONSTACK`, `sigaltstack`), masks,
+  `kill`/`tgkill`, `SIGCHLD`, `SIGSEGV` handlers for faults and guard
+  pages, `sigsuspend`/`sigtimedwait`, and `EINTR` from blocking calls.
+  Also `timerfd`, `select`/`pselect6`, `pwrite`/`preadv`, `mremap`,
+  symbolic links (stored as MayOS link files), `close_range`,
+  `sendmmsg` and `/proc/self/{maps,status,stat,fd,...}`. Mapped files are
+  read on first touch, so large libraries only cost what they use. `linuxtrace on` logs every
   Linux system call to the serial port. See `examples/linux-hello` and
   `examples/linux-paint`.
 - **Linux software from Alpine Linux**: `pkg install <name>` in the
   Terminal downloads Alpine packages (with their dependencies), unpacks
   them and runs their setup steps; `pkg search`, `pkg list`. For
   example `pkg install netsurf` then `netsurf` gives you the NetSurf web
-  browser (GTK 3). Programs with windows use MayOS's built-in **Wayland
+  browser (GTK 3). Firefox is on its way: `pkg install firefox` sets it
+  up for MayOS (one process, software drawing, no sandbox); give the VM
+  2 GB of RAM or more and about 1 GB of free disk. Programs with windows use MayOS's built-in **Wayland
   compositor** (`wl_shm`, `xdg_shell`, keyboard and pointer), so GTK and
   SDL programs appear as normal MayOS windows. Needs about 150 MB of
   disk for NetSurf.

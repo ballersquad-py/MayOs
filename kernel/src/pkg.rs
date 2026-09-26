@@ -82,6 +82,34 @@ pub fn job(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
 
 // --- index ---------------------------------------------------------------
 
+/// Defaults that suit MayOS: one process, software drawing, no sandbox,
+/// no telemetry or updates.
+fn firefox_prefs(dir: &str) {
+    let prefs = r#"// MayOS defaults (written by pkg)
+pref("fission.autostart", false);
+pref("browser.tabs.remote.autostart", false);
+pref("dom.ipc.processCount", 1);
+pref("dom.ipc.processPrelaunch.enabled", false);
+pref("network.process.enabled", false);
+pref("media.rdd-process.enabled", false);
+pref("media.utility-process.enabled", false);
+pref("gfx.webrender.software", true);
+pref("layers.acceleration.disabled", true);
+pref("media.hardware-video-decoding.enabled", false);
+pref("widget.dmabuf.force-enabled", false);
+pref("security.sandbox.content.level", 0);
+pref("browser.shell.checkDefaultBrowser", false);
+pref("browser.startup.homepage_override.mstone", "ignore");
+pref("app.update.enabled", false);
+pref("toolkit.telemetry.enabled", false);
+pref("datareporting.policy.dataSubmissionEnabled", false);
+pref("browser.sessionstore.resume_from_crash", false);
+"#;
+    let pdir = format!("{}/defaults/pref", dir);
+    let _ = mkdirs(&pdir);
+    let _ = fs::write_file(&format!("{}/mayos.js", pdir), prefs.as_bytes());
+}
+
 fn download(url: &str) -> Result<Vec<u8>, String> {
     let u = web::url::Url::parse(url).ok_or("bad url")?;
     let r = crate::network::http::get(&u)?;
@@ -314,6 +342,14 @@ fn install(names: &[&str], c: &Console, cancel: &AtomicBool) -> Result<(), Strin
     }
     say(c, "Done.\n");
     let hint: Vec<String> = names.iter().filter_map(|n| idx.pkgs.get(*n)).map(|p| p.name.clone()).collect();
+    for dir in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
+        if fs::exists(dir) {
+            firefox_prefs(dir);
+        }
+    }
+    if hint.iter().any(|n| n.starts_with("firefox")) {
+        say(c, "Start Firefox with: firefox  (first start takes a while)\n");
+    }
     if hint.iter().any(|n| n == "netsurf") {
         say(c, "Start the browser with: netsurf\n");
     }

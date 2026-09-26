@@ -141,6 +141,13 @@ fn user_programs() -> TestResult {
     sched::sleep_ms(100);
     let after = crate::mem::pmm::stats().0;
     ensure!(before.abs_diff(after) < 64, "frame leak: {} free before, {} after", before, after);
+
+    // The Linux layer: signals, timerfd, select, symlinks, /proc, ...
+    // (after the leak check: forks and threads still leak a kernel stack).
+    if fs::exists("/bin/linux-signals") {
+        let (code, out) = run_program("/bin/linux-signals", "", 20000)?;
+        ensure!(code == 0 && out.contains("SIGNALS PASSED"), "linux-signals: {} {}", code, out);
+    }
     Ok(())
 }
 

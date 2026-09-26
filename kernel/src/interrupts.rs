@@ -80,16 +80,46 @@ extern "C" fn interrupt_dispatch(frame: &mut TrapFrame) -> u64 {
 fn exception(frame: &mut TrapFrame) -> u64 {
     let v = frame.vector as usize;
     let name = EXCEPTION_NAMES[v];
-    if frame.from_user() && v == 14 && crate::proc::linux::page_fault(cpu::read_cr2(), frame.error) {
-        // Memory handed out on first use (Linux programs).
-        return frame as *mut TrapFrame as u64;
+    // Read before interrupts are turned on: another fault could replace it.
+    let cr2 = if v == 14 { cpu::read_cr2() } else { 0 };
+    if frame.from_user() && v == 14 {
+        // Memory handed out on first use (Linux programs). Interrupts on:
+        // pages of mapped files are read from disk.
+        cpu::sti();
+        let ok = crate::proc::linux::page_fault(cr2, frame.error);
+        cpu::cli();
+        if ok {
+            return frame as *mut TrapFrame as u64;
+        }
+    }
+    if frame.from_user()
+        && let Some(p) = sched::current_process()
+        && p.linux.is_some()
+    {
+        // Linux programs may catch their own faults (SIGSEGV handlers).
+        let (sig, code, addr) = match v {
+            14 => (11, if frame.error & 1 != 0 { 2 } else { 1 }, cr2),
+            13 | 12 | 11 => (11, 128, 0), // SI_KERNEL
+            0 => (8, 1, frame.rip),      // FPE_INTDIV
+            16 | 19 => (8, 0, frame.rip),
+            6 => (4, 1, frame.rip), // ILL_ILLOPC
+            1 | 3 => (5, 1, frame.rip),
+            17 => (7, 1, frame.rip), // BUS_ADRALN
+            _ => (11, 128, 0),
+        };
+        cpu::sti();
+        let caught = crate::proc::signal::fault(&p, frame, sig, code, addr);
+        cpu::cli();
+        if caught {
+            return frame as *mut TrapFrame as u64;
+        }
     }
     if frame.from_user() {
         let msg = alloc::format!(
             "\n[process crashed] {} at rip={:#x} addr={:#x} err={:#x}\n",
             name,
             frame.rip,
-            if v == 14 { cpu::read_cr2() } else { 0 },
+            cr2,
             frame.error
         );
         crate::kprint!("{}", msg);

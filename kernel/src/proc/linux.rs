@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::process::Process;
 use super::screen::{self, InputKind, Screen};
 use super::unix::{self, Endpoint, EventFd, Epoll, Listener, Shm};
-use super::{sched, usermem};
+use super::{sched, signal, usermem};
 use crate::arch::idt::TrapFrame;
 use crate::fs;
 use crate::mem::paging::{self, NO_EXECUTE, USER, WRITABLE};
@@ -66,6 +66,24 @@ pub struct Region {
     pub end: u64,
     pub writable: bool,
     pub exec: bool,
+    /// File whose contents fill the pages (index + 1 into
+    /// `LinuxState::mapped`, 0 for zero-filled memory), and the file offset
+    /// of `start`.
+    pub file: u32,
+    pub foff: u64,
+    /// PROT_NONE: reserved, every access faults.
+    pub none: bool,
+}
+
+impl Region {
+    fn anon(start: u64, end: u64, writable: bool, exec: bool) -> Region {
+        Region { start, end, writable, exec, file: 0, foff: 0, none: false }
+    }
+
+    /// The part of this region from `start` on.
+    fn from(&self, start: u64) -> Region {
+        Region { start, foff: if self.file != 0 { self.foff + (start - self.start) } else { 0 }, ..*self }
+    }
 }
 
 pub struct Pipe {
@@ -108,6 +126,39 @@ pub enum Desc {
     Memfd { shm: Arc<Shm>, pos: u64 },
     EventFd { ev: Arc<EventFd>, nonblock: bool },
     Epoll(Arc<Epoll>),
+    TimerFd { t: Arc<TimerFd>, nonblock: bool },
+}
+
+/// timerfd: expirations counted against the uptime clock (microseconds).
+pub struct TimerFd {
+    /// (next expiry, interval); next = 0 when disarmed.
+    state: Spin<(u64, u64)>,
+    realtime: bool,
+}
+
+impl TimerFd {
+    /// Expirations since the last read (and re-arm the timer).
+    fn take(&self) -> u64 {
+        let now = crate::time::uptime_us();
+        let mut s = self.state.lock();
+        let (next, interval) = *s;
+        if next == 0 || now < next {
+            return 0;
+        }
+        if interval == 0 {
+            *s = (0, 0);
+            1
+        } else {
+            let n = 1 + (now - next) / interval;
+            s.0 = next + n * interval;
+            n
+        }
+    }
+
+    fn ready(&self) -> bool {
+        let (next, _) = *self.state.lock();
+        next != 0 && crate::time::uptime_us() >= next
+    }
 }
 
 pub type DescRef = Arc<Mutex<Desc>>;
@@ -126,6 +177,10 @@ pub struct LinuxState {
     pub screen: Spin<Option<Arc<Screen>>>,
     /// Shared memory mapped into this process (kept while it lives).
     pub shared: Spin<Vec<Arc<Shm>>>,
+    /// Signal handlers, masks and pending signals.
+    pub sig: Spin<super::signal::Signals>,
+    /// Files with mappings (see `Region::file`).
+    pub mapped: Spin<Vec<DescRef>>,
 }
 
 impl Drop for Desc {
@@ -167,6 +222,17 @@ fn default_env(cwd: &str) -> Vec<String> {
         String::from("GDK_BACKEND=wayland"),
         String::from("NO_AT_BRIDGE=1"),
         String::from("XDG_DATA_DIRS=/usr/share"),
+        // Firefox: Wayland, software drawing, no sandboxes (they need
+        // seccomp and namespaces), no crash reporter.
+        String::from("MOZ_ENABLE_WAYLAND=1"),
+        String::from("MOZ_DISABLE_CONTENT_SANDBOX=1"),
+        String::from("MOZ_DISABLE_GMP_SANDBOX=1"),
+        String::from("MOZ_DISABLE_RDD_SANDBOX=1"),
+        String::from("MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1"),
+        String::from("MOZ_DISABLE_UTILITY_SANDBOX=1"),
+        String::from("MOZ_CRASHREPORTER_DISABLE=1"),
+        String::from("MOZ_FORCE_DISABLE_E10S=1"),
+        String::from("LIBGL_ALWAYS_SOFTWARE=1"),
         alloc::format!("PWD={}", cwd),
     ]
 }
@@ -194,10 +260,12 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
         mmap_next: Spin::new(MMAP_BASE),
         brk: Spin::new((image.brk, image.brk)),
         cwd: Spin::new(String::from(cwd)),
-        exe: Spin::new(String::from(path)),
+        exe: Spin::new(fs::resolve_link(path)),
         cloexec: Spin::new(alloc::collections::BTreeSet::new()),
         screen: Spin::new(None),
         shared: Spin::new(Vec::new()),
+        sig: Spin::new(super::signal::Signals::default()),
+        mapped: Spin::new(Vec::new()),
     };
     Ok((state, rsp, entry))
 }
@@ -286,7 +354,7 @@ fn build_stack(pml4: u64, image: &super::elf::LoadedImage, at_base: u64, argv: &
     }
     put(0);
     put(0);
-    Ok((sp, Region { start: bottom, end: top - eager * PAGE_SIZE, writable: true, exec: false }))
+    Ok((sp, Region::anon(bottom, top - eager * PAGE_SIZE, true, false)))
 }
 
 fn split_args(s: &str) -> Vec<String> {
@@ -332,13 +400,33 @@ pub fn fault_in(addr: u64, write: bool) -> bool {
     let page = addr & !(PAGE_SIZE - 1);
     let region = l.regions.lock().iter().find(|r| page >= r.start && page < r.end).copied();
     let Some(r) = region else { return false };
-    if write && !r.writable {
+    if r.none || write && !r.writable {
         return false;
     }
     if paging::translate(p.pml4(), page).is_some() {
         return true;
     }
     let Some(f) = pmm::alloc_frame_zeroed() else { return false };
+    if r.file != 0 {
+        let d = l.mapped.lock().get(r.file as usize - 1).cloned();
+        if let Some(d) = d {
+            let buf = unsafe { core::slice::from_raw_parts_mut(crate::mem::phys_to_virt(f) as *mut u8, PAGE_SIZE as usize) };
+            let mut g = d.lock();
+            let mut n = 0usize;
+            while n < buf.len() {
+                let got = read_at(&mut g, r.foff + (page - r.start) + n as u64, &mut buf[n..]);
+                if got <= 0 {
+                    break;
+                }
+                n += got as usize;
+            }
+        }
+        // Another thread may have brought the page in meanwhile.
+        if paging::translate(p.pml4(), page).is_some() {
+            pmm::free_frame(f);
+            return true;
+        }
+    }
     let mut flags = USER;
     if r.writable {
         flags |= WRITABLE;
@@ -384,7 +472,7 @@ fn remove_regions(l: &LinuxState, start: u64, end: u64) {
             out.push(Region { end: start, ..*r });
         }
         if r.end > end {
-            out.push(Region { start: end, ..*r });
+            out.push(r.from(end));
         }
     }
     *regs = out;
@@ -455,30 +543,27 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         return start as i64;
     }
     let writable = prot & 2 != 0 || flags & MAP_ANONYMOUS == 0;
-    l.regions.lock().push(Region { start, end: start + len, writable: writable || prot == 0, exec: prot & 4 != 0 });
+    let mut region = Region::anon(start, start + len, writable || prot == 0, prot & 4 != 0);
+    region.none = prot == 0;
     if flags & MAP_ANONYMOUS == 0 {
-        // File mapping: copy the contents in (private mappings only).
+        // File mapping (private): pages are read from the file when first
+        // touched, so large libraries cost only what is used.
         let Some(d) = get_fd(p, fd) else { return -EBADF };
-        let mut buf = vec![0u8; len as usize];
-        // The file layer may return short reads: fill the whole mapping.
-        let mut n = 0usize;
-        {
-            let mut g = d.lock();
-            while n < buf.len() {
-                let r = read_at(&mut g, off + n as u64, &mut buf[n..]);
-                if r < 0 {
-                    return r;
-                }
-                if r == 0 {
-                    break;
-                }
-                n += r as usize;
+        if !matches!(&*d.lock(), Desc::File { .. } | Desc::Memfd { .. } | Desc::Virtual { .. }) {
+            return -ENODEV;
+        }
+        let mut m = l.mapped.lock();
+        let idx = match m.iter().position(|x| Arc::ptr_eq(x, &d)) {
+            Some(i) => i,
+            None => {
+                m.push(d);
+                m.len() - 1
             }
-        }
-        if !usermem::write_bytes(p.pml4(), start, &buf[..n]) {
-            return -ENOMEM;
-        }
+        };
+        region.file = idx as u32 + 1;
+        region.foff = off;
     }
+    l.regions.lock().push(region);
     start as i64
 }
 
@@ -499,7 +584,7 @@ fn sys_brk(p: &Process, addr: u64) -> i64 {
     let old_top = b.1.div_ceil(PAGE_SIZE) * PAGE_SIZE;
     let new_top = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
     if new_top > old_top {
-        l.regions.lock().push(Region { start: old_top, end: new_top, writable: true, exec: false });
+        l.regions.lock().push(Region::anon(old_top, new_top, true, false));
     } else if new_top < old_top {
         drop(b);
         remove_regions(l, new_top, old_top);
@@ -602,8 +687,7 @@ fn virtual_file(path: &str) -> Option<Desc> {
             let (free, total) = pmm::stats();
             alloc::format!("MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\n", total * 4, free * 4, free * 4)
         }
-        "/proc/self/maps" | "/proc/self/cmdline" | "/proc/self/stat" | "/proc/self/status" => String::new(),
-        _ => return None,
+                _ => return None,
     };
     Some(Desc::Virtual { data: text.into_bytes(), pos: 0 })
 }
@@ -660,6 +744,9 @@ fn sys_openat(p: &Process, dirfd: i64, ptr: u64, flags: u64) -> i64 {
 }
 
 fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
+    if let Some(d) = proc_file(p, &path) {
+        return add_fd(p, d);
+    }
     if let Some(d) = virtual_file(&path) {
         return add_fd(p, d);
     }
@@ -671,6 +758,15 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
             Ok(shm) => add_fd(p, Desc::Memfd { shm, pos: 0 }),
             Err(e) => e,
         };
+    }
+    if matches!(proc_self(p, &path).as_str(), "/proc/self/fd" | "/proc/self/task") {
+        let entries: Vec<(String, bool)> = if proc_self(p, &path).ends_with("fd") {
+            let fds: Vec<String> = linux(p).map(|l| l.fds.lock().iter().enumerate().filter(|(_, d)| d.is_some()).map(|(i, _)| alloc::format!("{}", i)).collect()).unwrap_or_default();
+            fds.into_iter().map(|n: String| (n, false)).collect()
+        } else {
+            sched::process_thread_ids(p.pid).into_iter().map(|t| (alloc::format!("{}", t), true)).collect()
+        };
+        return add_fd(p, Desc::Dir { path: proc_self(p, &path), entries, pos: 0 });
     }
     if path == "/dev/input" {
         let entries = ["event0", "event1", "mice"].iter().map(|n| (String::from(*n), false)).collect();
@@ -875,6 +971,27 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
             }
         }
         Desc::Epoll(_) => -EINVAL,
+        Desc::TimerFd { t, nonblock } => {
+            let (t, nb) = (t.clone(), *nonblock);
+            drop(g);
+            if buf.len() < 8 {
+                return -EINVAL;
+            }
+            loop {
+                let n = t.take();
+                if n > 0 {
+                    buf[..8].copy_from_slice(&n.to_le_bytes());
+                    return 8;
+                }
+                if nb {
+                    return -EAGAIN;
+                }
+                if signal::interrupted(p) {
+                    return -EINTR;
+                }
+                sched::sleep_ms(1);
+            }
+        }
         Desc::Input { screen, kind, nonblock } => {
             let (screen, kind, nb) = (screen.clone(), *kind, *nonblock);
             drop(g);
@@ -918,7 +1035,9 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             *dirty = true;
             data.len() as i64
         }
-        Desc::File { .. } | Desc::Dir { .. } | Desc::Virtual { .. } => -EBADF,
+        Desc::File { .. } | Desc::Dir { .. } => -EBADF,
+        // /proc settings (oom_score_adj, ...): accepted and ignored.
+        Desc::Virtual { .. } => data.len() as i64,
         Desc::Null | Desc::Zero | Desc::Random => data.len() as i64,
         Desc::Fb { screen, pos } => {
             let b = screen.buf.lock().clone();
@@ -947,7 +1066,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             ev.add(u64::from_le_bytes(data[..8].try_into().unwrap()));
             8
         }
-        Desc::Epoll(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::TimerFd { .. } => -EINVAL,
         Desc::Tcp { stream: Some(s), .. } => match s.write_all(data, 60_000) {
             Ok(()) => data.len() as i64,
             Err(_) => -EPIPE,
@@ -1202,7 +1321,7 @@ fn stat_fd(p: &Process, fd: i64) -> Result<[u8; 144], i64> {
         Desc::Input { .. } => stat_buf(0o20660, 0, 0, 10),
         Desc::Unix { .. } => stat_buf(0o140777, 0, 0, 11),
         Desc::Memfd { shm, .. } => stat_buf(0o100600, shm.size(), 0, Arc::as_ptr(shm) as u64),
-        Desc::EventFd { .. } | Desc::Epoll(_) => stat_buf(0o600, 0, 0, 12),
+        Desc::EventFd { .. } | Desc::Epoll(_) | Desc::TimerFd { .. } => stat_buf(0o600, 0, 0, 12),
         Desc::Tcp { .. } | Desc::Udp { .. } => stat_buf(0o140777, 0, 0, 7),
         Desc::PipeRead(_) | Desc::PipeWrite(_) => stat_buf(0o10600, 0, 0, 8),
     })
@@ -1774,6 +1893,7 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
         Desc::Unix { listener: Some(l), .. } => (!l.pending.lock().is_empty(), false),
         Desc::Unix { .. } => (false, false),
         Desc::EventFd { ev, .. } => (*ev.count.lock() > 0, true),
+        Desc::TimerFd { t, .. } => (t.ready(), false),
         Desc::Epoll(e) => {
             let list: Vec<(DescRef, u32)> = e.list.lock().iter().filter(|i| !i.disabled).map(|i| (i.desc.clone(), i.events)).collect();
             drop(g);
@@ -1884,6 +2004,9 @@ fn sys_epoll_wait(p: &Process, epfd: i64, out: u64, max: i32, timeout_ms: i64) -
             }
             return (buf.len() / 12) as i64;
         }
+        if signal::interrupted(p) {
+            return -EINTR;
+        }
         sched::sleep_ms(1);
     }
 }
@@ -1908,6 +2031,9 @@ fn sys_poll(p: &Process, ptr: u64, n: u64, timeout_ms: i64) -> i64 {
                 return -EFAULT;
             }
             return count;
+        }
+        if signal::interrupted(p) {
+            return -EINTR;
         }
         sched::sleep_ms(2);
     }
@@ -1975,6 +2101,10 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                     FUTEX.lock().retain(|w| !Arc::ptr_eq(&w.woken, &woken));
                     return -ETIMEDOUT;
                 }
+                if signal::interrupted(p) {
+                    FUTEX.lock().retain(|w| !Arc::ptr_eq(&w.woken, &woken));
+                    return -EINTR;
+                }
                 sched::sleep_ms(1);
             }
         }
@@ -2003,6 +2133,9 @@ fn sys_clone(p: &Arc<Process>, f: &TrapFrame) -> i64 {
     }
     let fs = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
     let tid = sched::spawn_user_frame(p.clone(), frame, fs);
+    if let Some(l) = linux(p) {
+        l.sig.lock().new_thread(sched::current_id(), tid);
+    }
     if flags & CLONE_PARENT_SETTID != 0 {
         usermem::write_u32(p.pml4(), ptid, tid as u32);
     }
@@ -2022,6 +2155,9 @@ fn thread_exit(p: &Arc<Process>, code: i64) -> ! {
         usermem::write_u32(p.pml4(), ctid, 0);
         futex_wake(p.pml4(), ctid, 1);
     }
+    if let Some(l) = linux(p) {
+        l.sig.lock().thread_exit(sched::current_id());
+    }
     if sched::process_thread_count(p.pid) <= 1 {
         super::process::exit_current_process(code, None);
     }
@@ -2029,6 +2165,21 @@ fn thread_exit(p: &Arc<Process>, code: i64) -> ! {
 }
 
 // --- time & misc --------------------------------------------------------
+
+/// Sleep, waking early for a signal. Returns true if a signal came.
+fn sleep_interruptible(p: &Process, ms: u64) -> bool {
+    let until = crate::time::uptime_ms() + ms;
+    loop {
+        if signal::interrupted(p) {
+            return true;
+        }
+        let now = crate::time::uptime_ms();
+        if now >= until {
+            return false;
+        }
+        sched::sleep_ms((until - now).min(10));
+    }
+}
 
 pub fn unix_ms() -> u64 {
     let t = crate::arch::rtc::now();
@@ -2079,7 +2230,10 @@ pub static TRACE: AtomicBool = AtomicBool::new(false);
 
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
-    let exited = syscall_inner(p, f);
+    let mut exited = syscall_inner(p, f);
+    if !exited && nr != 15 {
+        exited = signal::deliver(p, f);
+    }
     if TRACE.load(Ordering::Relaxed) {
         crate::kprintln!("[{}] sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {}", p.pid, nr, args[0], args[1], args[2], args[3], f.rax as i64);
     }
@@ -2108,18 +2262,26 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         10 => sys_mprotect(p, a0, a1, a2),
         11 => sys_munmap(p, a0, a1),
         12 => sys_brk(p, a0),
-        13 | 14 | 131 => {
-            // rt_sigaction / rt_sigprocmask / sigaltstack: signals are not
-            // delivered, so report empty old state.
-            let old = match f.rax {
-                13 => a2,
-                14 => a2,
-                _ => a1,
-            };
-            if old != 0 {
-                usermem::write_bytes(pml4, old, &[0u8; 24]);
+        13 => signal::sigaction(p, a0, a1, a2),
+        14 => signal::sigprocmask(p, a0, a1, a2),
+        131 => signal::sigaltstack(p, a0, a1, f.rsp),
+        15 => {
+            // rt_sigreturn: the frame holds every register, rax included.
+            if !signal::sigreturn(p, f) {
+                super::process::exit_current_process(-11, Some("Segmentation fault (bad signal frame)\n"));
+                return true;
             }
-            0
+            return signal::deliver(p, f);
+        }
+        127 => signal::sigpending(p, a0),
+        128 => signal::sigtimedwait(p, a0, a1, timespec_ms(p, a2)),
+        130 => signal::sigsuspend(p, a0),
+        34 => {
+            // pause
+            while !signal::interrupted(p) {
+                sched::sleep_ms(10);
+            }
+            -EINTR
         }
         16 => match a1 {
             0x5413 => {
@@ -2163,7 +2325,6 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             _ => device_ioctl(p, a0 as i64, a1, a2),
         },
         17 => sys_pread(p, a0 as i64, a1, a2, a3),
-        18 => -ENOSYS, // pwrite64
         19 => sys_readv(p, a0 as i64, a1, a2),
         20 => sys_writev(p, a0 as i64, a1, a2),
         21 => match path_at(p, -100, a0) {
@@ -2175,16 +2336,14 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             sched::yield_now();
             0
         }
-        25 => -ENOMEM, // mremap: callers fall back to copying
+        25 => sys_mremap(p, a0, a1, a2, a3),
         28 => 0,       // madvise
         32 => sys_dup(p, a0 as i64, None, 0),
         33 => sys_dup(p, a0 as i64, Some(a1 as i64), 0),
-        35 => {
-            if let Some(ms) = timespec_ms(p, a0) {
-                sched::sleep_ms(ms.max(1));
-            }
-            0
-        }
+        35 => match timespec_ms(p, a0) {
+            Some(ms) => if sleep_interruptible(p, ms.max(1)) { -EINTR } else { 0 },
+            None => -EFAULT,
+        },
         39 => p.pid as i64,
         41 => sys_socket(p, a0, a1),
         42 => sys_connect(p, a0 as i64, a1, a2),
@@ -2276,14 +2435,22 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         61 => sys_wait4(p, a0 as i32 as i64, a1, a2),
         62 => sys_kill(p, a0 as i32 as i64, a1),
         200 | 234 => {
-            // tkill / tgkill: fatal signals end the process.
-            let sig = if f.rax == 234 { a2 } else { a1 };
-            if matches!(sig, 6 | 9 | 11 | 15) {
-                let msg = if sig == 6 { "Aborted\n" } else { "Killed\n" };
-                super::process::exit_current_process(128 + sig as i64, Some(msg));
-                return true;
+            // tkill(tid, sig) / tgkill(tgid, tid, sig)
+            let (tgid, tid, sig) = if f.rax == 234 { (a0, a1, a2) } else { (p.pid, a0, a1) };
+            if sig > 64 {
+                -EINVAL
+            } else {
+                let target = if tgid == p.pid { Some(p.clone()) } else { super::process::find(tgid) };
+                match target {
+                    Some(t) => {
+                        if signal::send(&t, Some(tid), sig, signal::SI_TKILL, p.pid) {
+                            return true;
+                        }
+                        0
+                    }
+                    None => -ESRCH,
+                }
             }
-            0
         }
         63 => sys_uname(p, a0),
         72 => {
@@ -2314,6 +2481,10 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     },
                     None => -EBADF,
                 },
+                5 | 36 => {
+                    // F_GETLK / F_OFD_GETLK: nobody else holds a lock.
+                    if usermem::write_bytes(pml4, a2, &2u16.to_le_bytes()) { 0 } else { -EFAULT }
+                }
                 4 => {
                     if let Some(d) = get_fd(p, a0 as i64) {
                         match &mut *d.lock() {
@@ -2397,15 +2568,15 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             }
         }
         89 | 267 => {
-            // readlink(at): only /proc/self/exe
+            // readlink(at)
             let (pp, buf, len) = if f.rax == 89 { (a0, a1, a2) } else { (a1, a2, a3) };
-            let path = usermem::read_cstr(pml4, pp, 4096).unwrap_or_default();
-            if path == "/proc/self/exe" {
-                let exe = linux(p).map(|l| l.exe.lock().clone()).unwrap_or_default();
-                let n = exe.len().min(len as usize);
-                if usermem::write_bytes(pml4, buf, &exe.as_bytes()[..n]) { n as i64 } else { -EFAULT }
-            } else {
-                -EINVAL
+            let dirfd = if f.rax == 89 { -100 } else { a0 as i32 as i64 };
+            match readlink(p, dirfd, pp) {
+                Ok(target) => {
+                    let n = target.len().min(len as usize);
+                    if usermem::write_bytes(pml4, buf, &target.as_bytes()[..n]) { n as i64 } else { -EFAULT }
+                }
+                Err(e) => e,
             }
         }
         96 => {
@@ -2509,9 +2680,10 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 } else {
                     ms
                 };
-                sched::sleep_ms(ms.max(1));
+                if sleep_interruptible(p, ms.max(1)) { -EINTR } else { 0 }
+            } else {
+                -EFAULT
             }
-            0
         }
         231 => {
             super::process::exit_current_process(a0 as i64, None);
@@ -2582,7 +2754,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         273 => 0, // set_robust_list
         288 => sys_accept(p, a0 as i64, a1, a2, a3),
-        86 | 88 | 265 | 266 => -EPERM, // link / symlink: FAT32 has none
+        86 | 265 => -EPERM, // link: FAT32 has no hard links
         292 => {
             let r = sys_dup(p, a0 as i64, Some(a1 as i64), 0);
             if r >= 0 && a2 & O_CLOEXEC != 0
@@ -2608,6 +2780,200 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let mut b = vec![0u8; (a1 as usize).min(1 << 20)];
             fill_random(&mut b);
             if usermem::write_bytes(pml4, a0, &b) { b.len() as i64 } else { -EFAULT }
+        }
+        18 => sys_pwrite(p, a0 as i64, a1, a2, a3),
+        295 | 296 => sys_preadv(p, f.rax == 296, a0 as i64, a1, a2, a3),
+        23 | 270 => {
+            // select(n, r, w, e, timeval) / pselect6(n, r, w, e, timespec, sigmask)
+            let ms = if a4 == 0 {
+                -1
+            } else if f.rax == 23 {
+                let sec = usermem::read_u64(pml4, a4).unwrap_or(0);
+                let usec = usermem::read_u64(pml4, a4 + 8).unwrap_or(0);
+                (sec * 1000 + usec / 1000) as i64
+            } else {
+                timespec_ms(p, a4).map(|v| v as i64).unwrap_or(-1)
+            };
+            sys_select(p, a0 as usize, a1, a2, a3, ms)
+        }
+        26 | 149 | 150 | 151 | 152 | 325 => 0, // msync, mlock*, munlock*
+        27 => {
+            // mincore: everything counts as resident
+            let n = a1.div_ceil(PAGE_SIZE) as usize;
+            if usermem::write_bytes(pml4, a2, &vec![1u8; n]) { 0 } else { -EFAULT }
+        }
+        36 | 37 | 38 => {
+            // getitimer / alarm / setitimer: timers are not armed.
+            if f.rax == 36 && a1 != 0 {
+                usermem::write_bytes(pml4, a1, &[0u8; 32]);
+            }
+            if f.rax == 38 && a2 != 0 {
+                usermem::write_bytes(pml4, a2, &[0u8; 32]);
+            }
+            0
+        }
+        40 => sys_sendfile(p, a0 as i64, a1 as i64, a2, a3),
+        73 => if get_fd(p, a0 as i64).is_some() { 0 } else { -EBADF }, // flock: one user
+        76 => match path_at(p, -100, a0) {
+            // truncate(path, length)
+            Ok(path) => match fs::read_file(&path) {
+                Ok(mut d) => {
+                    d.resize(a1 as usize, 0);
+                    fs::write_file(&path, &d).map(|_| 0).unwrap_or_else(fs_err)
+                }
+                Err(e) => fs_err(e),
+            },
+            Err(e) => e,
+        },
+        81 => match get_fd(p, a0 as i64) {
+            // fchdir
+            Some(d) => match &*d.lock() {
+                Desc::Dir { path, .. } => {
+                    if let Some(l) = linux(p) {
+                        *l.cwd.lock() = path.clone();
+                    }
+                    0
+                }
+                _ => -ENOTDIR,
+            },
+            None => -EBADF,
+        },
+        85 => sys_openat(p, -100, a0, 0x241), // creat: O_CREAT | O_WRONLY | O_TRUNC
+        88 | 266 => {
+            // symlink(target, linkpath) / symlinkat(target, dirfd, linkpath):
+            // stored as a MayOS link file (FAT32 has no symbolic links).
+            let target = usermem::read_cstr(pml4, a0, 4096).unwrap_or_default();
+            let link = if f.rax == 88 { path_at(p, -100, a1) } else { path_at(p, a1 as i32 as i64, a2) };
+            match link {
+                Ok(link) if fs::exists(&link) => -EEXIST,
+                Ok(link) => {
+                    let mut d = fs::LINK_MAGIC.to_vec();
+                    d.extend_from_slice(target.as_bytes());
+                    fs::write_file(&link, &d).map(|_| 0).unwrap_or_else(fs_err)
+                }
+                Err(e) => e,
+            }
+        }
+        90 | 91 | 92 | 93 | 94 | 260 | 268 | 132 | 235 | 280 | 261 => 0, // chmod, chown, utime families
+        95 => 0o022, // umask: the old mask
+        98 => {
+            // getrusage: CPU time of the process's threads
+            let ms = sched::process_cpu_ms(p.pid);
+            let mut b = [0u8; 144];
+            b[0..8].copy_from_slice(&(ms / 1000).to_le_bytes());
+            b[8..16].copy_from_slice(&((ms % 1000) * 1000).to_le_bytes());
+            if usermem::write_bytes(pml4, a1, &b) { 0 } else { -EFAULT }
+        }
+        100 => {
+            // times: ticks of 10 ms
+            let t = sched::process_cpu_ms(p.pid) / 10;
+            if a0 != 0 {
+                let b: Vec<u8> = [t, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+                usermem::write_bytes(pml4, a0, &b);
+            }
+            (crate::time::uptime_ms() / 10) as i64
+        }
+        103 | 116 | 126 | 162 | 203 | 277 | 306 => 0, // syslog, setgroups, capset, sync, sched_setaffinity, sync_file_range, syncfs
+        109 => 0, // setpgid
+        111 | 112 | 121 | 124 => p.pid as i64, // getpgrp, setsid, getpgid, getsid
+        115 => 0, // getgroups: none extra
+        125 => {
+            // capget: no capabilities
+            if a1 != 0 {
+                usermem::write_bytes(pml4, a1, &[0u8; 24]);
+            }
+            0
+        }
+        140 => 20, // getpriority: nice 0
+        141 => 0,
+        142 | 143 => {
+            if f.rax == 143 {
+                usermem::write_u32(pml4, a1, 0);
+            }
+            0
+        }
+        144 | 145 | 146 | 147 => 0, // sched_setscheduler, getscheduler (SCHED_OTHER), priority range
+        148 => if write_timespec(p, a1, 10_000) { 0 } else { -EFAULT },
+        160 => 0, // setrlimit
+        161 | 165 | 166 | 272 => -EPERM, // chroot, mount, umount2, unshare
+        274 => -EPERM, // get_robust_list of another thread
+        317 => -EINVAL, // seccomp: not available (sandboxes must be off)
+        309 => {
+            // getcpu
+            if a0 != 0 {
+                usermem::write_u32(pml4, a0, 0);
+            }
+            if a1 != 0 {
+                usermem::write_u32(pml4, a1, 0);
+            }
+            0
+        }
+        253 | 294 => {
+            // inotify_init / inotify_init1: a descriptor that never reports
+            // changes (files are only changed by this machine's programs).
+            let flags = if f.rax == 294 { a0 } else { 0 };
+            let fd = add_fd(p, Desc::EventFd { ev: EventFd::new(0, false), nonblock: flags & O_NONBLOCK != 0 });
+            set_cloexec(p, fd, flags & O_CLOEXEC != 0);
+            fd
+        }
+        254 => {
+            // inotify_add_watch: a new watch number
+            static WD: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+            WD.fetch_add(1, Ordering::Relaxed)
+        }
+        255 => 0, // inotify_rm_watch
+        283 => {
+            // timerfd_create(clock, flags)
+            let t = Arc::new(TimerFd { state: Spin::new((0, 0)), realtime: a0 == 0 });
+            let fd = add_fd(p, Desc::TimerFd { t, nonblock: a1 & O_NONBLOCK != 0 });
+            set_cloexec(p, fd, a1 & O_CLOEXEC != 0);
+            fd
+        }
+        286 | 287 => sys_timerfd(p, f.rax == 286, a0 as i64, a1, a2, a3),
+        436 => {
+            // close_range(first, last, flags)
+            const CLOSE_RANGE_CLOEXEC: u64 = 4;
+            let n = linux(p).map(|l| l.fds.lock().len()).unwrap_or(0) as u64;
+            for fd in a0..=a1.min(n.saturating_sub(1)) {
+                if a2 & CLOSE_RANGE_CLOEXEC != 0 {
+                    if get_fd(p, fd as i64).is_some() {
+                        set_cloexec(p, fd as i64, true);
+                    }
+                } else {
+                    sys_close(p, fd as i64);
+                }
+            }
+            0
+        }
+        307 => {
+            // sendmmsg(fd, msgvec, n, flags): struct mmsghdr is 64 bytes
+            let mut sent = 0;
+            for i in 0..a2.min(1024) {
+                let r = sys_sendmsg(p, a0 as i64, a1 + i * 64);
+                if r < 0 {
+                    if sent == 0 {
+                        sent = r;
+                    }
+                    break;
+                }
+                usermem::write_u32(pml4, a1 + i * 64 + 56, r as u32);
+                sent += 1;
+            }
+            sent
+        }
+        299 => {
+            // recvmmsg: one message at a time
+            if a2 == 0 {
+                0
+            } else {
+                let r = sys_recvmsg(p, a0 as i64, a1, a3);
+                if r >= 0 {
+                    usermem::write_u32(pml4, a1 + 56, r as u32);
+                    1
+                } else {
+                    r
+                }
+            }
         }
         _ => {
             // Report each missing call once.
@@ -2759,6 +3125,8 @@ fn sys_fork(p: &Arc<Process>, f: &TrapFrame, flags: u64, newsp: u64, ptid: u64, 
         cloexec: Spin::new(l.cloexec.lock().clone()),
         screen: Spin::new(None),
         shared: Spin::new(l.shared.lock().clone()),
+        sig: Spin::new(l.sig.lock().fork_copy(sched::current_id())),
+        mapped: Spin::new(l.mapped.lock().clone()),
     };
     let child = super::process::fork_process(p, pml4, state);
     let mut frame = f.clone();
@@ -2863,9 +3231,11 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     sched::switch_address_space(pml4);
     paging::destroy_address_space(old);
     *l.regions.lock() = alloc::vec![stack];
+    l.mapped.lock().clear();
     *l.mmap_next.lock() = MMAP_BASE;
     *l.brk.lock() = (brk, brk);
-    *l.exe.lock() = path;
+    // The real file: programs find their files next to it (Firefox).
+    *l.exe.lock() = fs::resolve_link(&path);
     let closing: Vec<usize> = core::mem::take(&mut *l.cloexec.lock()).into_iter().collect();
     let dropped: Vec<Option<DescRef>> = {
         let mut fds = l.fds.lock();
@@ -2873,6 +3243,7 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     };
     drop(dropped);
     sched::set_clear_child_tid(0);
+    l.sig.lock().exec_reset();
     let (cs, ss) = (f.cs, f.ss);
     *f = TrapFrame { rip: entry, rsp, cs, ss, rflags: 0x202, ..Default::default() };
     // Fresh floating-point state.
@@ -2903,22 +3274,26 @@ fn sys_wait4(p: &Arc<Process>, pid: i64, status: u64, options: u64) -> i64 {
         if options & WNOHANG != 0 {
             return 0;
         }
+        if signal::interrupted(p) {
+            return -EINTR;
+        }
         sched::sleep_ms(2);
     }
 }
 
-/// kill: signals are not delivered, so any fatal signal ends the target.
+/// kill: queue the signal, or end the target if it has no handler.
 fn sys_kill(p: &Arc<Process>, pid: i64, sig: u64) -> i64 {
     let target = if pid == 0 || pid == -1 { p.pid } else { pid.unsigned_abs() };
     let Some(t) = super::process::find(target) else { return -ESRCH };
-    if sig == 0 || sig == 17 || sig == 18 || sig == 28 || sig == 23 {
-        return 0; // probe, SIGCHLD, SIGCONT, SIGWINCH, SIGURG
+    if sig > 64 {
+        return -EINVAL;
     }
-    if t.pid == p.pid {
-        super::process::exit_current_process(-(sig as i64), None);
+    if t.has_exited().is_some() {
+        return if sig == 0 { -ESRCH } else { 0 };
+    }
+    if signal::send(&t, None, sig, signal::SI_USER, p.pid) {
         sched::exit_current();
     }
-    super::process::kill_signal(&t, sig as i64);
     0
 }
 
@@ -2947,19 +3322,345 @@ fn sys_mprotect(p: &Process, addr: u64, len: u64, prot: u64) -> i64 {
             if r.start < addr {
                 out.push(Region { end: addr, ..*r });
             }
-            out.push(Region { start: r.start.max(addr), end: r.end.min(end), writable: prot & 2 != 0 || prot == 0, exec: prot & 4 != 0 });
+            out.push(Region { end: r.end.min(end), writable: prot & 2 != 0 || prot == 0, exec: prot & 4 != 0, none: prot == 0, ..r.from(r.start.max(addr)) });
             if r.end > end {
-                out.push(Region { start: end, ..*r });
+                out.push(r.from(end));
             }
         }
         *regs = out;
     }
     let mut a = addr;
     while a < end {
-        if prot != 0 {
-            paging::set_flags(p.pml4(), a, flags);
-        }
+        // PROT_NONE keeps the page (and its contents) but only for the
+        // kernel: user accesses fault until the rights come back.
+        paging::set_flags(p.pml4(), a, if prot == 0 { flags & !USER } else { flags });
         a += PAGE_SIZE;
     }
     0
+}
+
+/// preadv / pwritev(fd, iov, cnt, offset)
+fn sys_preadv(p: &Process, write: bool, fd: i64, iov: u64, cnt: u64, mut off: u64) -> i64 {
+    let Some(vecs) = iovecs(p, iov, cnt) else { return -EFAULT };
+    let mut total = 0i64;
+    for (b, l) in vecs {
+        let r = if write { sys_pwrite(p, fd, b, l, off) } else { sys_pread(p, fd, b, l, off) };
+        if r < 0 {
+            return if total == 0 { r } else { total };
+        }
+        total += r;
+        off += r as u64;
+        if (r as u64) < l {
+            break;
+        }
+    }
+    total
+}
+
+/// sendfile(out, in, offset*, count)
+fn sys_sendfile(p: &Process, out: i64, inp: i64, offp: u64, count: u64) -> i64 {
+    let Some(src) = get_fd(p, inp) else { return -EBADF };
+    let Some(dst) = get_fd(p, out) else { return -EBADF };
+    let mut buf = vec![0u8; (count as usize).min(1 << 20)];
+    let n = if offp != 0 {
+        let off = usermem::read_u64(p.pml4(), offp).unwrap_or(0);
+        let n = read_at(&mut src.lock(), off, &mut buf);
+        if n > 0 {
+            usermem::write_u64(p.pml4(), offp, off + n as u64);
+        }
+        n
+    } else {
+        read_desc(p, &src, &mut buf)
+    };
+    if n <= 0 { n } else { write_desc(p, &dst, &buf[..n as usize]) }
+}
+
+/// pwrite64: write at an offset without moving the file position.
+fn sys_pwrite(p: &Process, fd: i64, ptr: u64, len: u64, off: u64) -> i64 {
+    let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let Some(data) = usermem::read_bytes(p.pml4(), ptr, len.min(16 * 1024 * 1024)) else { return -EFAULT };
+    let mut g = d.lock();
+    match &mut *g {
+        Desc::File { data: Some(buf), writable: true, dirty, size, .. } => {
+            let end = off as usize + data.len();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[off as usize..end].copy_from_slice(&data);
+            *size = buf.len() as u64;
+            *dirty = true;
+            data.len() as i64
+        }
+        Desc::Memfd { pos, .. } => {
+            let saved = *pos;
+            *pos = off;
+            drop(g);
+            let r = write_desc(p, &d, &data);
+            if let Desc::Memfd { pos, .. } = &mut *d.lock() {
+                *pos = saved;
+            }
+            r
+        }
+        Desc::File { .. } => -EBADF,
+        _ => -ESPIPE,
+    }
+}
+
+/// select / pselect6 on top of the poll readiness checks.
+fn sys_select(p: &Process, n: usize, rp: u64, wp: u64, ep: u64, timeout_ms: i64) -> i64 {
+    let n = n.min(1024);
+    let words = n.div_ceil(64);
+    let read_set = |ptr: u64| -> Option<Vec<u64>> {
+        if ptr == 0 {
+            return Some(vec![0; words]);
+        }
+        (0..words).map(|i| usermem::read_u64(p.pml4(), ptr + i as u64 * 8)).collect()
+    };
+    let (Some(r), Some(w), Some(_e)) = (read_set(rp), read_set(wp), read_set(ep)) else { return -EFAULT };
+    let deadline = if timeout_ms < 0 { u64::MAX } else { crate::time::uptime_ms() + timeout_ms as u64 };
+    loop {
+        let mut ro = vec![0u64; words];
+        let mut wo = vec![0u64; words];
+        let mut count = 0;
+        for fd in 0..n {
+            let (wr, ww) = (r[fd / 64] >> (fd % 64) & 1 != 0, w[fd / 64] >> (fd % 64) & 1 != 0);
+            if !wr && !ww {
+                continue;
+            }
+            let ev = ready(p, fd as i64, if wr { 1 } else { 0 } | if ww { 4 } else { 0 });
+            if ev & 0x20 != 0 {
+                return -EBADF;
+            }
+            if wr && ev & (1 | 0x10 | 8) != 0 {
+                ro[fd / 64] |= 1 << (fd % 64);
+                count += 1;
+            }
+            if ww && ev & (4 | 8) != 0 {
+                wo[fd / 64] |= 1 << (fd % 64);
+                count += 1;
+            }
+        }
+        if count > 0 || crate::time::uptime_ms() >= deadline {
+            let write_set = |ptr: u64, v: &[u64]| ptr == 0 || v.iter().enumerate().all(|(i, x)| usermem::write_u64(p.pml4(), ptr + i as u64 * 8, *x));
+            if !write_set(rp, &ro) || !write_set(wp, &wo) || !write_set(ep, &vec![0; words]) {
+                return -EFAULT;
+            }
+            return count;
+        }
+        if signal::interrupted(p) {
+            return -EINTR;
+        }
+        sched::sleep_ms(2);
+    }
+}
+
+/// timerfd_settime(fd, flags, new, old) / timerfd_gettime(fd, cur)
+fn sys_timerfd(p: &Process, set: bool, fd: i64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let Some(d) = get_fd(p, fd) else { return -EBADF };
+    let t = match &*d.lock() {
+        Desc::TimerFd { t, .. } => t.clone(),
+        _ => return -EINVAL,
+    };
+    let pml4 = p.pml4();
+    let ts_us = |ptr: u64| -> Option<u64> {
+        let s = usermem::read_u64(pml4, ptr)?;
+        let ns = usermem::read_u64(pml4, ptr + 8)?;
+        Some(s.saturating_mul(1_000_000) + ns / 1000)
+    };
+    let put_us = |ptr: u64, us: u64| usermem::write_u64(pml4, ptr, us / 1_000_000) && usermem::write_u64(pml4, ptr + 8, (us % 1_000_000) * 1000);
+    let now = crate::time::uptime_us();
+    let cur = *t.state.lock();
+    let out = if set { a3 } else { a1 };
+    if out != 0 {
+        let left = if cur.0 == 0 { 0 } else { cur.0.saturating_sub(now).max(1) };
+        if !(put_us(out, cur.1) && put_us(out + 16, left)) {
+            return -EFAULT;
+        }
+    }
+    if set {
+        let (Some(interval), Some(value)) = (ts_us(a2), ts_us(a2 + 16)) else { return -EFAULT };
+        const TFD_TIMER_ABSTIME: u64 = 1;
+        let next = if value == 0 {
+            0
+        } else if a1 & TFD_TIMER_ABSTIME != 0 {
+            let clock_now = if t.realtime { unix_ms() * 1000 } else { now };
+            now + value.saturating_sub(clock_now).max(1)
+        } else {
+            now + value
+        };
+        *t.state.lock() = (next, interval);
+    }
+    0
+}
+
+/// mremap: grow or shrink an anonymous mapping, moving it if allowed.
+fn sys_mremap(p: &Process, old: u64, old_len: u64, new_len: u64, flags: u64) -> i64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    let Some(l) = linux(p) else { return -ENOSYS };
+    if old & (PAGE_SIZE - 1) != 0 || new_len == 0 {
+        return -EINVAL;
+    }
+    let old_len = old_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let new_len = new_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    // The old range must be one mapping (musl probes the stack this way
+    // and expects EFAULT past its end).
+    let region = l.regions.lock().iter().find(|r| old >= r.start && old < r.end).copied();
+    let Some(r) = region else { return -EFAULT };
+    if old + old_len > r.end {
+        return -EFAULT;
+    }
+    if new_len <= old_len {
+        remove_regions(l, old + new_len, old + old_len);
+        unmap_range(p, old + new_len, old + old_len);
+        return old as i64;
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -ENOMEM;
+    }
+    // Move: a fresh range, with the old pages re-pointed there.
+    let start = {
+        let mut next = l.mmap_next.lock();
+        let s = *next;
+        *next += new_len + PAGE_SIZE;
+        s
+    };
+    l.regions.lock().push(Region { start, end: start + new_len, ..r });
+    let mut a = 0;
+    while a < old_len {
+        if let Some((phys, entry)) = paging::translate(p.pml4(), old + a)
+            && entry & paging::BORROWED == 0
+        {
+            let frame = phys & !(PAGE_SIZE - 1);
+            paging::unmap(p.pml4(), old + a);
+            let mut flags = USER;
+            if r.writable {
+                flags |= WRITABLE;
+            }
+            if !r.exec {
+                flags |= NO_EXECUTE;
+            }
+            if paging::map(p.pml4(), start + a, frame, flags).is_err() {
+                pmm::free_frame(frame);
+            }
+        }
+        a += PAGE_SIZE;
+    }
+    remove_regions(l, old, old + old_len);
+    unmap_range(p, old, old + old_len);
+    start as i64
+}
+
+/// readlink: MayOS link files and the /proc/self links.
+fn readlink(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
+    let raw = usermem::read_cstr(p.pml4(), ptr, 4096).ok_or(-EFAULT)?;
+    let raw = proc_self(p, &raw);
+    if raw == "/proc/self/exe" {
+        return Ok(linux(p).map(|l| l.exe.lock().clone()).unwrap_or_default());
+    }
+    if raw == "/proc/self/cwd" {
+        return Ok(linux(p).map(|l| l.cwd.lock().clone()).unwrap_or_default());
+    }
+    if let Some(n) = raw.strip_prefix("/proc/self/fd/") {
+        let fd: i64 = n.parse().map_err(|_| -ENOENT)?;
+        let d = get_fd(p, fd).ok_or(-ENOENT)?;
+        let g = d.lock();
+        return Ok(match &*g {
+            Desc::File { path, .. } | Desc::Dir { path, .. } => path.clone(),
+            Desc::Console => String::from("/dev/tty"),
+            Desc::Null => String::from("/dev/null"),
+            Desc::PipeRead(_) | Desc::PipeWrite(_) => alloc::format!("pipe:[{}]", fd + 1000),
+            Desc::Tcp { .. } | Desc::Udp { .. } | Desc::Unix { .. } => alloc::format!("socket:[{}]", fd + 1000),
+            Desc::Memfd { .. } => String::from("/memfd: (deleted)"),
+            _ => alloc::format!("anon_inode:[{}]", fd),
+        });
+    }
+    let path = path_at(p, dirfd, ptr)?;
+    let data = fs::read_file(&path).map_err(fs_err)?;
+    if data.len() < 1024 && data.starts_with(fs::LINK_MAGIC) {
+        Ok(String::from_utf8_lossy(&data[fs::LINK_MAGIC.len()..]).trim().to_string())
+    } else {
+        Err(-EINVAL)
+    }
+}
+
+/// "/proc/<own pid>/..." and "/proc/thread-self/..." name "/proc/self/...".
+fn proc_self(p: &Process, path: &str) -> String {
+    let own = alloc::format!("/proc/{}/", p.pid);
+    if let Some(rest) = path.strip_prefix(own.as_str()) {
+        return alloc::format!("/proc/self/{}", rest);
+    }
+    if let Some(rest) = path.strip_prefix("/proc/thread-self/") {
+        return alloc::format!("/proc/self/{}", rest);
+    }
+    String::from(path)
+}
+
+/// Per-process /proc files and a few /sys files programs look at.
+fn proc_file(p: &Process, path: &str) -> Option<Desc> {
+    let path = proc_self(p, path);
+    let l = linux(p)?;
+    let name = l.exe.lock().rsplit('/').next().unwrap_or("").chars().take(15).collect::<String>();
+    let threads = sched::process_thread_count(p.pid);
+    let text = match path.as_str() {
+        "/proc/self/maps" | "/proc/self/smaps" => {
+            let mut regs = l.regions.lock().clone();
+            regs.sort_by_key(|r| r.start);
+            let mut t = String::new();
+            for r in regs {
+                t.push_str(&alloc::format!(
+                    "{:x}-{:x} r{}{}p 00000000 00:00 0\n",
+                    r.start,
+                    r.end,
+                    if r.writable { 'w' } else { '-' },
+                    if r.exec { 'x' } else { '-' }
+                ));
+            }
+            t
+        }
+        "/proc/self/cmdline" => {
+            let mut t = l.exe.lock().clone();
+            t.push('\0');
+            t
+        }
+        "/proc/self/comm" => alloc::format!("{}\n", name),
+        "/proc/self/stat" => {
+            let cpu = sched::process_cpu_ms(p.pid) / 10;
+            alloc::format!(
+                "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 {} 0 0 0 20 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                p.pid, name, p.parent.max(1), p.pid, p.pid, cpu, threads
+            )
+        }
+        "/proc/self/statm" => String::from("0 0 0 0 0 0 0\n"),
+        "/proc/self/status" => alloc::format!(
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nVmRSS:\t0 kB\nThreads:\t{}\nSigQ:\t0/0\n",
+            name, p.pid, p.pid, p.parent.max(1), threads
+        ),
+        "/proc/self/oom_score_adj" | "/proc/self/oom_adj" | "/proc/self/loginuid" => String::from("0\n"),
+        "/proc/self/mountinfo" | "/proc/mounts" | "/proc/self/mounts" => String::from("1 0 0:1 / / rw - vfat /dev/root rw\n"),
+        "/proc/self/limits" => String::from("Limit Soft Limit Hard Limit Units\nMax stack size 8388608 unlimited bytes\nMax open files 1024 1024 files\n"),
+        "/proc/sys/kernel/osrelease" => String::from("6.1.0-mayos\n"),
+        "/proc/sys/kernel/random/uuid" | "/proc/sys/kernel/random/boot_id" => {
+            let mut b = [0u8; 16];
+            fill_random(&mut b);
+            let h: String = b.iter().map(|x| alloc::format!("{:02x}", x)).collect();
+            alloc::format!("{}-{}-{}-{}-{}\n", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+        }
+        "/proc/sys/kernel/yama/ptrace_scope" => String::from("1\n"),
+        "/proc/sys/kernel/pid_max" => String::from("4194304\n"),
+        "/proc/sys/vm/overcommit_memory" => String::from("0\n"),
+        "/proc/uptime" => {
+            let ms = crate::time::uptime_ms();
+            alloc::format!("{}.{:02} {}.{:02}\n", ms / 1000, ms % 1000 / 10, ms / 1000, ms % 1000 / 10)
+        }
+        "/proc/loadavg" => String::from("0.00 0.00 0.00 1/1 1\n"),
+        "/proc/stat" => String::from("cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nbtime 0\n"),
+        "/proc/version" => String::from("Linux version 6.1.0-mayos (MayOS) #1\n"),
+        "/proc/filesystems" => String::from("\tvfat\nnodev\ttmpfs\n"),
+        "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/present" | "/sys/devices/system/cpu/possible" => String::from("0\n"),
+        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq" => String::from("2000000\n"),
+        "/etc/machine-id" | "/var/lib/dbus/machine-id" => String::from("6d61796f736d61796f736d61796f7331\n"),
+        "/etc/localtime" => return None,
+        _ => return None,
+    };
+    Some(Desc::Virtual { data: text.into_bytes(), pos: 0 })
 }

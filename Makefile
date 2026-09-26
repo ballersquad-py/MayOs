@@ -15,6 +15,9 @@ USER_DIR   := userspace/target/x86_64-unknown-none/release
 # installed (`rustup target add x86_64-unknown-linux-musl`).
 LINUX_BINS := $(shell rustup target list --installed 2>/dev/null | grep -q x86_64-unknown-linux-musl && echo linux-hello linux-paint)
 USER_BINS  += $(LINUX_BINS)
+# C test of the Linux layer (signals, timerfd, ...), built when musl-gcc is installed.
+LINUX_C    := $(shell command -v musl-gcc >/dev/null 2>&1 && echo linux-signals)
+USER_BINS  += $(LINUX_C)
 
 QEMU       ?= qemu-system-x86_64
 # Sound backend for QEMU: pa (PulseAudio), pipewire, alsa, sdl, dsound
@@ -48,6 +51,9 @@ userspace:
 	for b in $(LINUX_BINS); do \
 		(cd examples/$$b && cargo build --release --target x86_64-unknown-linux-musl) && \
 		cp examples/$$b/target/x86_64-unknown-linux-musl/release/$$b $(USER_DIR)/ || exit 1; \
+	done
+	for b in $(LINUX_C); do \
+		musl-gcc -static -O2 -o $(USER_DIR)/$$b examples/$$b/signals.c -lpthread || exit 1; \
 	done
 
 define make_iso

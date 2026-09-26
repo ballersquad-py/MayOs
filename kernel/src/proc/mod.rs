@@ -3,6 +3,7 @@ pub mod linux;
 pub mod process;
 pub mod sched;
 pub mod screen;
+pub mod signal;
 pub mod syscall;
 pub mod unix;
 pub mod wayland;
