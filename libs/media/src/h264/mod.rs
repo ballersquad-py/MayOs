@@ -235,7 +235,7 @@ impl Decoder {
     }
 
     fn decode_au(&mut self, data: &[u8]) -> Result<()> {
-        if self.length_size > 0 && !starts_with_start_code(data) {
+        if self.length_size > 0 && (lengths_tile(data, self.length_size) || !starts_with_start_code(data)) {
             let mut p = 0;
             while p + self.length_size <= data.len() {
                 let mut len = 0usize;
@@ -784,6 +784,21 @@ impl Decoder {
         self.out.push_back(Frame { buf, crop_x: cx, crop_y: cy, width: w, height: h, poc, full_range: full, matrix });
         true
     }
+}
+
+/// True when `d` splits exactly into length-prefixed NAL units. A sample
+/// whose first NAL is 256..511 bytes long begins with `00 00 01`, which
+/// looks like an Annex B start code, so the prefix sizes decide.
+fn lengths_tile(d: &[u8], size: usize) -> bool {
+    let mut p = 0;
+    while p + size <= d.len() {
+        let len = d[p..p + size].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+        if len == 0 {
+            return false;
+        }
+        p += size + len;
+    }
+    p == d.len()
 }
 
 fn starts_with_start_code(d: &[u8]) -> bool {
