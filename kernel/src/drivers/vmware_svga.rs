@@ -66,10 +66,38 @@ unsafe impl Send for VmwareSvga {}
 
 static REPORT: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
 
+static FAILURES: crate::sync::Spin<alloc::string::String> = crate::sync::Spin::new(alloc::string::String::new());
+
+/// Remember why the adapter could not be used (shown by `gpuinfo`).
+pub fn fail(why: alloc::string::String) {
+    crate::kprintln!("svga: {}", why);
+    let mut f = FAILURES.lock();
+    if f.len() < 4000 {
+        f.push_str(&why);
+        f.push('\n');
+    }
+}
+
 /// The 3D capability report made at start-up (the `gpuinfo` command).
 pub fn report() -> alloc::string::String {
-    let r = REPORT.lock().clone();
-    if r.is_empty() { alloc::string::String::from("No VMware SVGA (VMSVGA) display adapter in use.\n") } else { r }
+    let mut r = REPORT.lock().clone();
+    let f = FAILURES.lock().clone();
+    let mut devs = alloc::string::String::new();
+    for d in crate::drivers::pci::devices() {
+        if d.class == 0x03 {
+            devs.push_str(&alloc::format!("display device {:04x}:{:04x} at {:02x}:{:02x}.{} BAR0 {:#x}\n", d.vendor, d.device, d.bus, d.slot, d.func, d.read32(0x10)));
+        }
+    }
+    devs.push_str(&alloc::format!("MayOS is using: {}\n", crate::gui::display_description()));
+    if r.is_empty() {
+        r = alloc::string::String::from("No VMware SVGA (VMSVGA) display adapter in use.\n");
+    }
+    r.push_str(&devs);
+    if !f.is_empty() {
+        r.push_str("Problems:\n");
+        r.push_str(&f);
+    }
+    r
 }
 
 impl VmwareSvga {
@@ -90,6 +118,7 @@ impl VmwareSvga {
     pub fn new(pci: &PciDevice) -> Option<VmwareSvga> {
         let bar0 = pci.read32(0x10);
         if bar0 & 1 == 0 {
+            fail(alloc::format!("BAR0 {:#x} is not an I/O port range", bar0));
             return None; // not the I/O-port register interface
         }
         let cmd = pci.read32(0x04);
@@ -110,7 +139,9 @@ impl VmwareSvga {
             pending: false,
         };
         dev.write(REG_ID, SVGA_ID_2);
-        if dev.read(REG_ID) != SVGA_ID_2 {
+        let id = dev.read(REG_ID);
+        if id != SVGA_ID_2 {
+            fail(alloc::format!("device refused SVGA_ID_2 (id {:#x})", id));
             return None;
         }
         dev.fb_phys = dev.read(REG_FB_START) as u64;
@@ -120,11 +151,18 @@ impl VmwareSvga {
         dev.vram = dev.read(REG_VRAM_SIZE) as usize;
         dev.max = (dev.read(REG_MAX_WIDTH), dev.read(REG_MAX_HEIGHT));
         if dev.fb_phys == 0 || dev.vram < 1024 * 1024 {
+            fail(alloc::format!("framebuffer {:#x}, vram {} bytes", dev.fb_phys, dev.vram));
             return None;
         }
         // Map all of VRAM (up to 256 MiB) once.
         dev.fb_len = dev.vram.min(256 * 1024 * 1024);
-        dev.fb_virt = paging::map_framebuffer(dev.fb_phys, dev.fb_len)?;
+        dev.fb_virt = match paging::map_framebuffer(dev.fb_phys, dev.fb_len) {
+            Some(v) => v,
+            None => {
+                fail(alloc::format!("cannot map {} MiB of VRAM at {:#x}", dev.fb_len >> 20, dev.fb_phys));
+                return None;
+            }
+        };
 
         let fifo_phys = match dev.read(REG_MEM_START) as u64 {
             0 => pci.bar(2),
@@ -132,6 +170,7 @@ impl VmwareSvga {
         };
         let fifo_size = dev.read(REG_MEM_SIZE) as usize;
         if fifo_phys == 0 || fifo_size < 4096 {
+            fail(alloc::format!("FIFO at {:#x}, size {}", fifo_phys, fifo_size));
             return None;
         }
         dev.fifo = paging::map_mmio(fifo_phys, fifo_size) as *mut u32;
@@ -230,12 +269,14 @@ impl VmwareSvga {
         self.write(REG_BITS_PER_PIXEL, 32);
         self.write(REG_ENABLE, 1);
         if self.read(REG_WIDTH) != w || self.read(REG_HEIGHT) != h {
+            fail(alloc::format!("mode {}x{}: device reports {}x{}", w, h, self.read(REG_WIDTH), self.read(REG_HEIGHT)));
             return false;
         }
         let pitch = self.read(REG_BYTES_PER_LINE) as usize;
         let offset = self.read(REG_FB_OFFSET) as usize;
         if pitch < w as usize * 4 || offset + pitch * h as usize > self.fb_len {
             crate::kprintln!("svga: mode {}x{} has pitch {} offset {} beyond VRAM", w, h, pitch, offset);
+            fail(alloc::format!("mode {}x{}: pitch {} offset {} beyond {} MiB of VRAM", w, h, pitch, offset, self.fb_len >> 20));
             return false;
         }
         self.pitch = pitch;
@@ -247,6 +288,7 @@ impl VmwareSvga {
 
     pub fn set_mode(&mut self, w: u32, h: u32) -> bool {
         if !self.supports(w, h) {
+            fail(alloc::format!("mode {}x{} not supported (max {}x{}, VRAM mapped {} MiB)", w, h, self.max.0, self.max.1, self.fb_len >> 20));
             return false;
         }
         let old = (self.width, self.height);

@@ -181,7 +181,10 @@ fn init_devices() {
                     gui::set_display(disp);
                     break;
                 }
-                None => kprintln!("gpu: {:04x}:{:04x} could not be initialised", d.vendor, d.device),
+                None => {
+                    kprintln!("gpu: {:04x}:{:04x} could not be initialised", d.vendor, d.device);
+                    drivers::vmware_svga::fail(alloc::format!("{:04x}:{:04x} could not be initialised (boot screen {:?})", d.vendor, d.device, gui::display::Display::boot_size()));
+                }
             }
         }
     }
