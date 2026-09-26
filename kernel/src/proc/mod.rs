@@ -4,4 +4,5 @@ pub mod process;
 pub mod sched;
 pub mod screen;
 pub mod syscall;
+pub mod unix;
 pub mod usermem;
