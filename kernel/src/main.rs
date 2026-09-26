@@ -43,7 +43,8 @@ extern "C" fn kmain() -> ! {
     }
     mem::init();
     // Per-CPU area (GS), GDT and TSS of the boot CPU, then the IDT.
-    gdt::init_cpu(arch::percpu::install(0, 0));
+    let bsp = arch::percpu::install(0, 0);
+    gdt::init_cpu(bsp);
     idt::init();
     let (free, total) = mem::pmm::stats();
     kprintln!("memory: {} MiB free of {} MiB", free * 4 / 1024, total * 4 / 1024);
@@ -53,6 +54,7 @@ extern "C" fn kmain() -> ! {
     kprintln!("acpi: {} cpu(s), {} io-apic(s)", acpi.cpu_count, acpi.ioapics.len());
     apic::init(acpi);
     let tsc_per_ms = apic::start_timer(1000);
+    arch::percpu::this().lapic_id = apic::lapic_id();
     time::init(tsc_per_ms);
     idt::init_syscall();
     cpu::enable_sse();
@@ -66,6 +68,7 @@ extern "C" fn kmain() -> ! {
     init_devices();
 
     proc::sched::init();
+    proc::sched::start_reaper();
     // The other CPUs join the scheduler once it exists.
     smp::start();
     // Drivers that start their own threads come after the scheduler.

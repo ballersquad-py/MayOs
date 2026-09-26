@@ -40,6 +40,7 @@ const EXCEPTION_NAMES: [&str; 32] = [
     "Reserved",
 ];
 
+
 #[unsafe(no_mangle)]
 extern "C" fn interrupt_dispatch(frame: &mut TrapFrame) -> u64 {
     let vector = frame.vector as u8;

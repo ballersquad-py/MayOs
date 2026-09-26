@@ -2700,6 +2700,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         105 | 106 | 113 | 114 | 117 | 119 => 0, // set*id: one user
         61 => sys_wait4(p, a0 as i32 as i64, a1, a2),
+        247 => sys_waitid(p, a0, a1 as i32 as i64, a2, a3),
         62 => sys_kill(p, a0 as i32 as i64, a1),
         200 | 234 => {
             // tkill(tid, sig) / tgkill(tgid, tid, sig)
@@ -4073,4 +4074,49 @@ fn remember_unlinked(path: &str) {
         u.clear();
     }
     u.insert(String::from(path));
+}
+
+
+/// waitid(idtype, id, infop, options): like wait4, reported in a siginfo.
+fn sys_waitid(p: &Arc<Process>, idtype: u64, id: i64, infop: u64, options: u64) -> i64 {
+    const WNOHANG: u64 = 1;
+    const WNOWAIT: u64 = 0x0100_0000;
+    let want = |c: &Arc<Process>| match idtype {
+        0 => true,                 // P_ALL
+        1 => c.pid as i64 == id,   // P_PID
+        _ => true,                 // P_PGID: one process group
+    };
+    loop {
+        let ev_seen = sched::events();
+        let kids: Vec<Arc<Process>> = super::process::children(p.pid).into_iter().filter(|c| want(c)).collect();
+        if kids.is_empty() {
+            return -ECHILD;
+        }
+        if let Some((c, code)) = kids.iter().find_map(|c| c.has_exited().map(|code| (c, code))) {
+            let mut si = [0u8; 128];
+            si[0..4].copy_from_slice(&17u32.to_le_bytes()); // SIGCHLD
+            let (cld, status): (u32, i32) = if code < 0 && code >= -64 { (2, (-code) as i32) } else if code == -130 { (2, 2) } else { (1, (code & 0xff) as i32) };
+            si[8..12].copy_from_slice(&cld.to_le_bytes()); // CLD_EXITED / CLD_KILLED
+            si[16..20].copy_from_slice(&(c.pid as u32).to_le_bytes());
+            si[20..24].copy_from_slice(&1000u32.to_le_bytes());
+            si[24..28].copy_from_slice(&status.to_le_bytes());
+            if infop != 0 && !usermem::write_bytes(p.pml4(), infop, &si) {
+                return -EFAULT;
+            }
+            if options & WNOWAIT == 0 {
+                super::process::reap(c.pid);
+            }
+            return 0;
+        }
+        if options & WNOHANG != 0 {
+            if infop != 0 {
+                usermem::write_bytes(p.pml4(), infop, &[0u8; 128]);
+            }
+            return 0;
+        }
+        if signal::interrupted(p) {
+            return -EINTR;
+        }
+        sched::wait_event(ev_seen, 20);
+    }
 }

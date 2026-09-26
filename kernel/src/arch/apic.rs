@@ -111,6 +111,17 @@ pub fn ipi_others(vector: u8) {
     lapic_write(ICR_LOW, vector as u32 | (1 << 14) | (0b11 << 18));
 }
 
+/// Send `vector` to the CPU with local APIC id `dest`.
+pub fn ipi_to(dest: u32, vector: u8) {
+    const ICR_LOW: usize = 0x300;
+    const ICR_HIGH: usize = 0x310;
+    while lapic_read(ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    lapic_write(ICR_HIGH, dest << 24);
+    lapic_write(ICR_LOW, vector as u32 | (1 << 14));
+}
+
 pub fn lapic_id() -> u32 {
     lapic_read(LAPIC_ID) >> 24
 }

@@ -35,6 +35,11 @@ pub struct PerCpu {
     /// `on_cpu` flag of the thread switched away from, cleared once we are
     /// off its stack (offset 32).
     pub prev_on_cpu: u64,
+    /// The thread running here (a `*const sched::Thread`), 0 before the
+    /// scheduler runs (offset 40: read with one gs-relative load).
+    pub current_thread: u64,
+    /// The address space loaded here (for targeted TLB shootdowns).
+    pub cr3: core::sync::atomic::AtomicU64,
     pub lapic_id: u32,
     pub gdt: [u64; 7],
     pub tss: Tss,
@@ -53,6 +58,8 @@ pub fn install(index: usize, lapic_id: u32) -> &'static mut PerCpu {
         user_rsp: 0,
         index: index as u64,
         prev_on_cpu: 0,
+        current_thread: 0,
+        cr3: core::sync::atomic::AtomicU64::new(0),
         lapic_id,
         gdt: [0; 7],
         tss: Tss { _r0: 0, rsp: [0; 3], _r1: 0, ist: [0; 7], _r2: 0, _r3: 0, iomap_base: core::mem::size_of::<Tss>() as u16 },
@@ -81,6 +88,12 @@ pub fn index() -> usize {
     let v: u64;
     unsafe { core::arch::asm!("mov {}, gs:[24]", out(reg) v, options(nostack, readonly, preserves_flags)) };
     v as usize
+}
+
+/// CPU `i`'s area, if it is running.
+pub fn get(i: usize) -> Option<&'static PerCpu> {
+    let p = CPUS[i].load(Ordering::Acquire);
+    if p == 0 { None } else { Some(unsafe { &*(p as *const PerCpu) }) }
 }
 
 /// This CPU's area.

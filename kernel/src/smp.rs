@@ -67,6 +67,7 @@ extern "C" fn ap_main(info: *const crate::boot::MpInfo) -> ! {
     let boot = unsafe { &*(info.extra_argument as *const ApBoot) };
     unsafe { cpu::write_cr3(crate::mem::paging::kernel_pml4()) };
     let pc = percpu::install(boot.index, info.lapic_id);
+    pc.cr3.store(crate::mem::paging::kernel_pml4(), Ordering::Release);
     gdt::init_cpu(pc);
     idt::load();
     idt::init_syscall();
@@ -88,28 +89,55 @@ static SHOOT_LOCK: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
-/// User mappings of `pml4` changed (unmapped or made stricter): make every
-/// CPU drop stale translations.
+/// User mappings of `pml4` changed (unmapped or made stricter): make the
+/// CPUs that have it loaded drop stale translations. Usually none but this
+/// one, so no interrupt is sent at all.
 pub fn tlb_shootdown(pml4: u64) {
-    // This CPU: reload CR3 if it is the changed address space.
+    let n = online();
+    if n <= 1 {
+        if cpu::read_cr3() & 0x000f_ffff_ffff_f000 == pml4 {
+            unsafe { cpu::write_cr3(pml4) };
+        }
+        return;
+    }
+    // Stay on this CPU while deciding who to ask (interrupts off), but
+    // take the lock with interrupts on so we can answer others meanwhile.
+    let irq = cpu::interrupts_enabled();
+    loop {
+        cpu::cli();
+        if SHOOT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            break;
+        }
+        if irq {
+            cpu::sti();
+        }
+        core::hint::spin_loop();
+    }
     if cpu::read_cr3() & 0x000f_ffff_ffff_f000 == pml4 {
         unsafe { cpu::write_cr3(pml4) };
     }
-    let n = online();
-    if n <= 1 {
-        return;
-    }
-    while SHOOT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
-    }
-    TARGET.store(pml4, Ordering::Release);
-    PENDING.store(n - 1, Ordering::Release);
-    apic::ipi_others(idt::VEC_TLB);
-    let until = crate::time::uptime_ms() + 100;
-    while PENDING.load(Ordering::Acquire) > 0 && crate::time::uptime_ms() < until {
-        core::hint::spin_loop();
+    let me = percpu::index();
+    let targets: alloc::vec::Vec<u32> = (0..n)
+        .filter(|&i| i != me)
+        .filter_map(percpu::get)
+        .filter(|pc| pc.cr3.load(Ordering::Acquire) == pml4)
+        .map(|pc| pc.lapic_id)
+        .collect();
+    if !targets.is_empty() {
+        TARGET.store(pml4, Ordering::Release);
+        PENDING.store(targets.len(), Ordering::Release);
+        for &t in &targets {
+            apic::ipi_to(t, idt::VEC_TLB);
+        }
+        let until = crate::time::uptime_ms() + 50;
+        while PENDING.load(Ordering::Acquire) > 0 && crate::time::uptime_ms() < until {
+            core::hint::spin_loop();
+        }
     }
     SHOOT_LOCK.store(false, Ordering::Release);
+    if irq {
+        cpu::sti();
+    }
 }
 
 pub fn on_tlb_ipi() {

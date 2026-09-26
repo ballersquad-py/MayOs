@@ -40,8 +40,11 @@ pub struct Thread {
     fs_base: u64,
     /// GS base of Linux threads (arch_prctl ARCH_SET_GS).
     gs_base: u64,
-    /// Sleeping in `wait_event`: `notify` wakes it early.
-    waiting: bool,
+    /// Sleeping in `wait_event`: the event count it saw (wakes when the
+    /// count moves), or NO_EVENT.
+    wait_seen: u64,
+    /// Sleeping in `wait_flag`: the flag (`*const AtomicBool`) that ends it.
+    wait_flag: usize,
     /// Executing on some CPU (set until that CPU is off its stack).
     on_cpu: AtomicBool,
     /// A CPU's idle thread (runs only there, when nothing else can).
@@ -61,7 +64,39 @@ impl Drop for Thread {
     }
 }
 
+const NO_EVENT: u64 = u64::MAX;
+
+/// Threads taken off the run queue, waiting to be freed by `reaper`.
+static GRAVE: Spin<Vec<Box<Thread>>> = Spin::new(Vec::new());
+
+/// Free dead threads (and, with the last one, their process) outside the
+/// scheduler.
+extern "C" fn reaper(_: usize) {
+    loop {
+        let dead: Vec<Box<Thread>> = core::mem::take(&mut *GRAVE.lock());
+        drop(dead);
+        sleep_ms(20);
+    }
+}
+
+/// Start the reaper thread (once the scheduler exists).
+pub fn start_reaper() {
+    spawn_kernel("reaper", reaper, 0);
+}
+
+/// Bumped whenever a thread becomes ready to run: idle CPUs only look for
+/// work when it moved.
+static READY_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 struct Scheduler {
+    /// Earliest wake-up time of a sleeping thread (skip the scan before).
+    next_deadline: u64,
+    /// Event count at the last scan of sleepers.
+    events_seen: u64,
+    /// A thread died since the last reap.
+    dead: bool,
+    /// READY_GEN when each CPU last found nothing to run.
+    idle_seen: [u64; MAX_CPUS],
     threads: Vec<Box<Thread>>,
     /// Index of the thread each CPU runs.
     current: [usize; MAX_CPUS],
@@ -78,7 +113,7 @@ impl Scheduler {
 }
 
 static SCHED: Spin<Scheduler> =
-    Spin::new(Scheduler { threads: Vec::new(), current: [0; MAX_CPUS], idle: [0; MAX_CPUS], next_id: 1, slice_start: [0; MAX_CPUS] });
+    Spin::new(Scheduler { next_deadline: 0, events_seen: 0, dead: false, idle_seen: [u64::MAX; MAX_CPUS], threads: Vec::new(), current: [0; MAX_CPUS], idle: [0; MAX_CPUS], next_id: 1, slice_start: [0; MAX_CPUS] });
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Register the boot context as thread 0, the idle thread.
@@ -96,7 +131,8 @@ pub fn init() {
         cpu_ms: 0,
         fs_base: 0,
         gs_base: 0,
-        waiting: false,
+        wait_seen: NO_EVENT,
+        wait_flag: 0,
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -104,6 +140,7 @@ pub fn init() {
     }));
     s.current[0] = 0;
     s.idle[0] = 0;
+    percpu::this().current_thread = &*s.threads[0] as *const Thread as u64;
 }
 
 /// Register the running context of another CPU as its idle thread.
@@ -123,7 +160,8 @@ pub fn init_ap(cpu: usize) {
         cpu_ms: 0,
         fs_base: 0,
         gs_base: 0,
-        waiting: false,
+        wait_seen: NO_EVENT,
+        wait_flag: 0,
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -132,6 +170,7 @@ pub fn init_ap(cpu: usize) {
     let i = s.threads.len() - 1;
     s.current[cpu] = i;
     s.idle[cpu] = i;
+    percpu::this().current_thread = &*s.threads[i] as *const Thread as u64;
     s.slice_start[cpu] = crate::time::uptime_ms();
 }
 
@@ -181,12 +220,14 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         cpu_ms: 0,
         fs_base,
         gs_base: 0,
-        waiting: false,
+        wait_seen: NO_EVENT,
+        wait_flag: 0,
         on_cpu: AtomicBool::new(false),
         idle: false,
         fpu: Box::new(fpu),
         clear_child_tid: 0,
     }));
+    READY_GEN.fetch_add(1, Ordering::AcqRel);
     id
 }
 
@@ -207,42 +248,48 @@ pub fn spawn_user_frame(process: Arc<Process>, frame: idt::TrapFrame, fs_base: u
     id
 }
 
+/// The thread running on this CPU (it cannot be freed while it runs).
+fn me() -> Option<&'static mut Thread> {
+    // One gs-relative load: preemption cannot split it (the thread may
+    // move to another CPU at any time while interrupts are on).
+    let p: u64;
+    unsafe { core::arch::asm!("mov {}, gs:[40]", out(reg) p, options(nostack, readonly, preserves_flags)) };
+    if p == 0 { None } else { Some(unsafe { &mut *(p as *mut Thread) }) }
+}
+
 /// Set the calling thread's GS base.
 pub fn set_gs_base(v: u64) {
-    let mut s = SCHED.lock();
-    let c = s.cur();
-    s.threads[c].gs_base = v;
+    if let Some(t) = me() {
+        t.gs_base = v;
+    }
     // In the kernel the program's GS base waits in KERNEL_GS_BASE.
     unsafe { cpu::wrmsr(MSR_KERNEL_GS_BASE, v) };
 }
 
 pub fn gs_base() -> u64 {
-    let s = SCHED.lock();
-    s.threads[s.cur()].gs_base
+    me().map(|t| t.gs_base).unwrap_or(0)
 }
 
 /// Set the calling thread's FS base (thread-local storage).
 pub fn set_fs_base(v: u64) {
-    let mut s = SCHED.lock();
-    let c = s.cur();
-    s.threads[c].fs_base = v;
+    if let Some(t) = me() {
+        t.fs_base = v;
+    }
     unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, v) };
 }
 
 pub fn fs_base() -> u64 {
-    let s = SCHED.lock();
-    s.threads[s.cur()].fs_base
+    me().map(|t| t.fs_base).unwrap_or(0)
 }
 
 pub fn current_id() -> u64 {
-    let s = SCHED.lock();
-    s.threads[s.cur()].id
+    me().map(|t| t.id).unwrap_or(0)
 }
 
 pub fn set_clear_child_tid(addr: u64) {
-    let mut s = SCHED.lock();
-    let c = s.cur();
-    s.threads[c].clear_child_tid = addr;
+    if let Some(t) = me() {
+        t.clear_child_tid = addr;
+    }
 }
 
 /// Set the clear-child-tid address of another thread (after `clone`).
@@ -254,8 +301,7 @@ pub fn set_clear_child_tid_of(id: u64, addr: u64) {
 }
 
 pub fn clear_child_tid() -> u64 {
-    let s = SCHED.lock();
-    s.threads[s.cur()].clear_child_tid
+    me().map(|t| t.clear_child_tid).unwrap_or(0)
 }
 
 /// Threads (ids) of a process that are still alive.
@@ -328,14 +374,21 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         t.cpu_ms += elapsed;
         if t.state == State::Running {
             t.state = State::Ready;
+            if !t.idle {
+                READY_GEN.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 
-    // Reap dead threads no CPU is standing on.
-    let mut i = 0;
+    // Reap dead threads no CPU is standing on (only after something died).
+    let mut i = if s.dead { 0 } else { usize::MAX };
+    let mut left = false;
     while i < s.threads.len() {
         let t = &s.threads[i];
         let in_use = t.idle || t.on_cpu.load(Ordering::Acquire) || s.current.iter().take(percpu::count()).any(|&k| k == i);
+        if t.state == State::Dead && in_use {
+            left = true;
+        }
         if t.state == State::Dead && !in_use {
             let t = s.threads.remove(i);
             for k in s.current.iter_mut() {
@@ -348,25 +401,46 @@ pub fn schedule(frame_rsp: u64) -> u64 {
                     *k -= 1;
                 }
             }
-            drop(t);
+            // Freed by the reaper thread: dropping a thread may drop its
+            // process (closing files, freeing the address space), which
+            // must not happen here, under the scheduler lock.
+            GRAVE.lock().push(t);
         } else {
             i += 1;
         }
     }
+    if s.dead {
+        s.dead = left;
+    }
     let cur = s.current[c];
 
-    for t in s.threads.iter_mut() {
-        if let State::Sleeping(until) = t.state
-            && now >= until
-        {
-            t.state = State::Ready;
+    // Wake sleepers whose time came, or whose event or flag arrived; only
+    // when a deadline passed or events happened since the last look.
+    let ev = EVENTS.load(Ordering::Acquire);
+    if now >= s.next_deadline || ev != s.events_seen {
+        s.events_seen = ev;
+        let mut next = u64::MAX;
+        for t in s.threads.iter_mut() {
+            if let State::Sleeping(until) = t.state {
+                let flagged = t.wait_flag != 0 && unsafe { (*(t.wait_flag as *const AtomicBool)).load(Ordering::Acquire) };
+                if now >= until || (t.wait_seen != NO_EVENT && t.wait_seen != ev) || flagged {
+                    t.state = State::Ready;
+                    READY_GEN.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    next = next.min(until);
+                }
+            }
         }
+        s.next_deadline = next;
     }
 
     // Next ready thread after the current one that no CPU is running.
     let n = s.threads.len();
     let mut next = s.idle[c];
-    for k in 1..=n {
+    let ready_gen = READY_GEN.load(Ordering::Acquire);
+    // An idle CPU with nothing new to run stays idle without a scan.
+    let skip = cur == s.idle[c] && s.idle_seen[c] == ready_gen;
+    for k in if skip { 1..=0 } else { 1..=n } {
         let i = (cur + k) % n;
         let t = &s.threads[i];
         if !t.idle && t.state == State::Ready && (i == cur || !t.on_cpu.load(Ordering::Acquire)) {
@@ -376,6 +450,9 @@ pub fn schedule(frame_rsp: u64) -> u64 {
     }
     if next == s.idle[c] && s.threads[cur].state == State::Ready && !s.threads[cur].idle {
         next = cur;
+    }
+    if next == s.idle[c] && !skip {
+        s.idle_seen[c] = ready_gen;
     }
     if next != cur {
         // Floating-point registers and thread-local storage go with the thread.
@@ -392,6 +469,7 @@ pub fn schedule(frame_rsp: u64) -> u64 {
     }
     s.current[c] = next;
     s.slice_start[c] = now;
+    percpu::this().current_thread = &*s.threads[next] as *const Thread as u64;
     let t = &mut s.threads[next];
     t.state = State::Running;
     if t.kstack_top != 0 {
@@ -399,6 +477,7 @@ pub fn schedule(frame_rsp: u64) -> u64 {
         idt::set_syscall_stack(t.kstack_top);
     }
     if cpu::read_cr3() & 0x000f_ffff_ffff_f000 != t.pml4 {
+        percpu::this().cr3.store(t.pml4, Ordering::Release);
         unsafe { cpu::write_cr3(t.pml4) };
     }
     t.rsp
@@ -414,6 +493,11 @@ fn set_current_state(state: State) {
     let mut s = SCHED.lock();
     let c = s.cur();
     s.threads[c].state = state;
+    match state {
+        State::Sleeping(until) => s.next_deadline = s.next_deadline.min(until),
+        State::Dead => s.dead = true,
+        _ => {}
+    }
 }
 
 /// Bumped by `notify` whenever something waiting threads may care about
@@ -437,55 +521,47 @@ pub fn wait_event(seen: u64, ms: u64) {
         if EVENTS.load(Ordering::Acquire) != seen {
             return;
         }
+        let until = crate::time::uptime_ms() + ms.max(1);
         let c = s.cur();
-        s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
-        s.threads[c].waiting = true;
+        s.threads[c].state = State::Sleeping(until);
+        s.threads[c].wait_seen = seen;
+        s.next_deadline = s.next_deadline.min(until);
     }
     yield_now();
-    let mut s = SCHED.lock();
-    let c = s.cur();
-    s.threads[c].waiting = false;
-}
-
-/// Something happened: wake every thread in `wait_event`.
-pub fn notify() {
-    EVENTS.fetch_add(1, Ordering::AcqRel);
-    let mut s = SCHED.lock();
-    for t in s.threads.iter_mut() {
-        if t.waiting && matches!(t.state, State::Sleeping(_)) {
-            t.state = State::Ready;
-            t.waiting = false;
-        }
+    if let Some(t) = me() {
+        t.wait_seen = NO_EVENT;
     }
 }
 
-/// Sleep up to `ms` unless `flag` is set; `wake` ends the sleep early.
+/// Something happened: threads in `wait_event` wake at the next
+/// scheduling point of any CPU. Lock-free (called very often).
+pub fn notify() {
+    EVENTS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Sleep up to `ms` unless `flag` is set; setting it and calling `wake`
+/// ends the sleep early.
 pub fn wait_flag(flag: &core::sync::atomic::AtomicBool, ms: u64) {
     {
         let mut s = SCHED.lock();
         if flag.load(Ordering::Acquire) {
             return;
         }
+        let until = crate::time::uptime_ms() + ms.max(1);
         let c = s.cur();
-        s.threads[c].state = State::Sleeping(crate::time::uptime_ms() + ms.max(1));
-        s.threads[c].waiting = true;
+        s.threads[c].state = State::Sleeping(until);
+        s.threads[c].wait_flag = flag as *const _ as usize;
+        s.next_deadline = s.next_deadline.min(until);
     }
     yield_now();
-    let mut s = SCHED.lock();
-    let c = s.cur();
-    s.threads[c].waiting = false;
+    if let Some(t) = me() {
+        t.wait_flag = 0;
+    }
 }
 
-/// End the `wait_flag`/`wait_event` sleep of thread `id`.
-pub fn wake(id: u64) {
-    let mut s = SCHED.lock();
-    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id)
-        && t.waiting
-        && matches!(t.state, State::Sleeping(_))
-    {
-        t.state = State::Ready;
-        t.waiting = false;
-    }
+/// A `wait_flag` flag was set: get sleepers looked at.
+pub fn wake(_id: u64) {
+    EVENTS.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn sleep_ms(ms: u64) {
@@ -507,18 +583,20 @@ pub fn exit_current() -> ! {
 }
 
 pub fn current_process() -> Option<Arc<Process>> {
-    let s = SCHED.lock();
-    s.threads[s.cur()].process.clone()
+    me().and_then(|t| t.process.clone())
 }
 
 /// Mark every thread of a process dead (used when it exits or faults).
 pub fn kill_process_threads(pid: u64) {
     let mut s = SCHED.lock();
+    let mut any = false;
     for t in s.threads.iter_mut() {
         if t.process.as_ref().map(|p| p.pid) == Some(pid) {
             t.state = State::Dead;
+            any = true;
         }
     }
+    s.dead |= any;
 }
 
 /// End every thread of `pid` except the calling one (execve).
@@ -530,6 +608,7 @@ pub fn kill_other_threads(pid: u64) {
             t.state = State::Dead;
         }
     }
+    s.dead = true;
 }
 
 /// Wait until no other thread of `pid` is still executing on some CPU
@@ -555,6 +634,7 @@ pub fn switch_address_space(pml4: u64) {
     s.threads[c].pml4 = pml4;
     s.threads[c].fs_base = 0;
     s.threads[c].gs_base = 0;
+    percpu::this().cr3.store(pml4, Ordering::Release);
     unsafe {
         cpu::wrmsr(MSR_KERNEL_GS_BASE, 0);
         cpu::write_cr3(pml4);
