@@ -2369,13 +2369,23 @@ fn futex_wake_list(pml4: u64, addr: u64, n: u64, wake: &mut Vec<u64>) -> i64 {
     woken
 }
 
+fn timespec_us(p: &Process, ptr: u64) -> Option<u64> {
+    if ptr == 0 {
+        return None;
+    }
+    let s = usermem::read_u64(p.pml4(), ptr)? as i64;
+    let ns = usermem::read_u64(p.pml4(), ptr + 8)? as i64;
+    Some((s.max(0) as u64).saturating_mul(1_000_000).saturating_add((ns.max(0) as u64).div_ceil(1000)))
+}
+
 fn timespec_ms(p: &Process, ptr: u64) -> Option<u64> {
     if ptr == 0 {
         return None;
     }
     let s = usermem::read_u64(p.pml4(), ptr)? as i64;
     let ns = usermem::read_u64(p.pml4(), ptr + 8)? as i64;
-    Some((s.max(0) as u64) * 1000 + (ns.max(0) as u64) / 1_000_000)
+    // Round up: a non-zero timeout shorter than 1 ms must still wait.
+    Some((s.max(0) as u64).saturating_mul(1000).saturating_add((ns.max(0) as u64).div_ceil(1_000_000)))
 }
 
 fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
@@ -2388,13 +2398,15 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
             if usermem::read_bytes(p.pml4(), addr, 4).is_none() {
                 return -EFAULT;
             }
-            let deadline = match timespec_ms(p, tptr) {
-                Some(ms) if cmd == 9 => {
+            // Deadline in microseconds of uptime (sub-millisecond waits must
+            // sleep, not return at once and make the caller spin).
+            let deadline = match timespec_us(p, tptr) {
+                Some(us) if cmd == 9 => {
                     // Absolute (monotonic or realtime) time.
-                    let now = if op & 256 != 0 { unix_ms() } else { crate::time::uptime_ms() };
-                    crate::time::uptime_ms() + ms.saturating_sub(now)
+                    let now = if op & 256 != 0 { unix_us() } else { crate::time::uptime_us() };
+                    crate::time::uptime_us() + us.saturating_sub(now)
                 }
-                Some(ms) => crate::time::uptime_ms() + ms,
+                Some(us) => crate::time::uptime_us() + us,
                 None => u64::MAX,
             };
             let woken = Arc::new(AtomicBool::new(false));
@@ -2410,7 +2422,7 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 if woken.load(Ordering::Acquire) {
                     return 0;
                 }
-                if crate::time::uptime_ms() >= deadline {
+                if crate::time::uptime_us() >= deadline {
                     FUTEX.lock().retain(|w| !Arc::ptr_eq(&w.woken, &woken));
                     return -ETIMEDOUT;
                 }
@@ -2420,7 +2432,7 @@ fn sys_futex(p: &Process, addr: u64, op: u64, val: u64, tptr: u64) -> i64 {
                 }
                 // Woken directly by FUTEX_WAKE; the cap is for timeouts
                 // and signals.
-                let left = deadline.saturating_sub(crate::time::uptime_ms()).clamp(1, 50);
+                let left = deadline.saturating_sub(crate::time::uptime_us()).div_ceil(1000).clamp(1, 50);
                 sched::wait_flag(&woken, left);
             }
         }
