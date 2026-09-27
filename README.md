@@ -79,6 +79,13 @@ Settings app are done.
   Memory: `minecraft --memory 4G` (or `/etc/minecraft-memory` containing e.g. `4G`; default 2G). The GPU is used when `/etc/gpu3d` is on (`MC_GPU=0` forces software). Custom launcher:
   `minecraft --launcher /path/launcher.jar` (or put the path in
   `/etc/minecraft-launcher` to make it the default).
+- **Minecraft mods**: `minecraft 1.21.11 --mods` installs Fabric and a
+  performance pack from Modrinth (Sodium, Lithium, FerriteCore,
+  ImmediatelyFast, EntityCulling, MoreCulling, Dynamic FPS, Clumps, Krypton);
+  `minecraft 1.8.9` uses the Ornithe loader with legacy-lwjgl3 (LWJGL 3 on
+  Wayland; old LWJGL 2 needs X11). Each modded version has its own folder,
+  `~/.minecraft/instances/<version>-<loader>/`; put your own mods in its
+  `mods/` folder.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).

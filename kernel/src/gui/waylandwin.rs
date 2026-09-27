@@ -24,6 +24,9 @@ impl WaylandWindow {
     }
 
     fn image_size(&self) -> (i32, i32) {
+        if let Some(d) = self.win.direct.lock().as_ref() {
+            return (d.w, d.h);
+        }
         self.win.image.lock().as_ref().map(|i| (i.0, i.1)).unwrap_or((640, 480))
     }
 }
@@ -44,6 +47,38 @@ impl App for WaylandWindow {
 
     fn render(&mut self, c: &mut Canvas, size: (i32, i32), _focused: bool) {
         self.size = size;
+        let direct = self.win.direct.lock().clone();
+        if let Some(d) = direct {
+            // GPU frame: rows straight from the GPU's copy into the screen.
+            let (w, h) = (d.w.min(size.0), d.h.min(size.1));
+            let copy_row = |dst: &mut [u32], y: i32| {
+                let bytes = unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 4) };
+                d.shm.copy_out(d.off + y as u64 * d.stride as u64, bytes);
+            };
+            if w > 0 && h > 0 {
+                if let Some((buf, stride)) = c.raw_region(Rect::new(0, 0, w, h)) {
+                    for y in 0..h {
+                        let o = y as usize * stride;
+                        copy_row(&mut buf[o..o + w as usize], y);
+                    }
+                } else {
+                    // Partly clipped: through a temporary picture.
+                    let mut px = alloc::vec![0u32; (w * h) as usize];
+                    for y in 0..h {
+                        let o = (y * w) as usize;
+                        copy_row(&mut px[o..o + w as usize], y);
+                    }
+                    c.blit_pixels(&px, w, h, Rect::new(0, 0, w, h));
+                }
+            }
+            if w < size.0 {
+                c.fill_rect(Rect::new(w, 0, size.0 - w, size.1), 0xff20_2124);
+            }
+            if h < size.1 {
+                c.fill_rect(Rect::new(0, h, w.min(size.0), size.1 - h), 0xff20_2124);
+            }
+            return;
+        }
         let img = self.win.image.lock().clone();
         match img {
             Some((w, h, px)) => {

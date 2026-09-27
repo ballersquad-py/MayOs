@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--memory 4G] [--dry-run] [--debug]
+//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -46,6 +46,8 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
+        boolean packOnly = false;
+        Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
         // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
         String memory = System.getenv("MC_MEMORY");
         try {
@@ -58,6 +60,9 @@ public class Launcher {
             else if (args[i].equals("--dry-run")) dry = true;
             else if (args[i].equals("--debug")) debug = true;
             else if (args[i].equals("--memory") && i + 1 < args.length) memory = args[++i];
+            else if (args[i].equals("--mods")) mods = true;
+            else if (args[i].equals("--pack-only")) { mods = true; packOnly = true; }
+            else if (args[i].equals("--vanilla")) mods = false;
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -94,15 +99,45 @@ public class Launcher {
         if (jv != null && num(jv.get("majorVersion")) > Runtime.version().feature())
             System.out.println("Warning: Minecraft " + version + " wants Java " + num(jv.get("majorVersion")) + ", this is Java " + Runtime.version().feature());
 
+        // Versions before 1.13 use LWJGL 2, which needs X11: they run with
+        // the Ornithe loader and the legacy-lwjgl3 mod (LWJGL 3 on Wayland).
+        boolean legacy = v.get("arguments") == null;
+        if (mods == null) mods = legacy;
+        if (legacy && !mods) System.out.println("Warning: " + version + " needs --mods (LWJGL 3) to open a window on MayOS");
+        Map<String, Object> loader = mods ? loaderProfile(version, legacy) : null;
+        Path gameDir = mods ? mc.resolve("instances").resolve(version + "-" + (legacy ? "ornithe" : "fabric")) : mc;
+        if (mods) System.out.println("Mod loader: " + str(loader.get("id")) + "; mods in " + gameDir.resolve("mods"));
+        if (packOnly) {
+            installPack(gameDir.resolve("mods"), version, legacy);
+            return;
+        }
+
         // Client jar and libraries.
         List<String[]> jobs = new ArrayList<>(); // url, path, size
         Path client = vdir.resolve(version + ".jar");
         Map<String, Object> cd = obj(obj(v.get("downloads")).get("client"));
         jobs.add(new String[] {str(cd.get("url")), client.toString(), String.valueOf(num(cd.get("size")))});
         List<String> cp = new ArrayList<>();
+        Set<String> loaderArtifacts = new HashSet<>();
+        if (loader != null) {
+            for (Object lo : list(loader.get("libraries"))) {
+                Map<String, Object> lib = obj(lo);
+                String[] n = str(lib.get("name")).split(":");
+                String path = n[0].replace('.', '/') + "/" + n[1] + "/" + n[2] + "/" + n[1] + "-" + n[2] + ".jar";
+                String base = lib.get("url") == null ? "https://libraries.minecraft.net/" : str(lib.get("url"));
+                if (!base.endsWith("/")) base += "/";
+                Path p = mc.resolve("libraries").resolve(path);
+                jobs.add(new String[] {base + path, p.toString(), String.valueOf(num(lib.get("size")))});
+                cp.add(p.toString());
+                loaderArtifacts.add(n[0] + ":" + n[1]);
+            }
+        }
         for (Object lo : list(v.get("libraries"))) {
             Map<String, Object> lib = obj(lo);
             if (!allowed(lib.get("rules"))) continue;
+            String[] n = String.valueOf(lib.get("name")).split(":");
+            if (n.length > 1 && loaderArtifacts.contains(n[0] + ":" + n[1])) continue; // the loader's newer copy
+            if (legacy && mods && n[0].equals("org.lwjgl.lwjgl")) continue; // LWJGL 2: replaced by legacy-lwjgl3
             Map<String, Object> dl = obj(lib.get("downloads"));
             if (dl == null || dl.get("artifact") == null) continue;
             Map<String, Object> a = obj(dl.get("artifact"));
@@ -134,7 +169,8 @@ public class Launcher {
         Map<String, String> vars = new HashMap<>();
         vars.put("auth_player_name", user);
         vars.put("version_name", version);
-        vars.put("game_directory", mc.toString());
+        vars.put("game_directory", gameDir.toString());
+        if (mods && !dry) installPack(gameDir.resolve("mods"), version, legacy);
         vars.put("assets_root", assets.toString());
         vars.put("game_assets", assets.toString());
         vars.put("assets_index_name", assetsId);
@@ -178,14 +214,17 @@ public class Launcher {
         Map<String, Object> arguments = obj(v.get("arguments"));
         if (arguments != null) {
             addArgs(cmd, arguments.get("jvm"), vars);
-            cmd.add(str(v.get("mainClass")));
+            if (loader != null) addArgs(cmd, obj(loader.get("arguments")).get("jvm"), vars);
+            cmd.add(str((loader != null ? loader : v).get("mainClass")));
             addArgs(cmd, arguments.get("game"), vars);
+            if (loader != null) addArgs(cmd, obj(loader.get("arguments")).get("game"), vars);
         } else {
             // Versions before 1.13.
             cmd.add("-Djava.library.path=" + natives);
             cmd.add("-cp");
             cmd.add(vars.get("classpath"));
-            cmd.add(str(v.get("mainClass")));
+            if (loader != null) addArgs(cmd, obj(loader.get("arguments")).get("jvm"), vars);
+            cmd.add(str((loader != null ? loader : v).get("mainClass")));
             for (String a : str(v.get("minecraftArguments")).split(" ")) cmd.add(subst(a, vars));
         }
         if (dry) {
@@ -193,7 +232,10 @@ public class Launcher {
             return;
         }
         System.out.println("Starting Minecraft...");
-        ProcessBuilder pb = new ProcessBuilder(cmd).directory(mc.toFile()).inheritIO();
+        Files.createDirectories(gameDir);
+        ProcessBuilder pb = new ProcessBuilder(cmd).directory(gameDir.toFile()).inheritIO();
+        // legacy-lwjgl3: GLFW (on MayOS's Wayland compositor), not SDL.
+        if (legacy && mods) pb.environment().put("LEGACY_LWJGL3_USE_SDL", "false");
         pb.environment().put("XDG_SESSION_TYPE", "wayland");
         pb.environment().remove("DISPLAY");
         // No GPU device: Mesa's software renderer (llvmpipe) drawing into
@@ -224,6 +266,65 @@ public class Launcher {
         // are only there when preloaded; unresolved ones jump to nowhere.
         if (Files.exists(Paths.get("/lib/libgcompat.so.0"))) pb.environment().merge("LD_PRELOAD", "/lib/libgcompat.so.0", (a, b) -> b + ":" + a);
         System.exit(pb.start().waitFor());
+    }
+
+    // Fabric (1.14+) or Ornithe (older versions) launcher profile.
+    static Map<String, Object> loaderProfile(String version, boolean legacy) throws Exception {
+        String meta = legacy ? "https://meta.ornithemc.net/v3/versions/fabric-loader/" : "https://meta.fabricmc.net/v2/versions/loader/";
+        List<Object> loaders = list(Json.parse(fetchString(meta + version)));
+        if (loaders.isEmpty()) throw new RuntimeException("no " + (legacy ? "Ornithe" : "Fabric") + " loader for Minecraft " + version);
+        String lv = str(obj(obj(loaders.get(0)).get("loader")).get("version"));
+        return obj(Json.parse(fetchString(meta + version + "/" + lv + "/profile/json")));
+    }
+
+    // The MayOS performance pack (Modrinth project slugs); your own mods
+    // can go next to them in the mods folder.
+    static final String[] PACK_MODERN = {"fabric-api", "sodium", "lithium", "ferrite-core", "immediatelyfast", "entityculling",
+            "modernfix", "moreculling", "dynamic-fps", "fastload", "clumps", "krypton"};
+    static final String[] PACK_LEGACY = {"moehreag-legacy-lwjgl3"};
+
+    static void installPack(Path modsDir, String version, boolean legacy) throws Exception {
+        Files.createDirectories(modsDir);
+        String loaderName = legacy ? "ornithe" : "fabric";
+        Map<String, String[]> files = new LinkedHashMap<>(); // project -> url, file name
+        Deque<String> todo = new ArrayDeque<>(Arrays.asList(legacy ? PACK_LEGACY : PACK_MODERN));
+        Set<String> seen = new HashSet<>();
+        while (!todo.isEmpty()) {
+            String project = todo.pop();
+            if (!seen.add(project)) continue;
+            String q = "https://api.modrinth.com/v2/project/" + project + "/version?loaders=%5B%22" + loaderName
+                    + "%22%5D&game_versions=%5B%22" + version + "%22%5D";
+            List<Object> vs;
+            try {
+                vs = list(Json.parse(fetchString(q)));
+            } catch (Exception e) {
+                vs = List.of();
+            }
+            if (vs.isEmpty()) {
+                System.out.println("  (" + project + ": no build for " + version + ", skipped)");
+                continue;
+            }
+            Map<String, Object> mv = obj(vs.get(0));
+            Map<String, Object> file = null;
+            for (Object f : list(mv.get("files")))
+                if (file == null || Boolean.TRUE.equals(obj(f).get("primary"))) file = obj(f);
+            if (file == null) continue;
+            files.put(project, new String[] {str(file.get("url")), str(file.get("filename"))});
+            for (Object d : list(mv.get("dependencies")))
+                if ("required".equals(obj(d).get("dependency_type")) && obj(d).get("project_id") != null) todo.add(str(obj(d).get("project_id")));
+        }
+        // Replace the jars this pack installed before; leave the user's own.
+        Path managed = modsDir.resolve(".mayos-pack");
+        Set<String> keep = new HashSet<>();
+        for (String[] f : files.values()) keep.add(f[1]);
+        if (Files.exists(managed))
+            for (String old : Files.readAllLines(managed))
+                if (!keep.contains(old)) Files.deleteIfExists(modsDir.resolve(old));
+        List<String[]> jobs = new ArrayList<>();
+        for (String[] f : files.values()) jobs.add(new String[] {f[0], modsDir.resolve(f[1]).toString(), "-1"});
+        System.out.println("Mods: " + String.join(", ", files.keySet()));
+        for (String[] j : jobs) download(j[0], Paths.get(j[1]), -2);
+        Files.write(managed, keep);
     }
 
     // Plain strings only: rule objects are for demo mode, custom window
@@ -262,7 +363,8 @@ public class Launcher {
         List<String[]> todo = new ArrayList<>();
         for (String[] j : jobs) {
             Path p = Paths.get(j[1]);
-            if (!Files.exists(p) || Files.size(p) != Long.parseLong(j[2])) todo.add(j);
+            long want = Long.parseLong(j[2]);
+            if (!Files.exists(p) || (want < 0 ? Files.size(p) == 0 : Files.size(p) != want)) todo.add(j);
         }
         if (todo.isEmpty()) return;
         System.out.println("Downloading " + todo.size() + " files (first start only)...");
@@ -281,7 +383,7 @@ public class Launcher {
     }
 
     static void download(String url, Path to, long size) throws Exception {
-        if (Files.exists(to) && (size < 0 ? to.toString().endsWith(".json") && Files.size(to) > 0 : Files.size(to) == size)) return;
+        if (Files.exists(to) && (size < 0 ? Files.size(to) > 0 : Files.size(to) == size)) return;
         Files.createDirectories(to.getParent());
         Path tmp = to.resolveSibling(to.getFileName() + ".part");
         for (int attempt = 1; ; attempt++) {

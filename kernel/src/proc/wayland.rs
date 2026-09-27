@@ -94,6 +94,18 @@ pub struct Window {
     pub min_size: Spin<(i32, i32)>,
     opened: AtomicBool,
     pub pid: u64,
+    /// GPU frame shown straight from the memory the GPU copied it to (no
+    /// copy into `image`): opaque single-surface windows such as games.
+    pub direct: Spin<Option<Direct>>,
+}
+
+#[derive(Clone)]
+pub struct Direct {
+    pub shm: Arc<Shm>,
+    pub off: u64,
+    pub w: i32,
+    pub h: i32,
+    pub stride: i32,
 }
 
 impl Window {
@@ -1071,6 +1083,7 @@ impl State {
             s.input = input;
         }
         let needs_enter = !s.entered_output;
+        let mut direct = false;
         self.frame_ready.extend(frames);
         if let Some(att) = pending {
             match att {
@@ -1101,44 +1114,62 @@ impl State {
                             let role = self.surface(id).map(|s| match s.role { Role::Toplevel(_) => "window", Role::Sub { .. } => "subsurface", Role::Popup { .. } => "popup", Role::None => "no role" }).unwrap_or("?");
                             wlog(alloc::format!("pid {}: frame on surface {} ({}) {}x{} stride {}{}", self.pid, id, role, b.w, b.h, b.stride, if b.gpu.is_some() { " GPU" } else { "" }));
                         }
-                        // A GPU buffer: have the GPU copy the frame into memory first.
-                        if let Some(sid) = b.gpu {
-                            super::drm::surface_readback(sid);
-                        }
-                        let Some(s) = self.surface(id) else { return };
-                        let damage = core::mem::take(&mut s.damage);
-                        // Same size as before and only part changed: copy just
-                        // the damaged rectangles into our copy of the picture.
-                        let area: i64 = damage.iter().map(|d| d.2.max(0) as i64 * d.3.max(0) as i64).sum();
-                        // GPU frames are always copied whole (their damage
-                        // hints refer to buffer ages we do not track).
-                        let partial = b.gpu.is_none()
-                            && !damage.is_empty()
-                            && area < b.w as i64 * b.h as i64 / 2
-                            && s.image.as_ref().is_some_and(|i| i.0 == b.w && i.1 == b.h);
-                        if partial {
-                            let img = s.image.as_mut().unwrap();
-                            let px = Arc::make_mut(&mut img.2);
-                            for d in damage {
-                                copy_rect(&b, px, d);
+                        if b.gpu.is_some() && self.direct_ok(id, &b) {
+                            // Fast path: the window reads the pixels where the
+                            // GPU put them; no copy of the frame here.
+                            super::drm::surface_readback(b.gpu.unwrap());
+                            if let Some(win) = self.window_of(id) {
+                                *win.direct.lock() = Some(Direct { shm: b.shm.clone(), off: b.off, w: b.w, h: b.h, stride: b.stride });
+                                win.version.fetch_add(1, Ordering::Relaxed);
+                                if !win.opened.swap(true, Ordering::Relaxed) {
+                                    PENDING.lock().push(win);
+                                }
                             }
-                        } else if let Some(img) = s.image.as_mut().filter(|i| i.0 == b.w && i.1 == b.h) {
-                            // Same size: copy into the existing picture (no
-                            // 7 MB allocation per frame under the heap lock).
-                            let px = Arc::make_mut(&mut img.2);
-                            if !(0..b.h).all(|y| copy_row(&b, px, y, 0, b.w)) {
+                            if let Some(s) = self.surface(id) {
                                 s.image = None;
+                                s.damage.clear();
                             }
+                            direct = true;
                         } else {
-                            s.image = copy_buffer(&b);
-                        }
-                        if let Some(s) = self.surface(id)
-                            && s.opaque
-                            && !b.opaque
-                            && let Some(img) = s.image.as_mut()
-                        {
-                            for v in Arc::make_mut(&mut img.2).iter_mut() {
-                                *v |= 0xff00_0000;
+                            // A GPU buffer: have the GPU copy the frame into memory first.
+                            if let Some(sid) = b.gpu {
+                                super::drm::surface_readback(sid);
+                            }
+                            let Some(s) = self.surface(id) else { return };
+                            let damage = core::mem::take(&mut s.damage);
+                            // Same size as before and only part changed: copy just
+                            // the damaged rectangles into our copy of the picture.
+                            let area: i64 = damage.iter().map(|d| d.2.max(0) as i64 * d.3.max(0) as i64).sum();
+                            // GPU frames are always copied whole (their damage
+                            // hints refer to buffer ages we do not track).
+                            let partial = b.gpu.is_none()
+                                && !damage.is_empty()
+                                && area < b.w as i64 * b.h as i64 / 2
+                                && s.image.as_ref().is_some_and(|i| i.0 == b.w && i.1 == b.h);
+                            if partial {
+                                let img = s.image.as_mut().unwrap();
+                                let px = Arc::make_mut(&mut img.2);
+                                for d in damage {
+                                    copy_rect(&b, px, d);
+                                }
+                            } else if let Some(img) = s.image.as_mut().filter(|i| i.0 == b.w && i.1 == b.h) {
+                                // Same size: copy into the existing picture (no
+                                // 7 MB allocation per frame under the heap lock).
+                                let px = Arc::make_mut(&mut img.2);
+                                if !(0..b.h).all(|y| copy_row(&b, px, y, 0, b.w)) {
+                                    s.image = None;
+                                }
+                            } else {
+                                s.image = copy_buffer(&b);
+                            }
+                            if let Some(s) = self.surface(id)
+                                && s.opaque
+                                && !b.opaque
+                                && let Some(img) = s.image.as_mut()
+                            {
+                                for v in Arc::make_mut(&mut img.2).iter_mut() {
+                                    *v |= 0xff00_0000;
+                                }
                             }
                         }
                         // Pixels are copied: the program may reuse the buffer.
@@ -1156,9 +1187,19 @@ impl State {
                 self.ev(id, 0, vec![A::U(*o)]);
             }
         }
-        if let Some(root) = self.root_of(id) {
+        if !direct && let Some(root) = self.root_of(id) {
             self.compose(root);
         }
+    }
+
+    /// A GPU frame can be shown without copying: the toplevel surface
+    /// alone, opaque, filling its window.
+    fn direct_ok(&self, id: u32, b: &Buffer) -> bool {
+        let Some(Obj::Surface(s)) = self.objs.get(&id) else { return false };
+        matches!(s.role, Role::Toplevel(_))
+            && s.children.is_empty()
+            && (b.opaque || s.opaque)
+            && self.geometry_of(id).is_none_or(|g| g == (0, 0, b.w, b.h))
     }
 
     /// The toplevel surface a surface is drawn into.
@@ -1203,6 +1244,7 @@ impl State {
             min_size: Spin::new((0, 0)),
             opened: AtomicBool::new(false),
             pid: c.pid,
+            direct: Spin::new(None),
         });
         if let Some(s) = self.surface(surface) {
             s.role = Role::Toplevel(w);
@@ -1244,6 +1286,7 @@ impl State {
             *win.image.lock() = None;
             return;
         };
+        *win.direct.lock() = None;
         let (gx, gy, gw, gh) = self.geometry_of(root).filter(|g| g.2 > 0 && g.3 > 0).unwrap_or((0, 0, bw, bh));
         let (w, h) = (gw.min(4096), gh.min(4096));
         // One opaque surface filling the window (games, GPU programs): show
