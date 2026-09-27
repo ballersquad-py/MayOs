@@ -318,6 +318,7 @@ fn execbuf(pml4: u64, arg: u64) -> i64 {
     let fence_rep = (w[4] as u64) | ((w[5] as u64) << 32);
     let cid = w[8];
     let Some(bytes) = usermem::read_bytes(pml4, cmds, size as u64) else { return -EFAULT };
+    let bytes = if cid != INVALID { rewrite_cb_offsets(cid, bytes) } else { bytes };
     let c = Cmds(bytes);
     let r = if cid != INVALID && OBJ.lock().contexts.contains_key(&cid) { svga3d::submit_dx(&c, cid) } else { svga3d::submit(&c) };
     let seq = FENCE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -337,6 +338,54 @@ fn execbuf(pml4: u64, arg: u64) -> i64 {
         let _ = usermem::write_bytes(pml4, fence_rep, &rep);
     }
     if err != 0 { err as i64 } else { 0 }
+}
+
+/// Constant buffer bound per (DX context, shader type, slot): surface and size.
+static CB_BINDINGS: crate::sync::Spin<BTreeMap<(u32, u32, u32), (u32, u32)>> = crate::sync::Spin::new(BTreeMap::new());
+
+/// VirtualBox mishandles DX_SET_{VS..CS}_CONSTANT_BUFFER_OFFSET (1220..1225,
+/// which Mesa uses to move within one big constant upload buffer): shaders
+/// then read stale matrices. Rewrite each into a full
+/// DX_SET_SINGLE_CONSTANT_BUFFER with the binding's surface and size.
+fn rewrite_cb_offsets(cid: u32, bytes: Vec<u8>) -> Vec<u8> {
+    const SET_SINGLE_CB: u32 = 1148;
+    let word = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    // Only streams made purely of 3D commands (id, size, body) are parsed.
+    let mut off = 0;
+    while off + 8 <= bytes.len() {
+        let id = word(&bytes, off);
+        if !(1040..2000).contains(&id) {
+            return bytes;
+        }
+        off += 8 + word(&bytes, off + 4) as usize;
+    }
+    if off != bytes.len() {
+        return bytes;
+    }
+    let mut map = CB_BINDINGS.lock();
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut off = 0;
+    while off < bytes.len() {
+        let (id, size) = (word(&bytes, off), word(&bytes, off + 4) as usize);
+        let body = &bytes[off + 8..off + 8 + size];
+        if id == SET_SINGLE_CB && size >= 20 {
+            let (slot, ty, sid, _o, sz) = (word(body, 0), word(body, 4), word(body, 8), word(body, 12), word(body, 16));
+            map.insert((cid, ty, slot), (sid, sz));
+        } else if (1220..=1225).contains(&id) && size >= 8 {
+            let ty = id - 1220 + 1; // VS=1, PS, GS, HS, DS, CS
+            let (slot, offset) = (word(body, 0), word(body, 4));
+            if let Some(&(sid, sz)) = map.get(&(cid, ty, slot)) {
+                for v in [SET_SINGLE_CB, 20, slot, ty, sid, offset, sz] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                off += 8 + size;
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes[off..off + 8 + size]);
+        off += 8 + size;
+    }
+    out
 }
 
 pub const MAJOR: u64 = 226;
