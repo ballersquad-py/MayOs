@@ -69,6 +69,9 @@ extern "C" fn kmain() -> ! {
 
     proc::sched::init();
     proc::sched::start_reaper();
+    if drivers::vmware_svga::fake_gpu() {
+        drivers::vmware_svga::install_fake_gpu();
+    }
     // The other CPUs join the scheduler once it exists.
     smp::start();
     // Drivers that start their own threads come after the scheduler.

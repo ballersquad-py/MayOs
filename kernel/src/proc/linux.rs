@@ -1532,6 +1532,13 @@ fn stat_path(path: &str) -> Result<[u8; 144], i64> {
     if let Some(minor) = super::drm::node(path) {
         return Ok(drm_stat(minor));
     }
+    // sysfs view of the GPU (libdrm checks these exist).
+    if super::drm::sys_dir(path).is_some() || super::drm::sys_readlink(path).is_some_and(|r| r.is_err()) {
+        return Ok(stat_buf(0o40755, 0, 0, 4));
+    }
+    if let Some(d) = super::drm::sys_file(path) {
+        return Ok(stat_buf(0o100444, d.len() as u64, 0, 5));
+    }
     if path.starts_with("/dev/snd/") && super::alsa::open(path).is_some() {
         return Ok(stat_buf(0o20660, 0, 0, 116));
     }
@@ -2734,7 +2741,14 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         exited = signal::deliver(p, f);
     }
     if TRACE.load(Ordering::Relaxed) {
-        crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], f.rax as i64);
+        // File calls: show the path too.
+        let path_arg = match nr {
+            2 | 4 | 6 | 21 | 89 | 137 => Some(args[0]),
+            257 | 262 | 267 | 269 | 332 | 439 => Some(args[1]),
+            _ => None,
+        };
+        let path = path_arg.and_then(|a| usermem::read_cstr(p.pml4(), a, 200)).unwrap_or_default();
+        crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {} {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], f.rax as i64, path);
     }
     exited
 }

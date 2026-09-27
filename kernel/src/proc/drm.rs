@@ -477,6 +477,11 @@ pub fn ioctl(pml4: u64, cmd: u64, arg: u64) -> i64 {
         }
         0x50 => 0, // FENCE_UNREF
         0x59 => 0, // SYNCCPU: the CPU and GPU never overlap here
+        0x5d => {
+            // MSG (messages to the host's log): accepted, no reply
+            let _ = usermem::write_u32(pml4, arg + 20, 0);
+            0
+        }
         _ => {
             // Logged a few times only: the serial port is slow and a
             // probing loop would stall everything.

@@ -204,6 +204,10 @@ fn io() -> Option<u16> {
 /// Submit raw bytes on command-buffer context `ctx` and wait for the
 /// device. Returns the final status and the error offset.
 fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -> Result<(), String> {
+    if crate::drivers::vmware_svga::fake_gpu() {
+        let _ = (st, ctx, bytes, dx_context);
+        return Ok(());
+    }
     let io = io().ok_or("no SVGA adapter")?;
     if bytes.len() > st.buf_pages * PAGE {
         return Err(alloc::format!("command stream of {} bytes is too long", bytes.len()));
