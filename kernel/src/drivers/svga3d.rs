@@ -184,8 +184,12 @@ struct State {
     /// Object tables stay allocated for the device's lifetime.
     otables: Vec<Mob>,
     /// Header page + command pages for synchronous submission.
+    /// Slots used in turn (header page offset i*64, buffer i), so a
+    /// just-completed buffer is not resubmitted while the device may
+    /// still be retiring it.
     header: u64,
-    buf: u64,
+    bufs: Vec<u64>,
+    slot: usize,
     buf_pages: usize,
     next_id: u64,
 }
@@ -195,6 +199,7 @@ struct State {
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 const BUF_PAGES: usize = 64; // 256 KiB of commands per submission
+const SLOTS: usize = 16;
 
 fn io() -> Option<u16> {
     let io = IO_BASE.load(Ordering::Acquire);
@@ -209,13 +214,16 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
         return Ok(());
     }
     let io = io().ok_or("no SVGA adapter")?;
+    let slot = st.slot;
+    st.slot = (st.slot + 1) % st.bufs.len();
+    let (header, buf) = (st.header + slot as u64 * 64, st.bufs[slot]);
     if bytes.len() > st.buf_pages * PAGE {
         return Err(alloc::format!("command stream of {} bytes is too long", bytes.len()));
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys_to_virt(st.buf) as *mut u8, bytes.len());
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys_to_virt(buf) as *mut u8, bytes.len());
     }
-    let h = phys_to_virt(st.header) as *mut u32;
+    let h = phys_to_virt(header) as *mut u32;
     st.next_id += 1;
     unsafe {
         core::ptr::write_bytes(h as *mut u8, 0, 64);
@@ -223,13 +231,13 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
         (h.add(2) as *mut u64).write_volatile(st.next_id);
         h.add(4).write_volatile(CB_FLAG_NO_IRQ | if dx_context.is_some() { 2 } else { 0 });
         h.add(5).write_volatile(bytes.len() as u32);
-        (h.add(6) as *mut u64).write_volatile(st.buf);
+        (h.add(6) as *mut u64).write_volatile(buf);
         h.add(8).write_volatile(0);
         h.add(9).write_volatile(dx_context.unwrap_or(0));
     }
     core::sync::atomic::fence(Ordering::SeqCst);
-    reg_write(io, REG_COMMAND_HIGH, (st.header >> 32) as u32);
-    reg_write(io, REG_COMMAND_LOW, (st.header as u32) | ctx);
+    reg_write(io, REG_COMMAND_HIGH, (header >> 32) as u32);
+    reg_write(io, REG_COMMAND_LOW, (header as u32) | ctx);
     let start = crate::time::uptime_ms();
     loop {
         let s = unsafe { h.read_volatile() };
@@ -247,8 +255,8 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
             return Err(alloc::format!("device status {} at offset {} of {}: {}", s, off, bytes.len(), what));
         }
         let waited = crate::time::uptime_ms() - start;
-        if waited > 2000 {
-            return Err(String::from("device did not answer within 2 s"));
+        if waited > 10_000 {
+            return Err(alloc::format!("device did not answer within 10 s (slot {}, {} bytes)", slot, bytes.len()));
         }
         // Short jobs finish while spinning; longer ones let others run.
         if waited > 0 {
@@ -296,8 +304,11 @@ pub fn init() -> Result<(), String> {
         return Err(String::from("the adapter has no command buffers / GB objects (turn on 3D acceleration)"));
     }
     let header = pmm::alloc_frame_zeroed().ok_or("out of memory")?;
-    let buf = pmm::alloc_contiguous(BUF_PAGES).ok_or("out of memory")?;
-    let mut st = State { started: false, otables: Vec::new(), header, buf, buf_pages: BUF_PAGES, next_id: 0 };
+    let mut bufs = Vec::new();
+    for _ in 0..SLOTS {
+        bufs.push(pmm::alloc_contiguous(BUF_PAGES).ok_or("out of memory")?);
+    }
+    let mut st = State { started: false, otables: Vec::new(), header, bufs, slot: 0, buf_pages: BUF_PAGES, next_id: 0 };
     // Device context: enable command-buffer context 0.
     let mut dc = Vec::new();
     for w in [DC_CMD_START_STOP_CONTEXT, 1, CB_CONTEXT_0] {
