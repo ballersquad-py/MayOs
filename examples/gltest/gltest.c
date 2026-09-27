@@ -35,8 +35,12 @@ int main(int argc, char **argv) {
         setenv("LIBGL_DEBUG", "verbose", 1);
         setenv("SVGA_DEBUG", "", 0);
     }
-    int sw = argc > 1 && !strcmp(argv[argc - 1], "-sw"); // software check (no GPU)
-    int wl = argc > 1 && !strcmp(argv[argc - 1], "-wl"); // through the Wayland compositor, like Firefox
+    int sw = 0, wl = 0, tex = 0; // -sw: software check, -wl: through the compositor, -tex: texture upload
+    for (int i = 1; i < argc; i++) {
+        sw |= !strcmp(argv[i], "-sw");
+        wl |= !strcmp(argv[i], "-wl");
+        tex |= !strcmp(argv[i], "-tex");
+    }
     int fd = sw || wl ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     if (fd < 0 && !sw && !wl) { printf("FAIL no /dev/dri/renderD128 (touch /etc/gpu3d and reboot)\n"); return 1; }
     void *gbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
@@ -196,6 +200,45 @@ int main(int argc, char **argv) {
         printf("%s presented %d of 30 frames through the compositor\n", swapped == 30 ? "ok  " : "FAIL", swapped);
         green = W * H * (swapped == 30);
         if (sw) green = green;
+    }
+    if (tex) {
+        // Texture upload: a 256x256 gradient drawn full-screen, then checked.
+        GL(void, glGenTextures, int, unsigned *) GL(void, glBindTexture, unsigned, unsigned)
+        GL(void, glTexImage2D, unsigned, int, int, int, int, int, unsigned, unsigned, const void *)
+        GL(void, glTexParameteri, unsigned, unsigned, int)
+        static uint8_t img[256 * 256 * 4];
+        for (int y = 0; y < 256; y++)
+            for (int x = 0; x < 256; x++) {
+                uint8_t *p = img + (y * 256 + x) * 4;
+                p[0] = x; p[1] = y; p[2] = 128; p[3] = 255;
+            }
+        unsigned tex;
+        glGenTextures(1, &tex); glBindTexture(0x0DE1, tex);
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);
+        glTexImage2D(0x0DE1, 0, 0x1908, 256, 256, 0, 0x1908, 0x1401, img);
+        const char *tvs = "attribute vec2 p; varying vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }";
+        const char *tfs = "precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = texture2D(t, uv); }";
+        unsigned tv = glCreateShader(0x8B31), tf = glCreateShader(0x8B30), tp = glCreateProgram();
+        glShaderSource(tv, 1, &tvs, 0); glCompileShader(tv); glShaderSource(tf, 1, &tfs, 0); glCompileShader(tf);
+        glAttachShader(tp, tv); glAttachShader(tp, tf); glBindAttribLocation(tp, 0, "p"); glLinkProgram(tp);
+        glBindFramebuffer(0x8D40, fb);
+        glViewport(0, 0, W, H);
+        glUseProgram(tp);
+        float quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+        glVertexAttribPointer(0, 2, 0x1406, 0, 0, quad); glEnableVertexAttribArray(0);
+        glDrawArrays(5, 0, 4);
+        glReadPixels(0, 0, W, H, 0x1908, 0x1401, px);
+        int good = 0;
+        for (int y = 0; y < H; y += 17)
+            for (int x = 0; x < W; x += 13) {
+                uint8_t *q = px + (y * W + x) * 4;
+                good += abs(q[0] - x) <= 2 && abs(q[1] - y) <= 2 && abs(q[2] - 128) <= 2;
+            }
+        int total = ((H + 16) / 17) * ((W + 12) / 13);
+        printf("%s texture upload: %d of %d samples right (row 0: %d,%d,%d  row 128: %d,%d,%d  row 255: %d,%d,%d)\n",
+            good == total ? "ok  " : "FAIL", good, total,
+            px[0], px[1], px[2], px[(128 * W) * 4], px[(128 * W) * 4 + 1], px[(128 * W) * 4 + 2], px[(255 * W) * 4], px[(255 * W) * 4 + 1], px[(255 * W) * 4 + 2]);
+        green = good == total ? W * H : 0;
     }
     int ok = (hw || sw) && green == W * H && linked;
     printf("%s\n", ok ? "GLTEST PASSED" : "GLTEST FAILED");

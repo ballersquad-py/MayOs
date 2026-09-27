@@ -908,7 +908,10 @@ impl State {
                         // Same size as before and only part changed: copy just
                         // the damaged rectangles into our copy of the picture.
                         let area: i64 = damage.iter().map(|d| d.2.max(0) as i64 * d.3.max(0) as i64).sum();
-                        let partial = !damage.is_empty()
+                        // GPU frames are always copied whole (their damage
+                        // hints refer to buffer ages we do not track).
+                        let partial = b.gpu.is_none()
+                            && !damage.is_empty()
                             && area < b.w as i64 * b.h as i64 / 2
                             && s.image.as_ref().is_some_and(|i| i.0 == b.w && i.1 == b.h);
                         if partial {
