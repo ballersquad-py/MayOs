@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
             if (surf & 4) printf("     window config %d: rgba %d%d%d%d depth %d stencil %d renderable %#x\n", i, r, g, b, a2, d, st, rt);
         }
     }
-    int cattrs[] = {0x3098 /* CONTEXT_CLIENT_VERSION */, 2, 0x3038};
+    int cattrs[] = {0x3098 /* CONTEXT_CLIENT_VERSION */, full ? 3 : 2, 0x3038};
     void *ctx = eglCreateContext(dpy, n ? cfg : 0, 0, cattrs);
     if (!ctx || !eglMakeCurrent(dpy, 0, 0, ctx)) { printf("FAIL context (error %#x)\n", eglGetError()); return 1; }
 #define GL(ret, name, ...) typedef ret (*name##_t)(__VA_ARGS__); name##_t name = (name##_t)eglGetProcAddress(#name);
@@ -312,6 +312,71 @@ int main(int argc, char **argv) {
         glClear(0x4000); glDrawArrays(5, 0, 4);
         CHECK_PIXEL("1024 texture, updated corner", 200, 200, 0, 200, 255);
         CHECK_PIXEL("1024 texture, untouched part", 50, 50, 0x40, 0x40, 0x40);
+        // 9: a 3 MiB vertex buffer (GPU memory described by a two-level
+        // page table), the quad stored at its end
+        glUseProgram(pr); glBindFramebuffer(0x8D40, fb); glViewport(0, 0, W, H);
+        static float bigvb[3 * 1024 * 1024 / 4];
+        size_t endq = sizeof bigvb / 4 - 12;
+        memcpy(bigvb + endq, full_quad, sizeof full_quad);
+        unsigned bvb; glGenBuffers(1, &bvb); glBindBuffer(0x8892, bvb);
+        glBufferData(0x8892, sizeof bigvb, bigvb, 0x88E4);
+        glVertexAttribPointer(0, 3, 0x1406, 0, 0, (void *)(endq * 4));
+        glClear(0x4000); glUniform4f(uc, 0, 1, 1, 1); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("3 MiB vertex buffer, data at the end", 128, 128, 0, 255, 255);
+        // 10: same, after glBufferSubData deep inside it
+        float leftq[] = {-1, -1, 0, 0, -1, 0, -1, 1, 0, 0, 1, 0};
+        glBufferSubData(0x8892, endq * 4, sizeof leftq, leftq);
+        glClear(0x4000); glUniform4f(uc, 1, 0.5f, 0, 1); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("3 MiB buffer, sub-update (inside)", 64, 128, 255, 128, 0);
+        CHECK_PIXEL("3 MiB buffer, sub-update (outside)", 192, 128, 0, 0, 0);
+        glVertexAttribPointer(0, 3, 0x1406, 0, 0, 0);
+        // 11: mat4 uniform (camera matrix) + interleaved position/colour
+        GL(void, glUniformMatrix4fv, int, int, unsigned char, const float *)
+        const char *mvs = "attribute vec3 p; attribute vec3 col; uniform mat4 m; varying vec3 vc; void main() { vc = col; gl_Position = m * vec4(p, 1.0); }";
+        const char *mfs = "precision mediump float; varying vec3 vc; uniform vec4 tint; void main() { gl_FragColor = vec4(vc, 1.0) * tint; }";
+        unsigned ma = glCreateShader(0x8B31), mb = glCreateShader(0x8B30), mp = glCreateProgram();
+        glShaderSource(ma, 1, &mvs, 0); glCompileShader(ma); glShaderSource(mb, 1, &mfs, 0); glCompileShader(mb);
+        glAttachShader(mp, ma); glAttachShader(mp, mb); glBindAttribLocation(mp, 0, "p"); glBindAttribLocation(mp, 1, "col"); glLinkProgram(mp);
+        glUseProgram(mp);
+        float inter[] = {-1, -1, 0, 1, 1, 1,  1, -1, 0, 1, 1, 1,  -1, 1, 0, 1, 1, 1,  1, 1, 0, 1, 1, 1};
+        unsigned ivb; glGenBuffers(1, &ivb); glBindBuffer(0x8892, ivb); glBufferData(0x8892, sizeof inter, inter, 0x88E4);
+        glVertexAttribPointer(0, 3, 0x1406, 0, 24, 0); glVertexAttribPointer(1, 3, 0x1406, 0, 24, (void *)12);
+        glEnableVertexAttribArray(1);
+        // scale x and y by 0.5, shift right by 0.5: covers x in [0,1] of NDC, y in [-0.5,0.5]
+        float m4[16] = {0.5f, 0, 0, 0,  0, 0.5f, 0, 0,  0, 0, 1, 0,  0.5f, 0, 0, 1};
+        glUniformMatrix4fv(glGetUniformLocation(mp, "m"), 1, 0, m4);
+        glUniform4f(glGetUniformLocation(mp, "tint"), 1, 0, 1, 1);
+        glClear(0x4000); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("mat4 uniform, inside", 192, 128, 255, 0, 255);
+        CHECK_PIXEL("mat4 uniform, outside", 64, 128, 0, 0, 0);
+        // 12: the matrix changed between two draws in one frame
+        float m5[16] = {0.5f, 0, 0, 0,  0, 0.5f, 0, 0,  0, 0, 1, 0,  -0.5f, 0, 0, 1};
+        glUniformMatrix4fv(glGetUniformLocation(mp, "m"), 1, 0, m5);
+        glUniform4f(glGetUniformLocation(mp, "tint"), 0, 1, 0, 1);
+        glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("second matrix, same frame (left)", 64, 128, 0, 255, 0);
+        CHECK_PIXEL("second matrix, first draw kept", 192, 128, 255, 0, 255);
+        glDisableVertexAttribArray(1);
+        // 13: 4x multisampled framebuffer resolved with glBlitFramebuffer
+        GL(void, glRenderbufferStorageMultisample, unsigned, int, unsigned, int, int)
+        GL(void, glBlitFramebuffer, int, int, int, int, int, int, int, int, unsigned, unsigned)
+        unsigned mfb, mrb, mdb;
+        glGenFramebuffers(1, &mfb); glBindFramebuffer(0x8D40, mfb);
+        glGenRenderbuffers(1, &mrb); glBindRenderbuffer(0x8D41, mrb); glRenderbufferStorageMultisample(0x8D41, 4, 0x8058, W, H);
+        glFramebufferRenderbuffer(0x8D40, 0x8CE0, 0x8D41, mrb);
+        glGenRenderbuffers(1, &mdb); glBindRenderbuffer(0x8D41, mdb); glRenderbufferStorageMultisample(0x8D41, 4, 0x81A6, W, H);
+        glFramebufferRenderbuffer(0x8D40, 0x8D00, 0x8D41, mdb);
+        printf("%s 4x multisampled framebuffer\n", glCheckFramebufferStatus(0x8D40) == 0x8CD5 ? "ok  " : "FAIL");
+        glEnable(0x0B71); glDepthFunc(0x0201); glClearColor(0, 0, 0, 1); glClear(0x4000 | 0x100);
+        glUseProgram(pr); glBindBuffer(0x8892, vbo);
+        glVertexAttribPointer(0, 3, 0x1406, 0, 0, 0);
+        glBufferData(0x8892, sizeof nearq, nearq, 0x88E8); glUniform4f(uc, 0, 0, 1, 1); glDrawArrays(5, 0, 4);
+        glBufferData(0x8892, sizeof farq, farq, 0x88E8); glUniform4f(uc, 1, 0, 0, 1); glDrawArrays(5, 0, 4);
+        glDisable(0x0B71);
+        glBindFramebuffer(0x8CA8 /* READ */, mfb); glBindFramebuffer(0x8CA9 /* DRAW */, fb);
+        glBlitFramebuffer(0, 0, W, H, 0, 0, W, H, 0x4000, 0x2600);
+        glBindFramebuffer(0x8D40, fb);
+        CHECK_PIXEL("MSAA draw + depth, resolved", 128, 128, 0, 0, 255);
         printf("%s %d of %d feature checks passed\n", passed == total ? "ok  " : "FAIL", passed, total);
         green = passed == total ? W * H : 0;
     }
