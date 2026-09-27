@@ -567,7 +567,10 @@ impl State {
                     });
                     match sid.and_then(|s| super::drm::surface_memory(s).map(|m| (s, m))) {
                         Some((sid, shm)) => {
-                            let b = Buffer { shm, off: off.max(0) as u64, w: w.clamp(0, 8192), h: h.clamp(0, 8192), stride, opaque: fmt == 0x3432_5258, gpu: Some(sid) };
+                            // The GPU writes the surface back tightly packed (width x 4 bytes a
+                            // row), whatever stride the client computed.
+                            let _ = stride;
+                            let b = Buffer { shm, off: 0, w: w.clamp(0, 8192), h: h.clamp(0, 8192), stride: w.clamp(0, 8192) * 4, opaque: fmt == 0x3432_5258, gpu: Some(sid) };
                             self.new_obj(new, Obj::Buffer(b), 1);
                         }
                         None => {

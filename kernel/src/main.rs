@@ -21,6 +21,7 @@ mod pkg;
 mod power;
 mod proc;
 mod selftest;
+mod watchdog;
 mod smp;
 mod serial;
 mod settings;
@@ -83,6 +84,7 @@ extern "C" fn kmain() -> ! {
         proc::sched::spawn_kernel("selftest", selftest::run, 0);
     }
     proc::wayland::init();
+    proc::sched::spawn_kernel("watchdog", watchdog::run, 0);
     proc::sched::spawn_kernel("desktop", gui::desktop_main, 0);
     proc::sched::start();
     kprintln!("boot complete in {} ms", time::uptime_ms());
