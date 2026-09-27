@@ -181,6 +181,10 @@ public class Launcher {
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(mc.toFile()).inheritIO();
         pb.environment().put("XDG_SESSION_TYPE", "wayland");
         pb.environment().remove("DISPLAY");
+        // LWJGL's natives are glibc builds. musl takes libc.so.6 and friends
+        // to mean itself, so gcompat's glibc symbols (__snprintf_chk, ...)
+        // are only there when preloaded; unresolved ones jump to nowhere.
+        if (Files.exists(Paths.get("/lib/libgcompat.so.0"))) pb.environment().merge("LD_PRELOAD", "/lib/libgcompat.so.0", (a, b) -> b + ":" + a);
         System.exit(pb.start().waitFor());
     }
 
