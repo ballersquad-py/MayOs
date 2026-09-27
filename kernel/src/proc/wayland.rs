@@ -47,10 +47,11 @@ impl ServiceFactory for Factory {
         let c = Arc::new(Client {
             pid,
             to_client,
-            st: Mutex::new(State::default()),
+            st: Mutex::new(State { pid, ..State::default() }),
             alive: AtomicBool::new(true),
             me: Spin::new(Weak::new()),
         });
+        wlog(alloc::format!("pid {}: connected", pid));
         *c.me.lock() = Arc::downgrade(&c);
         CLIENTS.lock().push(Arc::downgrade(&c));
         c
@@ -309,6 +310,8 @@ const GLOBALS: &[Global] = &[
 
 #[derive(Default)]
 struct State {
+    /// The client's process (for the log).
+    pid: u64,
     objs: BTreeMap<u32, Obj>,
     versions: BTreeMap<u32, u32>,
     inbuf: Vec<u8>,
@@ -370,12 +373,33 @@ enum A<'a> {
     Fd(DescRef),
 }
 
+/// A short log of what programs do with the compositor, in
+/// /wayland-log.txt (connections, globals, windows, first frames, errors),
+/// to see why a program shows no window.
+static LOG: Spin<Vec<String>> = Spin::new(Vec::new());
+static FRAMES_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn wlog(line: String) {
+    let text = {
+        let mut l = LOG.lock();
+        if l.len() >= 400 {
+            l.drain(..100);
+        }
+        l.push(alloc::format!("{} ms {}", crate::time::uptime_ms(), line));
+        l.join("\n")
+    };
+    let _ = crate::fs::write_file("/wayland-log.txt", text.as_bytes());
+}
+
 fn now_ms() -> u32 {
     crate::time::uptime_ms() as u32
 }
 
 impl State {
     fn ev(&mut self, obj: u32, op: u16, args: Vec<A>) {
+        if obj == 1 && op == 0 {
+            wlog(alloc::format!("pid {}: protocol error {:?}", self.pid, args.iter().map(|a| match a { A::S(s) => String::from(*s), A::U(v) => alloc::format!("{}", v), _ => String::new() }).collect::<Vec<_>>()));
+        }
         let mut body = Vec::new();
         for a in args {
             match a {
@@ -473,9 +497,10 @@ impl State {
         } else if is!(Obj::Registry) {
             if op == 0 {
                 let name = a.u();
-                let _iface = a.s();
+                let iface = a.s();
                 let ver = a.u();
                 let new = a.u();
+                wlog(alloc::format!("pid {}: bind {} v{}", self.pid, iface, ver));
                 self.bind(c, name, ver, new);
             }
         } else if is!(Obj::Compositor) {
@@ -899,6 +924,10 @@ impl State {
                 Some(bid) => {
                     if let Some(Obj::Buffer(b)) = self.objs.get(&bid) {
                         let b = b.clone();
+                        if FRAMES_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                            let role = self.surface(id).map(|s| match s.role { Role::Toplevel(_) => "window", Role::Sub { .. } => "subsurface", Role::Popup { .. } => "popup", Role::None => "no role" }).unwrap_or("?");
+                            wlog(alloc::format!("pid {}: frame on surface {} ({}) {}x{} stride {}{}", self.pid, id, role, b.w, b.h, b.stride, if b.gpu.is_some() { " GPU" } else { "" }));
+                        }
                         // A GPU buffer: have the GPU copy the frame into memory first.
                         if let Some(sid) = b.gpu {
                             super::drm::surface_readback(sid);
@@ -974,6 +1003,7 @@ impl State {
     }
 
     fn make_toplevel(&mut self, c: &Client, surface: u32, _role_obj: u32) {
+        wlog(alloc::format!("pid {}: window (surface {})", c.pid, surface));
         let w = Arc::new(Window {
             client: c.me.lock().clone(),
             surface,
