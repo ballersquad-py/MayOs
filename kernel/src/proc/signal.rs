@@ -563,6 +563,13 @@ pub fn sigreturn(p: &Process, f: &mut TrapFrame) -> bool {
 /// (and the signal is not blocked). Returns true if the thread resumes.
 pub fn fault(p: &Arc<Process>, f: &mut TrapFrame, sig: u64, code: i32, addr: u64) -> bool {
     let Some(st) = state(p) else { return false };
+    if sig == 11 || sig == 7 || sig == 4 {
+        // Programs often handle these themselves and exit; keep a record.
+        static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
+            crate::kprintln!("linux: signal {} in {} (pid {}) at {:#x} {} touching {:#x}", sig, super::linux::exe_name(p), p.pid, f.rip, super::linux::describe_addr(p, f.rip), addr);
+        }
+    }
     let tid = sched::current_id();
     {
         let mut s = st.lock();

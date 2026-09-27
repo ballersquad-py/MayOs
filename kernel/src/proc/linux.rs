@@ -311,6 +311,9 @@ fn base_env(cwd: &str) -> Vec<String> {
         String::from("MOZ_FORCE_DISABLE_E10S=1"),
         alloc::format!("PWD={}", cwd),
     ];
+    if crate::boot::cmdline().contains("wldebug") {
+        v.push(String::from("WAYLAND_DEBUG=1"));
+    }
     if crate::boot::cmdline().contains("egldebug") {
         v.push(String::from("EGL_LOG_LEVEL=debug"));
         v.push(String::from("LIBGL_DEBUG=verbose"));
@@ -1347,7 +1350,8 @@ fn sys_write(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     // "vmwgfx" (it treats them as unstable virtual-machine drivers). Its
     // probe (glxtest) reports the name through a pipe; report Mesa's own
     // name for the same driver instead.
-    if data.starts_with(b"DRI_DRIVER\nvmwgfx\n") && super::drm::firefox_gpu() && exe_name(p).contains("glxtest") {
+    if data.starts_with(b"DRI_DRIVER\nvmwgfx\n") && super::drm::firefox_gpu() {
+        crate::kprintln!("linux: reporting the GPU driver to Firefox as svga");
         let mut patched = b"DRI_DRIVER\nsvga\n".to_vec();
         patched.extend_from_slice(&data[b"DRI_DRIVER\nvmwgfx\n".len()..]);
         let r = write_desc(p, &d, &patched);
@@ -4499,4 +4503,21 @@ pub fn syscall_name(nr: u64) -> String {
         _ => return alloc::format!("sys{}", nr),
     };
     String::from(n)
+}
+
+/// "library+offset" for an address in a Linux process (crash reports).
+pub fn describe_addr(p: &Process, addr: u64) -> String {
+    let Some(l) = linux(p) else { return String::new() };
+    let regions = l.regions.lock().clone();
+    // The lowest mapping of the same file gives the library's base.
+    let Some(r) = regions.iter().find(|r| addr >= r.start && addr < r.end).copied() else { return String::from("(unmapped)") };
+    if r.file == 0 {
+        return String::from("(anonymous memory)");
+    }
+    let name = l.mapped.lock().get(r.file as usize - 1).and_then(|d| match &*d.lock() {
+        Desc::File { path, .. } => Some(path.clone()),
+        _ => None,
+    }).unwrap_or_default();
+    let base = r.start - r.foff;
+    alloc::format!("{}+{:#x}", name, addr - base)
 }
