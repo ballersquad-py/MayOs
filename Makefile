@@ -17,6 +17,8 @@ LINUX_BINS := $(shell rustup target list --installed 2>/dev/null | grep -q x86_6
 USER_BINS  += $(LINUX_BINS)
 # C test of the Linux layer (signals, timerfd, ...), built when musl-gcc is installed.
 LINUX_C    := $(shell command -v musl-gcc >/dev/null 2>&1 && echo linux-signals drmtest)
+LINUX_DYN  := $(shell command -v musl-gcc >/dev/null 2>&1 && echo gltest)
+USER_BINS  += $(LINUX_DYN)
 USER_BINS  += $(LINUX_C)
 
 QEMU       ?= qemu-system-x86_64
@@ -54,6 +56,9 @@ userspace:
 	done
 	for b in $(LINUX_C); do \
 		musl-gcc -static -O2 -o $(USER_DIR)/$$b examples/$$b/*.c -lpthread || exit 1; \
+	done
+	for b in $(LINUX_DYN); do \
+		musl-gcc -O2 -o $(USER_DIR)/$$b examples/$$b/*.c || exit 1; \
 	done
 
 define make_iso

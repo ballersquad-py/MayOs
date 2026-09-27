@@ -488,3 +488,96 @@ pub fn ioctl(pml4: u64, cmd: u64, arg: u64) -> i64 {
         }
     }
 }
+
+/// The PCI device directory of the GPU as sysfs paths name it, and the
+/// file inside it.
+fn sys_device_file(path: &str) -> Option<&str> {
+    for prefix in ["/sys/dev/char/226:0/device/", "/sys/dev/char/226:128/device/", "/sys/class/drm/card0/device/", "/sys/class/drm/renderD128/device/", "/sys/bus/pci/devices/0000:00:02.0/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// sysfs files libdrm reads to identify the GPU (drmGetDevice2), which is
+/// how Mesa picks the vmwgfx driver.
+pub fn sys_file(path: &str) -> Option<Vec<u8>> {
+    use alloc::string::String;
+    if !enabled() {
+        return None;
+    }
+    for (name, minor) in NODES {
+        for dir in ["/sys/dev/char/226:", "/sys/class/drm/"] {
+            let base = if dir.ends_with(':') { alloc::format!("{}{}", dir, minor) } else { alloc::format!("{}{}", dir, name) };
+            if path == alloc::format!("{}/uevent", base) {
+                return Some(alloc::format!("MAJOR=226\nMINOR={}\nDEVNAME=dri/{}\n", minor, name).into_bytes());
+            }
+            if path == alloc::format!("{}/dev", base) {
+                return Some(alloc::format!("226:{}\n", minor).into_bytes());
+            }
+        }
+    }
+    let f = sys_device_file(path)?;
+    Some(match f {
+        "vendor" | "subsystem_vendor" => String::from("0x15ad\n"),
+        "device" | "subsystem_device" => String::from("0x0405\n"),
+        "revision" => String::from("0x00\n"),
+        "class" => String::from("0x030000\n"),
+        "boot_vga" => String::from("1\n"),
+        "uevent" => String::from("DRIVER=vmwgfx\nPCI_CLASS=30000\nPCI_ID=15AD:0405\nPCI_SUBSYS_ID=15AD:0405\nPCI_SLOT_NAME=0000:00:02.0\nMODALIAS=pci:v000015ADd00000405sv000015ADsd00000405bc03sc00i00\n"),
+        "config" => {
+            // The first 64 bytes of PCI configuration space.
+            let mut c = [0u8; 64];
+            c[0..2].copy_from_slice(&0x15adu16.to_le_bytes());
+            c[2..4].copy_from_slice(&0x0405u16.to_le_bytes());
+            c[0x0a] = 0x00;
+            c[0x0b] = 0x03;
+            c[0x2c..0x2e].copy_from_slice(&0x15adu16.to_le_bytes());
+            c[0x2e..0x30].copy_from_slice(&0x0405u16.to_le_bytes());
+            return Some(c.to_vec());
+        }
+        _ => return None,
+    }.into_bytes())
+}
+
+/// readlink on sysfs: the PCI subsystem link, and plain directories
+/// (EINVAL = "not a link", which realpath needs to walk them).
+pub fn sys_readlink(path: &str) -> Option<Result<alloc::string::String, i64>> {
+    if !enabled() || !path.starts_with("/sys") {
+        return None;
+    }
+    if let Some(f) = sys_device_file(path) {
+        return Some(match f {
+            "subsystem" => Ok(alloc::string::String::from("/sys/bus/pci")),
+            "driver" => Ok(alloc::string::String::from("/sys/bus/pci/drivers/vmwgfx")),
+            _ => Err(-EINVAL),
+        });
+    }
+    let dirs = ["/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices", "/sys/bus/pci/drivers", "/sys/bus/pci/drivers/vmwgfx", "/sys/dev", "/sys/dev/char", "/sys/class", "/sys/class/drm"];
+    let t = path.trim_end_matches('/');
+    let dev = t.strip_prefix("/sys/dev/char/").is_some_and(|n| n == "226:0" || n == "226:128")
+        || t.strip_prefix("/sys/class/drm/").is_some_and(|n| n == "card0" || n == "renderD128")
+        || t.ends_with("/device") || t == "/sys/bus/pci/devices/0000:00:02.0";
+    if dirs.contains(&t) || dev {
+        return Some(Err(-EINVAL));
+    }
+    None
+}
+
+/// sysfs directories libdrm lists: the device's `drm` folder (its nodes).
+pub fn sys_dir(path: &str) -> Option<Vec<(alloc::string::String, bool)>> {
+    if !enabled() {
+        return None;
+    }
+    let t = path.trim_end_matches('/');
+    let f = sys_device_file(&alloc::format!("{}/", t)).map(|_| "")
+        .or_else(|| sys_device_file(t));
+    if f == Some("drm") {
+        return Some(NODES.iter().map(|(n, _)| (alloc::string::String::from(*n), true)).collect());
+    }
+    if t == "/sys/class/drm" {
+        return Some(NODES.iter().map(|(n, _)| (alloc::string::String::from(*n), true)).collect());
+    }
+    None
+}

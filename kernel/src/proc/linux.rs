@@ -960,6 +960,9 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
     if let Some(minor) = super::drm::node(&path) {
         return add_fd(p, Desc::Drm(minor));
     }
+    if let Some(entries) = super::drm::sys_dir(&path) {
+        return add_fd(p, Desc::Dir { path, entries, pos: 0 });
+    }
     if path == "/dev/dri" && super::drm::enabled() {
         let entries = super::drm::NODES.iter().map(|(n, _)| (String::from(*n), false)).collect();
         return add_fd(p, Desc::Dir { path, entries, pos: 0 });
@@ -4165,8 +4168,13 @@ fn readlink(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
             Desc::PipeRead(_) | Desc::PipeWrite(_) => alloc::format!("pipe:[{}]", fd + 1000),
             Desc::Tcp { .. } | Desc::Udp { .. } | Desc::Unix { .. } => alloc::format!("socket:[{}]", fd + 1000),
             Desc::Memfd { .. } => String::from("/memfd: (deleted)"),
+            Desc::Drm(0) => String::from("/dev/dri/card0"),
+            Desc::Drm(_) => String::from("/dev/dri/renderD128"),
             _ => alloc::format!("anon_inode:[{}]", fd),
         });
+    }
+    if let Some(r) = super::drm::sys_readlink(&raw) {
+        return r;
     }
     let path = path_at(p, dirfd, ptr)?;
     let data = fs::read_file(&path).map_err(fs_err)?;
@@ -4192,6 +4200,9 @@ fn proc_self(p: &Process, path: &str) -> String {
 /// Per-process /proc files and a few /sys files programs look at.
 fn proc_file(p: &Process, path: &str) -> Option<Desc> {
     let path = proc_self(p, path);
+    if let Some(data) = super::drm::sys_file(&path) {
+        return Some(Desc::Virtual { data, pos: 0 });
+    }
     let l = linux(p)?;
     let name = l.exe.lock().rsplit('/').next().unwrap_or("").chars().take(15).collect::<String>();
     let threads = sched::process_thread_count(p.pid);
