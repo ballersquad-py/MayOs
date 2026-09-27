@@ -236,6 +236,7 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
         h.add(8).write_volatile(0);
         h.add(9).write_volatile(dx_context.unwrap_or(0));
     }
+    journal_add(bytes, dx_context);
     core::sync::atomic::fence(Ordering::SeqCst);
     reg_write(io, REG_COMMAND_HIGH, (header >> 32) as u32);
     reg_write(io, REG_COMMAND_LOW, (header as u32) | ctx);
@@ -244,6 +245,7 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
         let s = unsafe { h.read_volatile() };
         if s != CB_STATUS_NONE {
             if s == CB_STATUS_COMPLETED {
+                journal_done("ok");
                 return Ok(());
             }
             let off = unsafe { h.add(1).read_volatile() } as usize;
@@ -253,6 +255,7 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
                 (Some(id), Some(size)) => alloc::format!("command {} ({} bytes of arguments, first {:x?})", id, size, word(off + 8)),
                 _ => String::from("unknown command"),
             };
+            journal_done("ERROR");
             return Err(alloc::format!("device status {} at offset {} of {}: {}", s, off, bytes.len(), what));
         }
         let waited = crate::time::uptime_ms() - start;
@@ -414,4 +417,57 @@ pub fn self_test() -> Result<String, String> {
     cleanup.cmd(CMD_DESTROY_GB_MOB, &[mob_b]);
     let _ = submit(&cleanup);
     if ok && upload_ok { Ok(log) } else { Err(log) }
+}
+
+/// Journal of the last GPU submissions, saved to /gpu-last.txt every
+/// second: if the whole VM freezes inside the 3D device, the file names
+/// the commands it was given last.
+static JOURNAL: crate::sync::Spin<(alloc::collections::VecDeque<String>, bool)> =
+    crate::sync::Spin::new((alloc::collections::VecDeque::new(), false));
+
+fn journal_add(bytes: &[u8], dx: Option<u32>) {
+    use core::fmt::Write;
+    let mut line = alloc::format!("{} ms dx={:?} {} B:", crate::time::uptime_ms(), dx, bytes.len());
+    let mut off = 0;
+    let mut n = 0;
+    while off + 8 <= bytes.len() && n < 40 {
+        let id = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        let _ = write!(line, " {}", id);
+        off += 8 + size;
+        n += 1;
+    }
+    let start = {
+        let mut j = JOURNAL.lock();
+        if j.0.len() >= 200 {
+            j.0.pop_front();
+        }
+        j.0.push_back(line);
+        !core::mem::replace(&mut j.1, true)
+    };
+    if start {
+        crate::proc::sched::spawn_kernel("gpu-journal", journal_thread, 0);
+    }
+}
+
+fn journal_done(what: &str) {
+    if let Some(l) = JOURNAL.lock().0.back_mut() {
+        l.push_str(" -> ");
+        l.push_str(what);
+    }
+}
+
+extern "C" fn journal_thread(_: usize) {
+    let mut last = String::new();
+    loop {
+        crate::proc::sched::sleep_ms(1000);
+        let text: String = {
+            let j = JOURNAL.lock();
+            j.0.iter().map(|l| alloc::format!("{}\n", l)).collect()
+        };
+        if text != last {
+            let _ = crate::fs::write_file("/gpu-last.txt", text.as_bytes());
+            last = text;
+        }
+    }
 }
