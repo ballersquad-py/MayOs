@@ -420,7 +420,7 @@ pub fn self_test() -> Result<String, String> {
 }
 
 /// Journal of the last GPU submissions, saved to /gpu-last.txt every
-/// second: if the whole VM freezes inside the 3D device, the file names
+/// quarter second: if the whole VM freezes inside the 3D device, the file names
 /// the commands it was given last.
 static JOURNAL: crate::sync::Spin<(alloc::collections::VecDeque<String>, bool)> =
     crate::sync::Spin::new((alloc::collections::VecDeque::new(), false));
@@ -460,7 +460,7 @@ fn journal_done(what: &str) {
 extern "C" fn journal_thread(_: usize) {
     let mut last = String::new();
     loop {
-        crate::proc::sched::sleep_ms(1000);
+        crate::proc::sched::sleep_ms(250);
         let text: String = {
             let j = JOURNAL.lock();
             j.0.iter().map(|l| alloc::format!("{}\n", l)).collect()
