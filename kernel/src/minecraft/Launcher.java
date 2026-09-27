@@ -15,7 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
-    static final String BUILD = "2026-09-27c";
+    static final String BUILD = "2026-09-27d";
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static HttpClient HTTP;
     static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
@@ -435,13 +435,14 @@ public class Launcher {
         return g.matches("\\d+x\\d+") ? g : "1280x720";
     }
 
-    // Rootful Xwayland on a free display; the game gets DISPLAY.
+    // Rootful Xwayland on a free display; the game gets DISPLAY. -shm: no
+    // glamor (on vmwgfx its buffer maps fail and the window stays black).
     static Process startXwayland(ProcessBuilder game) throws Exception {
         Files.createDirectories(Paths.get("/tmp/.X11-unix"));
         int d = 7;
         while (Files.exists(Paths.get("/tmp/.X11-unix/X" + d))) d++;
         String geometry = x11Geometry();
-        ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
+        ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-shm", "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
         xb.environment().putAll(game.environment());
         Process x = xb.start();
         Path sock = Paths.get("/tmp/.X11-unix/X" + d);
