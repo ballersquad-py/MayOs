@@ -669,6 +669,28 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
         }
         return start as i64;
     }
+    if flags & MAP_ANONYMOUS == 0
+        && let Some(d) = get_fd(p, fd)
+        && matches!(&*d.lock(), Desc::Drm(_))
+    {
+        // A GPU buffer: its pages, shared with the device.
+        let Some((shm, size)) = super::drm::bo_for_offset(off) else { return -EINVAL };
+        if len > size.div_ceil(PAGE_SIZE) * PAGE_SIZE {
+            return -EINVAL;
+        }
+        let mut rights = USER | paging::BORROWED | NO_EXECUTE;
+        if prot & 2 != 0 {
+            rights |= WRITABLE;
+        }
+        for i in 0..len / PAGE_SIZE {
+            let Some(pg) = shm.page(i as usize) else { return -ENOMEM };
+            if paging::map(p.pml4(), start + i * PAGE_SIZE, pg, rights).is_err() {
+                return -ENOMEM;
+            }
+        }
+        l.shared.lock().push(shm);
+        return start as i64;
+    }
     const MAP_SHARED: u64 = 1;
     if flags & MAP_ANONYMOUS == 0 && flags & 3 == MAP_SHARED
         && let Some(d) = get_fd(p, fd)

@@ -14,7 +14,6 @@ use core::sync::atomic::Ordering;
 
 use crate::drivers::vmware_svga::{reg_read, reg_write, IO_BASE};
 use crate::mem::{phys_to_virt, pmm};
-use crate::sync::Spin;
 
 const REG_COMMAND_LOW: u32 = 48;
 const REG_COMMAND_HIGH: u32 = 49;
@@ -36,6 +35,11 @@ pub const CMD_UPDATE_GB_IMAGE: u32 = 1101;
 pub const CMD_READBACK_GB_IMAGE: u32 = 1103;
 pub const CMD_SET_OTABLE_BASE64: u32 = 1115;
 pub const CMD_DEFINE_GB_MOB64: u32 = 1135;
+pub const CMD_DX_DEFINE_CONTEXT: u32 = 1143;
+pub const CMD_DX_DESTROY_CONTEXT: u32 = 1144;
+pub const CMD_DX_BIND_CONTEXT: u32 = 1145;
+pub const CMD_DX_SET_COTABLE: u32 = 1207;
+pub const CMD_DEFINE_GB_SURFACE_V4: u32 = 1267;
 
 const MOBFMT_PT64_0: u32 = 4;
 const MOBFMT_PT64_1: u32 = 5;
@@ -46,6 +50,8 @@ const PAGE: usize = 4096;
 /// Guest memory handed to the device: pages plus the page table that
 /// describes them (depth chosen by size).
 pub struct Mob {
+    /// Pages owned by this Mob (freed with it) unless `shared` holds them.
+    shared: Option<alloc::sync::Arc<crate::proc::unix::Shm>>,
     pub pages: Vec<u64>,
     tables: Vec<u64>,
     pub depth: u32,
@@ -100,7 +106,7 @@ impl Mob {
         } else {
             return None;
         };
-        Some(Mob { pages, tables, depth, base, size })
+        Some(Mob { shared: None, pages, tables, depth, base, size })
     }
 
     pub fn write(&self, off: usize, data: &[u8]) {
@@ -130,10 +136,30 @@ impl Mob {
     }
 }
 
+impl Mob {
+    /// A Mob over shared memory (a GPU buffer programs can map); the
+    /// pages live as long as the Shm.
+    pub fn over(shm: alloc::sync::Arc<crate::proc::unix::Shm>, size: usize) -> Option<Mob> {
+        let n = size.div_ceil(PAGE).max(1);
+        let mut pages = Vec::with_capacity(n);
+        for i in 0..n {
+            pages.push(shm.page(i)?);
+        }
+        let mut m = Mob::from_pages(pages, size)?;
+        m.shared = Some(shm);
+        Some(m)
+    }
+}
+
 impl Drop for Mob {
     fn drop(&mut self) {
-        for &f in self.pages.iter().chain(self.tables.iter()) {
+        for &f in self.tables.iter() {
             pmm::free_frame(f);
+        }
+        if self.shared.is_none() {
+            for &f in self.pages.iter() {
+                pmm::free_frame(f);
+            }
         }
     }
 }
@@ -164,9 +190,9 @@ struct State {
     next_id: u64,
 }
 
-static STATE: Spin<Option<State>> = Spin::new(None);
-/// The device only takes one submission at a time from us.
-static SUBMIT: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+/// A sleeping lock: submissions wait for the device, which must not
+/// happen with interrupts off.
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 const BUF_PAGES: usize = 64; // 256 KiB of commands per submission
 
@@ -210,17 +236,22 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
             let off = unsafe { h.add(1).read_volatile() };
             return Err(alloc::format!("device status {} at command offset {}", s, off));
         }
-        if crate::time::uptime_ms() - start > 2000 {
+        let waited = crate::time::uptime_ms() - start;
+        if waited > 2000 {
             return Err(String::from("device did not answer within 2 s"));
         }
-        core::hint::spin_loop();
+        // Short jobs finish while spinning; longer ones let others run.
+        if waited > 0 {
+            crate::proc::sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
 /// Run 3D commands on context 0 and wait for completion.
 pub fn submit(c: &Cmds) -> Result<(), String> {
     init()?;
-    let _g = SUBMIT.lock();
     let mut s = STATE.lock();
     let st = s.as_mut().ok_or("3D not initialised")?;
     submit_raw(st, CB_CONTEXT_0, &c.0, None)
@@ -229,7 +260,6 @@ pub fn submit(c: &Cmds) -> Result<(), String> {
 /// Run commands for a DX context.
 pub fn submit_dx(c: &Cmds, dx_context: u32) -> Result<(), String> {
     init()?;
-    let _g = SUBMIT.lock();
     let mut s = STATE.lock();
     let st = s.as_mut().ok_or("3D not initialised")?;
     submit_raw(st, CB_CONTEXT_0, &c.0, Some(dx_context))
@@ -304,7 +334,7 @@ pub fn self_test() -> Result<String, String> {
     let src = Mob::new(bytes).ok_or("out of memory")?;
     let dst = Mob::new(bytes).ok_or("out of memory")?;
     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + 3) as u8).collect();
-    let (mob_a, mob_b, sid_a, sid_b) = (4000u32, 4001u32, 4000u32, 4001u32);
+    let (mob_a, mob_b, sid_a, sid_b) = (0xfff0u32, 0xfff1u32, 0xfff0u32, 0xfff1u32);
     let mut log = String::new();
     let count = |m: &Mob| {
         let mut back = alloc::vec![0u8; bytes];

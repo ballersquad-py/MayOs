@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -67,6 +68,58 @@ int main(void) {
         nz += caps[i] != 0;
     CHECK(r == 0 && nz > 50, "3D caps: %llu bytes, %d set", (unsigned long long)p[8], nz);
 
+    // ---- stage 2: objects and command submission, as Mesa uses them ----
+    union { struct { uint32_t size, pad; } req; struct { uint64_t map_handle; uint32_t handle, gmr_id, gmr_off, pad; } rep; } bo;
+    const uint32_t W = 64, H = 64;
+    memset(&bo, 0, sizeof bo);
+    bo.req.size = W * H * 4;
+    int r2 = ioctl(fd, _IOWR('d', 0x41, bo), &bo);
+    CHECK(r2 == 0, "allocate a GPU buffer (handle %u)", bo.rep.handle);
+    uint32_t bo_handle = bo.rep.handle;
+    uint32_t *px = mmap(0, W * H * 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bo.rep.map_handle);
+    CHECK(px != MAP_FAILED, "map the buffer");
+    if (px == MAP_FAILED || r2) goto done;
+    for (uint32_t i = 0; i < W * H; i++) px[i] = 0x11223344;
+
+    uint32_t sreq[22] = {0};
+    sreq[0] = (1u << 24) | (1u << 23);   // bind render target | shader resource
+    sreq[1] = 68;                        // R8G8B8A8_UNORM
+    sreq[2] = 1;                         // mip levels
+    sreq[3] = 0;                         // drm flags
+    sreq[6] = bo_handle;                 // backing buffer
+    sreq[7] = 0;                         // array size
+    sreq[8] = W; sreq[9] = H; sreq[10] = 1;
+    sreq[11] = 4;                        // surface version
+    r2 = ioctl(fd, _IOWR('d', 0x5b, sreq), sreq);
+    uint32_t sid = sreq[0];
+    CHECK(r2 == 0, "create a DX surface on the buffer (sid %u)", sid);
+
+    union { uint32_t req; struct { int32_t cid; uint32_t pad; } rep; } ctx = {1};
+    r2 = ioctl(fd, _IOWR('d', 0x5a, ctx), &ctx);
+    uint32_t cid = ctx.rep.cid;
+    CHECK(r2 == 0, "create a DX context (cid %u)", cid);
+
+    // Commands: define a render-target view, clear it, read it back.
+    uint32_t cmd[64]; int n = 0;
+    float rgba[4] = {1.0f, 0.5f, 0.25f, 1.0f};
+    cmd[n++] = 1187; cmd[n++] = 7 * 4;             // DX_DEFINE_RENDERTARGET_VIEW
+    cmd[n++] = 0; cmd[n++] = sid; cmd[n++] = 68; cmd[n++] = 3; cmd[n++] = 0; cmd[n++] = 0; cmd[n++] = 1;
+    cmd[n++] = 1176; cmd[n++] = 5 * 4;             // DX_CLEAR_RENDERTARGET_VIEW
+    cmd[n++] = 0; memcpy(&cmd[n], rgba, 16); n += 4;
+    cmd[n++] = 1183; cmd[n++] = 2 * 4;             // DX_READBACK_SUBRESOURCE
+    cmd[n++] = sid; cmd[n++] = 0;
+    uint32_t fence[6] = {0};
+    struct { uint64_t commands; uint32_t size, throttle; uint64_t fence_rep; uint32_t version, flags, context, imported; } eb =
+        {(uint64_t)(uintptr_t)cmd, (uint32_t)(n * 4), 0, (uint64_t)(uintptr_t)fence, 2, 0, cid, -1};
+    r2 = ioctl(fd, _IOW('d', 0x4c, eb), &eb);
+    CHECK(r2 == 0 && fence[5] == 0, "GPU ran a DX clear (fence %u)", fence[0]);
+    int good = 0;
+    for (uint32_t i = 0; i < W * H; i++) {
+        uint32_t v = px[i], r = v & 0xff, g = (v >> 8) & 0xff, b = (v >> 16) & 0xff, a = v >> 24;
+        good += r == 0xff && (g == 0x7f || g == 0x80) && (b == 0x3f || b == 0x40) && a == 0xff;
+    }
+    CHECK(good == (int)(W * H), "cleared pixels read back: %d of %u are (255,128,64,255), first %#x", good, W * H, px[0]);
+done:
     printf("%s\n", fails ? "DRMTEST FAILED" : "DRMTEST PASSED");
     return fails != 0;
 }
