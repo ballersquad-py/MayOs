@@ -62,10 +62,24 @@ impl IdeDisk {
             if s & 0x80 == 0 && s & 0x08 != 0 {
                 return true;
             }
-            if uptime_ms() - start > 2000 {
+            // A busy host can stall emulated IDE for seconds.
+            if uptime_ms() - start > 10_000 {
                 return false;
             }
             backoff.wait();
+        }
+    }
+
+    /// Software reset of the channel (SRST), then wait until not busy.
+    fn soft_reset(&self) {
+        unsafe {
+            outb(self.ctrl, 0x04);
+            self.delay();
+            outb(self.ctrl, 0x00);
+        }
+        let start = uptime_ms();
+        while self.status() & 0x80 != 0 && uptime_ms() - start < 5000 {
+            core::hint::spin_loop();
         }
     }
 
@@ -151,15 +165,30 @@ impl fat32::BlockDevice for IdeDisk {
         let mut done = 0;
         while done < total {
             let n = (total - done).min(256);
-            self.setup(lba + done as u64, n as u16 & 0xff | if n == 256 { 0x100 } else { 0 }, 0x24);
-            for s in 0..n {
-                if !self.wait_drq() {
-                    return Err(());
+            // Retry a failed command after a controller reset: one slow or
+            // failed transfer should not become an I/O error for programs.
+            let mut ok = false;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    self.soft_reset();
                 }
-                let off = (done + s) * 512;
-                // One string instruction per sector: the hypervisor handles
-                // it in a single exit instead of 256.
-                unsafe { insw(self.io, buf[off..off + 512].as_mut_ptr(), 256) };
+                self.setup(lba + done as u64, n as u16 & 0xff | if n == 256 { 0x100 } else { 0 }, 0x24);
+                ok = (0..n).all(|s| {
+                    if !self.wait_drq() {
+                        return false;
+                    }
+                    let off = (done + s) * 512;
+                    // One string instruction per sector: the hypervisor handles
+                    // it in a single exit instead of 256.
+                    unsafe { insw(self.io, buf[off..off + 512].as_mut_ptr(), 256) };
+                    true
+                });
+                if ok {
+                    break;
+                }
+            }
+            if !ok {
+                return Err(());
             }
             done += n;
         }
