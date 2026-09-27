@@ -138,6 +138,65 @@ int main(int argc, char **argv) {
     for (int i = 0; i < W * H; i++) green += px[i * 4] < 10 && px[i * 4 + 1] > 245 && px[i * 4 + 2] < 10;
     printf("%s triangle drawn: %d of %d pixels green (first %d,%d,%d), GL error %#x\n", green == W * H ? "ok  " : "FAIL", green, W * H, px[0], px[1], px[2], glGetError());
     printf("     %d frames in %.1f ms (%.0f fps)\n", frames, ms, frames * 1000.0 / ms);
+    if (wl) {
+        // Like Firefox: a wl_surface, a wl_egl_window, an EGL window surface,
+        // draw and present a few frames through the compositor.
+        void *wlc = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_GLOBAL);
+        void *wle = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_GLOBAL);
+        struct wl_interface_s { const char *name; int version; int mc; const void *m; int ec; const void *e; };
+        const struct wl_interface_s *reg_if = dlsym(wlc, "wl_registry_interface");
+        const struct wl_interface_s *comp_if = dlsym(wlc, "wl_compositor_interface");
+        const struct wl_interface_s *surf_if = dlsym(wlc, "wl_surface_interface");
+        void *(*marshal)(void *, uint32_t, const void *, uint32_t, uint32_t, ...) = dlsym(wlc, "wl_proxy_marshal_flags");
+        uint32_t (*pver)(void *) = dlsym(wlc, "wl_proxy_get_version");
+        int (*add_listener)(void *, void (**)(void), void *) = dlsym(wlc, "wl_proxy_add_listener");
+        int (*roundtrip)(void *) = dlsym(wlc, "wl_display_roundtrip");
+        void *(*egl_win_create)(void *, int, int) = dlsym(wle, "wl_egl_window_create");
+        typedef void *(*eglCreateWindowSurface_t)(void *, void *, void *, const int *);
+        typedef unsigned (*eglSwapBuffers_t)(void *, void *);
+        eglCreateWindowSurface_t mkwin = (eglCreateWindowSurface_t)dlsym(egl, "eglCreateWindowSurface");
+        eglSwapBuffers_t swap = (eglSwapBuffers_t)dlsym(egl, "eglSwapBuffers");
+        if (!reg_if || !comp_if || !marshal || !egl_win_create || !mkwin) { printf("FAIL Wayland symbols missing\n"); return 1; }
+        static void *compositor;
+        struct reg_listener { void (*global)(void *, void *, uint32_t, const char *, uint32_t); void (*remove)(void *, void *, uint32_t); };
+        static const struct wl_interface_s *s_comp_if;
+        static void *(*s_marshal)(void *, uint32_t, const void *, uint32_t, uint32_t, ...);
+        s_comp_if = comp_if; s_marshal = marshal;
+        void on_global(void *d, void *reg, uint32_t name, const char *iface, uint32_t ver) {
+            (void)d; (void)ver;
+            if (!strcmp(iface, "wl_compositor"))
+                compositor = s_marshal(reg, 0 /* bind */, s_comp_if, 4, 0, name, s_comp_if->name, 4u, (void *)0);
+        }
+        void on_remove(void *d, void *reg, uint32_t name) { (void)d; (void)reg; (void)name; }
+        static struct reg_listener rl;
+        rl.global = on_global; rl.remove = on_remove;
+        void *registry = marshal(wldpy, 1 /* get_registry */, reg_if, pver(wldpy), 0, (void *)0);
+        add_listener(registry, (void (**)(void))&rl, 0);
+        roundtrip(wldpy);
+        if (!compositor) { printf("FAIL no wl_compositor\n"); return 1; }
+        void *surface = marshal(compositor, 0 /* create_surface */, surf_if, pver(compositor), 0, (void *)0);
+        void *win = egl_win_create(surface, 256, 256);
+        {
+            intptr_t *w = win;
+            printf("     wl_egl_window %p: version %ld, surface field %#lx (wl_surface %p)\n", win, (long)w[0], (long)w[7], surface);
+        }
+        void *esurf = mkwin(dpy, n ? cfg : 0, win, 0);
+        printf("%s EGL window surface\n", esurf ? "ok  " : "FAIL");
+        if (!esurf) return 1;
+        typedef unsigned (*eglMakeCurrent2_t)(void *, void *, void *, void *);
+        ((eglMakeCurrent2_t)dlsym(egl, "eglMakeCurrent"))(dpy, esurf, esurf, ctx);
+        glBindFramebuffer(0x8D40, 0);
+        int swapped = 0;
+        for (int i = 0; i < 30; i++) {
+            glViewport(0, 0, 256, 256);
+            glClearColor(i & 1, 0.5f, 1 - (i & 1), 1);
+            glClear(0x4000);
+            swapped += swap(dpy, esurf) ? 1 : 0;
+        }
+        printf("%s presented %d of 30 frames through the compositor\n", swapped == 30 ? "ok  " : "FAIL", swapped);
+        green = W * H * (swapped == 30);
+        if (sw) green = green;
+    }
     int ok = (hw || sw) && green == W * H && linked;
     printf("%s\n", ok ? "GLTEST PASSED" : "GLTEST FAILED");
     return !ok;

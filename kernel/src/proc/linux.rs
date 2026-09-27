@@ -3430,9 +3430,23 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         26 | 149 | 150 | 151 | 152 | 325 => 0, // msync, mlock*, munlock*
         27 => {
-            // mincore: everything counts as resident
-            let n = a1.div_ceil(PAGE_SIZE) as usize;
-            if usermem::write_bytes(pml4, a2, &vec![1u8; n]) { 0 } else { -EFAULT }
+            // mincore: pages of the program's mappings count as resident;
+            // any page outside them is ENOMEM, as on Linux (Mesa uses this
+            // to test whether a value is a valid pointer).
+            if a0 & (PAGE_SIZE - 1) != 0 {
+                -EINVAL
+            } else {
+                let n = a1.div_ceil(PAGE_SIZE);
+                let mapped = |a: u64| {
+                    paging::translate(pml4, a).is_some()
+                        || linux(p).is_some_and(|l| l.regions.lock().iter().any(|r| a >= r.start && a < r.end))
+                };
+                if (0..n).all(|i| mapped(a0 + i * PAGE_SIZE)) {
+                    if usermem::write_bytes(pml4, a2, &vec![1u8; n as usize]) { 0 } else { -EFAULT }
+                } else {
+                    -ENOMEM
+                }
+            }
         }
         36 | 37 | 38 => {
             // getitimer / alarm / setitimer: timers are not armed.

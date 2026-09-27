@@ -568,6 +568,15 @@ pub fn fault(p: &Arc<Process>, f: &mut TrapFrame, sig: u64, code: i32, addr: u64
         static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
             crate::kprintln!("linux: signal {} in {} (pid {}) at {:#x} {} touching {:#x}", sig, super::linux::exe_name(p), p.pid, f.rip, super::linux::describe_addr(p, f.rip), addr);
+            // Code addresses near the top of the stack (callers).
+            for i in 0..16u64 {
+                if let Some(v) = super::usermem::read_u64(p.pml4(), f.rsp + i * 8) {
+                    let d = super::linux::describe_addr(p, v);
+                    if d.contains(".so") || d.contains("firefox") || d.contains("/test/") {
+                        crate::kprintln!("linux:   stack+{:#x}: {:#x} {}", i * 8, v, d);
+                    }
+                }
+            }
         }
     }
     let tid = sched::current_id();
