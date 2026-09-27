@@ -323,7 +323,7 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
 /// glibc-built core library.
 const MINECRAFT_PKGS: &[&str] = &["openjdk21-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "ca-certificates-bundle", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor",
     // Cursors; X11 for LWJGL 2 (Forge 1.8.9) through Xwayland, with Java 8.
-    "adwaita-icon-theme", "xwayland", "xkbcomp", "xkeyboard-config", "libx11", "libxrandr", "libxxf86vm", "libxcursor", "libxi", "libxtst", "openjdk8-jre"];
+    "adwaita-icon-theme", "xwayland", "xkbcomp", "xkeyboard-config", "libx11", "libxrandr", "libxxf86vm", "libxcursor", "libxi", "libxtst", "openjdk8-jre", "xrandr"];
 
 /// `minecraft`: a custom launcher when one is set (`--launcher FILE`,
 /// $MC_LAUNCHER or the path in /etc/minecraft-launcher; a .jar runs with

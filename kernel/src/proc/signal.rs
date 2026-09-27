@@ -566,8 +566,9 @@ pub fn fault(p: &Arc<Process>, f: &mut TrapFrame, sig: u64, code: i32, addr: u64
     if sig == 11 || sig == 7 || sig == 4 {
         // Programs often handle these themselves and exit; keep a record.
         static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
+        if addr >= 0x10000 && N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
             crate::kprintln!("linux: signal {} in {} (pid {}) at {:#x} {} touching {:#x}", sig, super::linux::exe_name(p), p.pid, f.rip, super::linux::describe_addr(p, f.rip), addr);
+            crate::kprintln!("linux:   addr {} recent-unmap {:x?}", super::linux::describe_addr(p, addr), super::linux::was_unmapped(addr));
             // Code addresses near the top of the stack (callers).
             for i in 0..16u64 {
                 if let Some(v) = super::usermem::read_u64(p.pml4(), f.rsp + i * 8) {

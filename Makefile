@@ -116,3 +116,7 @@ clean:
 	cd userspace && cargo clean
 	cd libs && cargo clean
 	rm -rf $(BUILD)/iso_root $(ISO) $(TEST_ISO)
+
+AUTORUN_ISO := $(BUILD)/mayos-autorun.iso
+autorun-iso: $(LIMINE)/limine kernel ramdisk
+	$(call make_iso,tools/limine-autorun.conf,$(AUTORUN_ISO))

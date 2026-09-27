@@ -339,3 +339,32 @@ pub extern "C" fn run(_: usize) {
     }
     crate::power::qemu_exit(failed == 0);
 }
+
+/// Boot option `autorun`: run /autorun.sh with the Linux shell once the
+/// desktop is up, copy everything it prints to the serial port, then power
+/// off (QEMU exit code 33). Lets a host test Linux programs on MayOS.
+pub extern "C" fn autorun(_: usize) {
+    let start = crate::time::uptime_ms();
+    while crate::gui::FRAMES.load(core::sync::atomic::Ordering::Relaxed) == 0 && crate::time::uptime_ms() - start < 30_000 {
+        sched::sleep_ms(100);
+    }
+    crate::kprintln!("autorun: starting /autorun.sh");
+    let console = Console::new();
+    match process::spawn("/bin/sh", "/autorun.sh", "/", console.clone()) {
+        Ok(p) => loop {
+            let out = console.take_output();
+            if !out.is_empty() {
+                crate::serial::write_fmt(format_args!("{}", String::from_utf8_lossy(&out)));
+            }
+            if let Some(code) = p.has_exited() {
+                let out = console.take_output();
+                crate::serial::write_fmt(format_args!("{}", String::from_utf8_lossy(&out)));
+                crate::kprintln!("autorun: finished with {}", code);
+                break;
+            }
+            sched::sleep_ms(20);
+        },
+        Err(e) => crate::kprintln!("autorun: cannot start: {}", e),
+    }
+    crate::power::qemu_exit(true);
+}

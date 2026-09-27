@@ -83,6 +83,9 @@ extern "C" fn kmain() -> ! {
     if selftest {
         proc::sched::spawn_kernel("selftest", selftest::run, 0);
     }
+    if boot::cmdline().contains("autorun") {
+        proc::sched::spawn_kernel("autorun", selftest::autorun, 0);
+    }
     proc::wayland::init();
     proc::sched::spawn_kernel("watchdog", watchdog::run, 0);
     proc::sched::spawn_kernel("desktop", gui::desktop_main, 0);

@@ -608,10 +608,39 @@ fn fault_in_inner(addr: u64, write: bool) -> bool {
 /// Page fault from a Linux program: true if it was handled.
 pub fn page_fault(addr: u64, error: u64) -> bool {
     // Only faults on missing pages (bit 0 clear) can be demand paging.
-    error & 1 == 0 && fault_in(addr, error & 2 != 0)
+    if error & 1 == 0 {
+        return fault_in(addr, error & 2 != 0);
+    }
+    // A protection fault the page table no longer agrees with: this CPU
+    // still had the old rights cached (another thread's mprotect, e.g. a
+    // JIT flipping code pages). Drop the stale entry and retry.
+    let Some(p) = sched::current_process() else { return false };
+    let Some((_, e)) = paging::translate(p.pml4(), addr & !(PAGE_SIZE - 1)) else { return false };
+    let ok = e & USER != 0 && (error & 2 == 0 || e & WRITABLE != 0) && (error & 0x10 == 0 || e & NO_EXECUTE == 0);
+    if ok {
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack)) };
+    }
+    ok
+}
+
+/// Recently unmapped ranges, to explain crashes on freed memory.
+static UNMAPPED: Spin<[(u64, u64); 64]> = Spin::new([(0, 0); 64]);
+static UNMAPPED_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn was_unmapped(addr: u64) -> Option<(u64, u64, usize)> {
+    let u = UNMAPPED.lock();
+    let now = UNMAPPED_AT.load(core::sync::atomic::Ordering::Relaxed);
+    (1..=64).map(|i| (now.wrapping_sub(i) % 64, i)).find_map(|(k, i)| {
+        let (s, e) = u[k];
+        (addr >= s && addr < e).then_some((s, e, i))
+    })
 }
 
 fn unmap_range(p: &Process, start: u64, end: u64) {
+    {
+        let i = UNMAPPED_AT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        UNMAPPED.lock()[i % 64] = (start, end);
+    }
     super::drm::forget_maps(p.pml4(), start, end);
     let mut a = start;
     let mut any = false;

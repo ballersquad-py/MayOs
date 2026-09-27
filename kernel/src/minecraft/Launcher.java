@@ -76,6 +76,7 @@ public class Launcher {
         Path mc = home.resolve(".minecraft");
         Path store = trustStore(mc);
         HTTP = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+        cacheDir = mc.resolve("cache");
 
         Map<String, Object> manifest = obj(Json.parse(fetchString(MANIFEST)));
         String versionUrl = null;
@@ -214,6 +215,26 @@ public class Launcher {
         vars.put("version_name", version);
         vars.put("game_directory", gameDir.toString());
         if (mods && !dry) installPack(gameDir.resolve("mods"), version, legacy, forge);
+        // Fast defaults for a fresh game directory (software GL is slow):
+        // the player's own options.txt is never touched.
+        Path opts = gameDir.resolve("options.txt");
+        if (!dry && !Files.exists(opts)) {
+            Files.createDirectories(gameDir);
+            String common = "renderDistance:6\nparticles:2\nmaxFps:260\nenableVsync:false\nentityShadows:false\nrenderClouds:false\nmipmapLevels:0\n";
+            Files.writeString(opts, common + (legacy || forge
+                    ? "fancyGraphics:false\nao:0\n"
+                    : "graphicsMode:0\nao:false\nsimulationDistance:5\nbiomeBlendRadius:0\nrenderClouds:\"false\"\n"));
+            if (forge) Files.writeString(gameDir.resolve("optionsof.txt"),
+                    "ofFastRender:true\nofFastMath:true\nofSmoothFps:false\nofChunkUpdates:2\nofChunkUpdatesDynamic:true\nofAaLevel:0\nofAfLevel:1\nofClouds:3\nofTrees:1\nofDroppedItems:1\nofRainSplash:false\nofAnimatedWater:1\nofAnimatedLava:1\nofVignette:1\nofSky:true\nofDynamicFov:false\n");
+        }
+        if (forge) {
+            // Forge's loading splash draws from a second thread with a shared
+            // GL context, which crashes Mesa's llvmpipe.
+            Path splash = gameDir.resolve("config").resolve("splash.properties");
+            Files.createDirectories(splash.getParent());
+            String sp = Files.exists(splash) ? Files.readString(splash) : "";
+            if (!sp.contains("enabled=false")) Files.writeString(splash, sp.replace("enabled=true", "") + "\nenabled=false\n");
+        }
         vars.put("assets_root", assets.toString());
         vars.put("game_assets", assets.toString());
         vars.put("assets_index_name", assetsId);
@@ -239,7 +260,11 @@ public class Launcher {
             if (!Files.exists(Paths.get(java))) java = "/usr/lib/jvm/java-1.8-openjdk/jre/bin/java";
             if (!Files.exists(Paths.get(java))) throw new RuntimeException("Java 8 is missing: run pkg install minecraft");
             // Which Java really runs (Forge 1.8.9 fails on anything newer than 8).
-            Process v8 = new ProcessBuilder(java, "-version").redirectErrorStream(true).start();
+            ProcessBuilder vb = new ProcessBuilder(java, "-version").redirectErrorStream(true);
+            // Alpine's Java 21 launcher exports LD_LIBRARY_PATH to its own lib dir;
+            // Java 8 would then load Java 21's libjli/libjvm.
+            vb.environment().remove("LD_LIBRARY_PATH");
+            Process v8 = vb.start();
             String vtext = new String(v8.getInputStream().readAllBytes()).trim();
             v8.waitFor();
             System.out.println("Java for Forge: " + java + ": " + vtext.replace('\n', ' '));
@@ -281,6 +306,11 @@ public class Launcher {
             cmd.add(str((loader != null ? loader : v).get("mainClass")));
             Map<String, Object> argSrc = loader != null && loader.get("minecraftArguments") != null ? loader : v;
             for (String a : str(argSrc.get("minecraftArguments")).split(" ")) cmd.add(subst(a, vars));
+            if (forge) {
+                // No window manager under Xwayland: open the game at the X screen's size.
+                String[] wh = x11Geometry().split("x");
+                Collections.addAll(cmd, "--width", wh[0], "--height", wh[1]);
+            }
         }
         if (dry) {
             System.out.println(String.join(" ", cmd));
@@ -292,6 +322,7 @@ public class Launcher {
         // legacy-lwjgl3: GLFW (on MayOS's Wayland compositor), not SDL.
         if (legacy && mods) pb.environment().put("LEGACY_LWJGL3_USE_SDL", "false");
         pb.environment().put("XDG_SESSION_TYPE", "wayland");
+        pb.environment().remove("LD_LIBRARY_PATH");
         pb.environment().remove("DISPLAY");
         // Cursor theme for GLFW/Xwayland (adwaita-icon-theme).
         pb.environment().putIfAbsent("XCURSOR_THEME", "Adwaita");
@@ -392,12 +423,17 @@ public class Launcher {
 
     static String x11Size = null;
 
+    static String x11Geometry() {
+        String g = x11Size != null ? x11Size : Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
+        return g.matches("\\d+x\\d+") ? g : "1280x720";
+    }
+
     // Rootful Xwayland on a free display; the game gets DISPLAY.
     static Process startXwayland(ProcessBuilder game) throws Exception {
         Files.createDirectories(Paths.get("/tmp/.X11-unix"));
         int d = 7;
         while (Files.exists(Paths.get("/tmp/.X11-unix/X" + d))) d++;
-        String geometry = x11Size != null ? x11Size : Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
+        String geometry = x11Geometry();
         ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
         xb.environment().putAll(game.environment());
         Process x = xb.start();
@@ -544,8 +580,23 @@ public class Launcher {
         }
     }
 
+    // Metadata is cached, so the launcher also starts offline.
+    static Path cacheDir;
+
     static String fetchString(String url) throws Exception {
-        return HTTP.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofString()).body();
+        Path cached = cacheDir == null ? null : cacheDir.resolve(Integer.toHexString(url.hashCode()) + ".txt");
+        try {
+            HttpResponse<String> r = HTTP.send(HttpRequest.newBuilder(URI.create(url)).timeout(java.time.Duration.ofSeconds(20)).build(), HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
+            if (cached != null) {
+                Files.createDirectories(cacheDir);
+                Files.writeString(cached, r.body());
+            }
+            return r.body();
+        } catch (Exception e) {
+            if (cached != null && Files.exists(cached)) return Files.readString(cached);
+            throw e;
+        }
     }
 
     @SuppressWarnings("unchecked")
