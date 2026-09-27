@@ -137,7 +137,7 @@ fn bo_alloc(pml4: u64, arg: u64) -> i64 {
 
 /// Bytes a surface's backing memory needs: every mip level of every
 /// array slice, in the format's blocks (the device's guest-backed layout).
-fn surface_bytes(format: u32, w: u32, h: u32, d: u32, mips: u32, array: u32) -> u64 {
+fn surface_bytes(format: u32, w: u32, h: u32, d: u32, mips: u32, array: u32, samples: u32) -> u64 {
     // Unknown formats: assume the largest (16 bytes a pixel).
     let (bw, bh, bd, bpb) = crate::drivers::svga3d_formats::format_block(format).unwrap_or((1, 1, 1, 16));
     let mut total = 0u64;
@@ -145,7 +145,8 @@ fn surface_bytes(format: u32, w: u32, h: u32, d: u32, mips: u32, array: u32) -> 
         let (mw, mh, md) = ((w >> m).max(1), (h >> m).max(1), (d >> m).max(1));
         total += mw.div_ceil(bw) as u64 * mh.div_ceil(bh) as u64 * md.div_ceil(bd) as u64 * bpb as u64;
     }
-    total * array.max(1) as u64
+    // Multisampled surfaces hold every sample (as vmwgfx sizes them).
+    total * array.max(1) as u64 * samples.max(1) as u64
 }
 
 /// GB_SURFACE_CREATE(_EXT): `req` holds the request words.
@@ -154,7 +155,7 @@ fn surface_define(pml4: u64, arg: u64, req: &[u32], ext: bool) -> i64 {
     let (w, h, d) = (req[8], req[9], req[10]);
     let (flags_hi, ms_pattern, quality, stride) = if ext { (req[12], req[13], req[14], req[15]) } else { (0, 0, 0, 0) };
     let sid = SURFACE_IDS.lock().get();
-    let size = surface_bytes(format, w, h, d, mips, if flags & (1 << 0) != 0 && array == 0 { 6 } else { array });
+    let size = surface_bytes(format, w, h, d, mips, if flags & (1 << 0) != 0 && array == 0 { 6 } else { array }, msaa);
     let (backup, own) = if buf != INVALID && buf != 0 && OBJ.lock().bos.contains_key(&buf) {
         (buf, false)
     } else if drm_flags & 0x4 != 0 || buf == INVALID || buf == 0 {
