@@ -1122,6 +1122,13 @@ impl State {
                             for d in damage {
                                 copy_rect(&b, px, d);
                             }
+                        } else if let Some(img) = s.image.as_mut().filter(|i| i.0 == b.w && i.1 == b.h) {
+                            // Same size: copy into the existing picture (no
+                            // 7 MB allocation per frame under the heap lock).
+                            let px = Arc::make_mut(&mut img.2);
+                            if !(0..b.h).all(|y| copy_row(&b, px, y, 0, b.w)) {
+                                s.image = None;
+                            }
                         } else {
                             s.image = copy_buffer(&b);
                         }
@@ -1239,6 +1246,20 @@ impl State {
         };
         let (gx, gy, gw, gh) = self.geometry_of(root).filter(|g| g.2 > 0 && g.3 > 0).unwrap_or((0, 0, bw, bh));
         let (w, h) = (gw.min(4096), gh.min(4096));
+        // One opaque surface filling the window (games, GPU programs): show
+        // its picture as is instead of composing a copy.
+        if let Some(Obj::Surface(rs)) = self.objs.get(&root)
+            && rs.children.is_empty()
+            && (gx, gy, w, h) == (0, 0, bw, bh)
+            && rs.opaque
+        {
+            *win.image.lock() = rs.image.clone();
+            win.version.fetch_add(1, Ordering::Relaxed);
+            if !win.opened.swap(true, Ordering::Relaxed) {
+                PENDING.lock().push(win);
+            }
+            return;
+        }
         let mut out = vec![0xff00_0000u32; (w * h) as usize];
         self.draw_tree(root, -gx, -gy, &mut out, w, h, 0);
         *win.image.lock() = Some((w, h, Arc::new(out)));
