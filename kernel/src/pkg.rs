@@ -323,13 +323,29 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
 /// glibc-built core library.
 const MINECRAFT_PKGS: &[&str] = &["openjdk25-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
 
+/// `minecraft`: a custom launcher when one is set (`--launcher FILE`,
+/// $MC_LAUNCHER or the path in /etc/minecraft-launcher; a .jar runs with
+/// the JDK, anything else is executed), otherwise MayOS's own launcher.
+const MINECRAFT_SH: &[u8] = br#"#!/bin/sh
+JAVA=/usr/lib/jvm/java-25-openjdk/bin/java
+if [ "$1" = "--launcher" ]; then MC_LAUNCHER="$2"; shift 2; fi
+if [ -z "$MC_LAUNCHER" ] && [ -f /etc/minecraft-launcher ]; then MC_LAUNCHER=$(cat /etc/minecraft-launcher); fi
+export XDG_SESSION_TYPE=wayland
+unset DISPLAY
+case "$MC_LAUNCHER" in
+  "") exec $JAVA /usr/share/minecraft/Launcher.java "$@" ;;
+  *.jar) exec $JAVA -jar "$MC_LAUNCHER" "$@" ;;
+  *) exec "$MC_LAUNCHER" "$@" ;;
+esac
+"#;
+
 /// The launcher (one Java source file) and the `minecraft` command.
 fn minecraft_setup() {
     let _ = mkdirs("/usr/share/minecraft");
     let _ = fs::write_file("/usr/share/minecraft/Launcher.java", include_bytes!("minecraft/Launcher.java"));
     let _ = fs::write_file(
         "/usr/bin/minecraft",
-        b"#!/bin/sh\nexec /usr/lib/jvm/java-25-openjdk/bin/java /usr/share/minecraft/Launcher.java \"$@\"\n",
+        MINECRAFT_SH,
     );
 }
 

@@ -76,7 +76,9 @@ Settings app are done.
   (or `minecraft 1.20.1 --user Steve`). Installs OpenJDK 25, GLFW, Mesa
   and OpenAL from Alpine; the first start downloads the game from Mojang
   (~700 MB) and runs it offline (singleplayer). Give the VM 2+ GB of RAM;
-  `MC_MEMORY=2G minecraft` sets the Java heap.
+  `MC_MEMORY=2G minecraft` sets the Java heap. Custom launcher:
+  `minecraft --launcher /path/launcher.jar` (or put the path in
+  `/etc/minecraft-launcher` to make it the default).
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
