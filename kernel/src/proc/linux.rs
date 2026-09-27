@@ -133,6 +133,8 @@ pub enum Desc {
     SndCtl,
     /// /dev/dri/card0 or renderD128 (the minor number)
     Drm(u64),
+    /// A GPU surface shared as a file descriptor (DRM PRIME / dma-buf).
+    DmaBuf(u32),
     /// /dev/snd/pcmC0D0p
     SndPcm(Arc<super::alsa::Pcm>),
 }
@@ -283,7 +285,7 @@ pub fn ensure_session_bus() {
 }
 
 fn base_env(cwd: &str) -> Vec<String> {
-    alloc::vec![
+    let mut v = alloc::vec![
         String::from("PATH=/bin:/usr/bin:/sbin:/usr/sbin"),
         String::from("HOME=/home"),
         String::from("USER=user"),
@@ -307,10 +309,19 @@ fn base_env(cwd: &str) -> Vec<String> {
         String::from("MOZ_DISABLE_UTILITY_SANDBOX=1"),
         String::from("MOZ_CRASHREPORTER_DISABLE=1"),
         String::from("MOZ_FORCE_DISABLE_E10S=1"),
-        String::from("LIBGL_ALWAYS_SOFTWARE=1"),
-        String::from("GALLIUM_DRIVER=llvmpipe"),
         alloc::format!("PWD={}", cwd),
-    ]
+    ];
+    if crate::boot::cmdline().contains("egldebug") {
+        v.push(String::from("EGL_LOG_LEVEL=debug"));
+        v.push(String::from("LIBGL_DEBUG=verbose"));
+    }
+    // Software OpenGL unless Firefox's GPU mode is on (/etc/firefox-gpu;
+    // tools like gltest and gldemo pick the GPU themselves).
+    if !super::drm::firefox_gpu() {
+        v.push(String::from("LIBGL_ALWAYS_SOFTWARE=1"));
+        v.push(String::from("GALLIUM_DRIVER=llvmpipe"));
+    }
+    v
 }
 
 /// Load the program's dynamic linker, if it names one: (entry, AT_BASE).
@@ -1190,7 +1201,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
                 sched::wait_event(ev_seen, 20);
             }
         }
-        Desc::Epoll(_) | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) | Desc::DmaBuf(_) => -EINVAL,
         Desc::TimerFd { t, nonblock } => {
             let (t, nb) = (t.clone(), *nonblock);
             drop(g);
@@ -1287,7 +1298,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
             ev.add(u64::from_le_bytes(data[..8].try_into().unwrap()));
             8
         }
-        Desc::Epoll(_) | Desc::TimerFd { .. } | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) => -EINVAL,
+        Desc::Epoll(_) | Desc::TimerFd { .. } | Desc::SndCtl | Desc::SndPcm(_) | Desc::Drm(_) | Desc::DmaBuf(_) => -EINVAL,
         Desc::Tcp { stream: Some(s), .. } => match s.write_all(data, 60_000) {
             Ok(()) => data.len() as i64,
             Err(_) => -EPIPE,
@@ -1513,6 +1524,16 @@ fn stat_buf(mode: u32, size: u64, mtime: i64, ino: u64) -> [u8; 144] {
     b
 }
 
+/// The GPU surface behind a dma-buf file descriptor.
+pub fn dmabuf_handle(p: &Process, fd: i64) -> Option<u32> {
+    let d = get_fd(p, fd)?;
+    let g = d.lock();
+    match &*g {
+        Desc::DmaBuf(h) => Some(*h),
+        _ => None,
+    }
+}
+
 /// A DRM character device with its device number (libdrm checks it).
 fn drm_stat(minor: u64) -> [u8; 144] {
     let mut b = stat_buf(0o20666, 0, 0, 300 + minor);
@@ -1578,6 +1599,7 @@ fn stat_fd(p: &Process, fd: i64) -> Result<[u8; 144], i64> {
         Desc::EventFd { .. } | Desc::Epoll(_) | Desc::TimerFd { .. } => stat_buf(0o600, 0, 0, 12),
         Desc::SndCtl | Desc::SndPcm(_) => stat_buf(0o20660, 0, 0, 116),
         Desc::Drm(minor) => drm_stat(*minor),
+        Desc::DmaBuf(h) => stat_buf(0o600, 0, 0, 0x5000_0000 + *h as u64),
         Desc::Tcp { .. } | Desc::Udp { .. } => stat_buf(0o140777, 0, 0, 7),
         Desc::PipeRead(_) | Desc::PipeWrite(_) => stat_buf(0o10600, 0, 0, 8),
     })
@@ -2224,7 +2246,7 @@ fn desc_ready(p: &Process, d: &DescRef, events: u16) -> u16 {
         Desc::EventFd { ev, .. } => (*ev.count.lock() > 0, true),
         Desc::TimerFd { t, .. } => (t.ready(), false),
         Desc::SndPcm(pcm) => (false, pcm.ready_to_write()),
-        Desc::SndCtl | Desc::Drm(_) => (false, false),
+        Desc::SndCtl | Desc::Drm(_) | Desc::DmaBuf(_) => (false, false),
         Desc::Epoll(e) => {
             let list: Vec<(DescRef, u32)> = e.list.lock().iter().filter(|i| !i.disabled).map(|i| (i.desc.clone(), i.events)).collect();
             drop(g);
@@ -2754,7 +2776,11 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             257 | 262 | 267 | 269 | 332 | 439 => Some(args[1]),
             _ => None,
         };
-        let path = path_arg.and_then(|a| usermem::read_cstr(p.pml4(), a, 200)).unwrap_or_default();
+        let mut path = path_arg.and_then(|a| usermem::read_cstr(p.pml4(), a, 200)).unwrap_or_default();
+        if nr == 1 && args[2] < 400 {
+            // Small writes: show the text (pipes between processes).
+            path = usermem::read_bytes(p.pml4(), args[1], args[2]).map(|b| String::from_utf8_lossy(&b).replace('\n', "|")).unwrap_or_default();
+        }
         crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {} {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], f.rax as i64, path);
     }
     exited
@@ -3599,6 +3625,36 @@ pub fn exe_name(p: &Process) -> String {
 fn device_ioctl(p: &Process, fd: i64, cmd: u64, arg: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     if let Desc::Drm(_) = &*d.lock() {
+        let nr = cmd & 0xff;
+        match nr {
+            0x2d => {
+                // PRIME_HANDLE_TO_FD { u32 handle; u32 flags; s32 fd }
+                let Some(h) = usermem::read_bytes(p.pml4(), arg, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else { return -EFAULT };
+                if !super::drm::surface_exists(h) {
+                    return -ENOENT;
+                }
+                let fd = add_fd(p, Desc::DmaBuf(h));
+                set_cloexec(p, fd, true);
+                return if usermem::write_u32(p.pml4(), arg + 8, fd as u32) { 0 } else { -EFAULT };
+            }
+            0x2e => {
+                // PRIME_FD_TO_HANDLE { u32 handle; u32 flags; s32 fd }
+                let Some(fd) = usermem::read_bytes(p.pml4(), arg + 8, 4).map(|b| i32::from_le_bytes(b.try_into().unwrap())) else { return -EFAULT };
+                let Some(h) = dmabuf_handle(p, fd as i64) else { return -EBADF };
+                return if usermem::write_u32(p.pml4(), arg, h) { 0 } else { -EFAULT };
+            }
+            0x58 | 0x5c => {
+                // GB_SURFACE_REF(_EXT) by PRIME fd: turn the fd into the handle.
+                if let Some(b) = usermem::read_bytes(p.pml4(), arg, 8) {
+                    let (sid, kind) = (u32::from_le_bytes(b[0..4].try_into().unwrap()), u32::from_le_bytes(b[4..8].try_into().unwrap()));
+                    if kind == 1 {
+                        let Some(h) = dmabuf_handle(p, sid as i32 as i64) else { return -EBADF };
+                        usermem::write_u32(p.pml4(), arg, h);
+                    }
+                }
+            }
+            _ => {}
+        }
         return super::drm::ioctl(p.pml4(), cmd, arg);
     }
     let snd = match &*d.lock() {
@@ -4189,6 +4245,7 @@ fn readlink(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
             Desc::PipeRead(_) | Desc::PipeWrite(_) => alloc::format!("pipe:[{}]", fd + 1000),
             Desc::Tcp { .. } | Desc::Udp { .. } | Desc::Unix { .. } => alloc::format!("socket:[{}]", fd + 1000),
             Desc::Memfd { .. } => String::from("/memfd: (deleted)"),
+            Desc::DmaBuf(_) => String::from("/dmabuf:"),
             Desc::Drm(0) => String::from("/dev/dri/card0"),
             Desc::Drm(_) => String::from("/dev/dri/renderD128"),
             _ => alloc::format!("anon_inode:[{}]", fd),

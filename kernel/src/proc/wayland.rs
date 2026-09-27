@@ -164,6 +164,9 @@ struct Buffer {
     h: i32,
     stride: i32,
     opaque: bool,
+    /// A GPU surface (wl_drm PRIME buffer): its pixels are fetched from
+    /// the GPU into `shm` when the buffer is committed.
+    gpu: Option<u32>,
 }
 
 #[derive(Default)]
@@ -238,6 +241,8 @@ enum Obj {
     DataDevice,
     DecorationManager,
     Decoration,
+    /// wl_drm: how Mesa hands GPU-drawn buffers to the compositor.
+    Drm,
     Other,
 }
 
@@ -299,6 +304,7 @@ const GLOBALS: &[Global] = &[
     Global { name: 7, iface: "wl_shell", version: 1 },
     Global { name: 8, iface: "wl_data_device_manager", version: 3 },
     Global { name: 9, iface: "zxdg_decoration_manager_v1", version: 1 },
+    Global { name: 10, iface: "wl_drm", version: 2 },
 ];
 
 #[derive(Default)]
@@ -455,6 +461,10 @@ impl State {
                     let reg = a.u();
                     self.new_obj(reg, Obj::Registry, 1);
                     for g in GLOBALS {
+                        // The GPU path only when the GPU device is on.
+                        if g.iface == "wl_drm" && !super::drm::enabled() {
+                            continue;
+                        }
                         self.ev(reg, 0, vec![A::U(g.name), A::S(g.iface), A::U(g.version)]);
                     }
                 }
@@ -534,10 +544,38 @@ impl State {
                 0 => {
                     let new = a.u();
                     let (off, w, h, stride, fmt) = (a.i(), a.i(), a.i(), a.i(), a.u());
-                    let b = Buffer { shm, off: off.max(0) as u64, w: w.clamp(0, 8192), h: h.clamp(0, 8192), stride, opaque: fmt == 1 };
+                    let b = Buffer { shm, off: off.max(0) as u64, w: w.clamp(0, 8192), h: h.clamp(0, 8192), stride, opaque: fmt == 1, gpu: None };
                     self.new_obj(new, Obj::Buffer(b), 1);
                 }
                 1 => self.destroy(id),
+                _ => {}
+            }
+        } else if is!(Obj::Drm) {
+            match op {
+                0 => {
+                    // authenticate: render nodes need none
+                    self.ev(id, 2, vec![]);
+                }
+                3 => {
+                    // create_prime_buffer(id, fd, w, h, format, offset0, stride0, ...)
+                    let new = a.u();
+                    let (w, h, fmt, off, stride) = (a.i(), a.i(), a.u(), a.i(), a.i());
+                    let fd = self.infds.pop_front();
+                    let sid = fd.and_then(|d| match &*d.lock() {
+                        Desc::DmaBuf(h) => Some(*h),
+                        _ => None,
+                    });
+                    match sid.and_then(|s| super::drm::surface_memory(s).map(|m| (s, m))) {
+                        Some((sid, shm)) => {
+                            let b = Buffer { shm, off: off.max(0) as u64, w: w.clamp(0, 8192), h: h.clamp(0, 8192), stride, opaque: fmt == 0x3432_5258, gpu: Some(sid) };
+                            self.new_obj(new, Obj::Buffer(b), 1);
+                        }
+                        None => {
+                            self.new_obj(new, Obj::Other, 1);
+                            self.ev(1, 0, vec![A::U(id), A::U(2), A::S("wl_drm: not a GPU buffer")]);
+                        }
+                    }
+                }
                 _ => {}
             }
         } else if is!(Obj::Buffer(_)) {
@@ -757,6 +795,7 @@ impl State {
             "wl_shell" => Obj::Shell,
             "wl_data_device_manager" => Obj::DataDeviceManager,
             "zxdg_decoration_manager_v1" => Obj::DecorationManager,
+            "wl_drm" => Obj::Drm,
             _ => Obj::Other,
         };
         self.new_obj(new, obj, ver);
@@ -764,6 +803,14 @@ impl State {
             "wl_shm" => {
                 self.ev(new, 0, vec![A::U(0)]);
                 self.ev(new, 0, vec![A::U(1)]);
+            }
+            "wl_drm" => {
+                self.ev(new, 0, vec![A::S("/dev/dri/renderD128")]);
+                self.ev(new, 1, vec![A::U(0x3432_5241)]); // ARGB8888
+                self.ev(new, 1, vec![A::U(0x3432_5258)]); // XRGB8888
+                if ver >= 2 {
+                    self.ev(new, 3, vec![A::U(1)]); // PRIME buffers
+                }
             }
             "wl_seat" => {
                 self.ev(new, 0, vec![A::U(3)]); // pointer | keyboard
@@ -849,6 +896,10 @@ impl State {
                 Some(bid) => {
                     if let Some(Obj::Buffer(b)) = self.objs.get(&bid) {
                         let b = b.clone();
+                        // A GPU buffer: have the GPU copy the frame into memory first.
+                        if let Some(sid) = b.gpu {
+                            super::drm::surface_readback(sid);
+                        }
                         let Some(s) = self.surface(id) else { return };
                         let damage = core::mem::take(&mut s.damage);
                         // Same size as before and only part changed: copy just

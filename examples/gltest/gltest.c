@@ -36,8 +36,9 @@ int main(int argc, char **argv) {
         setenv("SVGA_DEBUG", "", 0);
     }
     int sw = argc > 1 && !strcmp(argv[argc - 1], "-sw"); // software check (no GPU)
-    int fd = sw ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    if (fd < 0 && !sw) { printf("FAIL no /dev/dri/renderD128 (touch /etc/gpu3d and reboot)\n"); return 1; }
+    int wl = argc > 1 && !strcmp(argv[argc - 1], "-wl"); // through the Wayland compositor, like Firefox
+    int fd = sw || wl ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (fd < 0 && !sw && !wl) { printf("FAIL no /dev/dri/renderD128 (touch /etc/gpu3d and reboot)\n"); return 1; }
     void *gbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
     void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
     if (!gbm || !egl) { printf("FAIL cannot load Mesa: %s\n", dlerror()); return 1; }
@@ -45,17 +46,40 @@ int main(int argc, char **argv) {
     LOAD(egl, eglGetPlatformDisplay); LOAD(egl, eglInitialize); LOAD(egl, eglQueryString); LOAD(egl, eglBindAPI);
     LOAD(egl, eglChooseConfig); LOAD(egl, eglCreateContext); LOAD(egl, eglMakeCurrent); LOAD(egl, eglGetProcAddress);
     LOAD(egl, eglGetError);
-    void *dev = sw ? 0 : gbm_create_device(fd);
-    if (!sw) printf("%s gbm device\n", dev ? "ok  " : "FAIL");
-    if (!dev && !sw) return 1;
-    void *dpy = sw ? eglGetPlatformDisplay(0x31DD /* SURFACELESS_MESA */, 0, 0) : eglGetPlatformDisplay(0x31D7 /* EGL_PLATFORM_GBM_KHR */, dev, 0);
+    void *dev = sw || wl ? 0 : gbm_create_device(fd);
+    if (!sw && !wl) printf("%s gbm device\n", dev ? "ok  " : "FAIL");
+    if (!dev && !sw && !wl) return 1;
+    void *wldpy = 0;
+    if (wl) {
+        void *wlc = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_GLOBAL);
+        void *(*connect)(const char *) = wlc ? (void *(*)(const char *))dlsym(wlc, "wl_display_connect") : 0;
+        wldpy = connect ? connect(0) : 0;
+        printf("%s Wayland connection\n", wldpy ? "ok  " : "FAIL");
+        if (!wldpy) return 1;
+    }
+    void *dpy = wl ? eglGetPlatformDisplay(0x31D8 /* WAYLAND_KHR */, wldpy, 0) : sw ? eglGetPlatformDisplay(0x31DD /* SURFACELESS_MESA */, 0, 0) : eglGetPlatformDisplay(0x31D7 /* EGL_PLATFORM_GBM_KHR */, dev, 0);
     int maj = 0, min = 0;
     if (!dpy || !eglInitialize(dpy, &maj, &min)) { printf("FAIL eglInitialize (error %#x)\n", eglGetError()); return 1; }
     printf("ok   EGL %d.%d, vendor %s\n", maj, min, eglQueryString(dpy, 0x3053));
     eglBindAPI(0x30A0 /* EGL_OPENGL_ES_API */);
-    int attrs[] = {0x3040 /* RENDERABLE_TYPE */, 0x0004 /* ES2 */, 0x3033 /* SURFACE_TYPE */, 0, 0x3038};
+    int attrs[] = {0x3040 /* RENDERABLE_TYPE */, 0x0004 /* ES2 */, 0x3033 /* SURFACE_TYPE */, wl ? 4 : 0, 0x3038};
     void *cfg = 0; int n = 0;
     eglChooseConfig(dpy, attrs, &cfg, 1, &n);
+    if (wl) {
+        printf("%s window configs: %d\n", n ? "ok  " : "FAIL", n);
+        typedef unsigned (*eglGetConfigs_t)(void *, void **, int, int *);
+        typedef unsigned (*eglGetConfigAttrib_t)(void *, void *, int, int *);
+        eglGetConfigs_t getc = (eglGetConfigs_t)dlsym(egl, "eglGetConfigs");
+        eglGetConfigAttrib_t geta = (eglGetConfigAttrib_t)dlsym(egl, "eglGetConfigAttrib");
+        void *all[256]; int na = 0;
+        getc(dpy, all, 256, &na);
+        for (int i = 0; i < na; i++) {
+            int r, g, b, a2, d, st, surf, rt;
+            geta(dpy, all[i], 0x3024, &r); geta(dpy, all[i], 0x3023, &g); geta(dpy, all[i], 0x3022, &b); geta(dpy, all[i], 0x3021, &a2);
+            geta(dpy, all[i], 0x3025, &d); geta(dpy, all[i], 0x3026, &st); geta(dpy, all[i], 0x3033, &surf); geta(dpy, all[i], 0x3040, &rt);
+            if (surf & 4) printf("     window config %d: rgba %d%d%d%d depth %d stencil %d renderable %#x\n", i, r, g, b, a2, d, st, rt);
+        }
+    }
     int cattrs[] = {0x3098 /* CONTEXT_CLIENT_VERSION */, 2, 0x3038};
     void *ctx = eglCreateContext(dpy, n ? cfg : 0, 0, cattrs);
     if (!ctx || !eglMakeCurrent(dpy, 0, 0, ctx)) { printf("FAIL context (error %#x)\n", eglGetError()); return 1; }

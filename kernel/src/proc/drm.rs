@@ -358,6 +358,12 @@ pub fn enabled() -> bool {
     crate::fs::exists("/etc/gpu3d") && vmware_svga::gpu_info().is_some_and(|g| g.caps & 0x0800_0000 != 0)
 }
 
+/// Firefox on the GPU (experimental): /etc/firefox-gpu as well as the
+/// GPU device.
+pub fn firefox_gpu() -> bool {
+    enabled() && crate::fs::exists("/etc/firefox-gpu")
+}
+
 pub fn node(path: &str) -> Option<u64> {
     let name = path.strip_prefix("/dev/dri/")?;
     NODES.iter().find(|(n, _)| *n == name).map(|&(_, m)| m).filter(|_| enabled())
@@ -617,4 +623,27 @@ pub fn sys_dir(path: &str) -> Option<Vec<(alloc::string::String, bool)>> {
         return Some(NODES.iter().map(|(n, _)| (alloc::string::String::from(*n), true)).collect());
     }
     None
+}
+
+pub fn surface_exists(sid: u32) -> bool {
+    OBJ.lock().surfaces.contains_key(&sid)
+}
+
+/// The memory behind a GPU surface after asking the GPU to copy its
+/// current contents there (for showing a GPU-drawn window).
+pub fn surface_readback(sid: u32) -> Option<Arc<Shm>> {
+    let backup = OBJ.lock().surfaces.get(&sid).map(|s| s.backup)?;
+    let mut c = Cmds::default();
+    c.cmd(svga3d::CMD_READBACK_GB_SURFACE, &[sid]);
+    if let Err(e) = svga3d::submit(&c) {
+        gpu_log("readback for display", &e);
+    }
+    OBJ.lock().bos.get(&backup).map(|b| b.shm.clone())
+}
+
+/// The memory behind a GPU surface (without fetching its contents).
+pub fn surface_memory(sid: u32) -> Option<Arc<Shm>> {
+    let o = OBJ.lock();
+    let backup = o.surfaces.get(&sid)?.backup;
+    o.bos.get(&backup).map(|b| b.shm.clone())
 }
