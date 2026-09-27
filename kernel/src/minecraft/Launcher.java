@@ -156,9 +156,11 @@ public class Launcher {
         // init under musl: use the C library's malloc.
         cmd.add("-Dorg.lwjgl.system.allocator=system");
         cmd.add("-Xmx" + Optional.ofNullable(System.getenv("MC_MEMORY")).orElse("1G"));
+        // (libglfw-mayos.so: Alpine's GLFW without the window icon call,
+        // which fails on Wayland and stops older versions.)
         // Use Alpine's (musl) GLFW, OpenAL and Mesa instead of the glibc
         // builds inside Mojang's LWJGL jars.
-        for (String[] l : new String[][] {{"glfw", "/usr/lib/libglfw.so.3"}, {"openal", "/usr/lib/libopenal.so.1"}, {"opengl", "/usr/lib/libGL.so.1"}})
+        for (String[] l : new String[][] {{"glfw", Files.exists(Paths.get("/usr/share/minecraft/libglfw-mayos.so")) ? "/usr/share/minecraft/libglfw-mayos.so" : "/usr/lib/libglfw.so.3"}, {"openal", "/usr/lib/libopenal.so.1"}, {"opengl", "/usr/lib/libGL.so.1"}})
             if (Files.exists(Paths.get(l[1]))) cmd.add("-Dorg.lwjgl." + l[0] + ".libname=" + l[1]);
         Map<String, Object> arguments = obj(v.get("arguments"));
         if (arguments != null) {

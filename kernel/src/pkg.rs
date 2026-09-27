@@ -343,6 +343,7 @@ esac
 fn minecraft_setup() {
     let _ = mkdirs("/usr/share/minecraft");
     let _ = fs::write_file("/usr/share/minecraft/Launcher.java", include_bytes!("minecraft/Launcher.java"));
+    let _ = fs::write_file("/usr/share/minecraft/libglfw-mayos.so", include_bytes!("minecraft/libglfw-mayos.so"));
     let _ = fs::write_file(
         "/usr/bin/minecraft",
         MINECRAFT_SH,
