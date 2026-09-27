@@ -331,7 +331,7 @@ int main(int argc, char **argv) {
         CHECK_PIXEL("3 MiB buffer, sub-update (outside)", 192, 128, 0, 0, 0);
         glVertexAttribPointer(0, 3, 0x1406, 0, 0, 0);
         // 11: mat4 uniform (camera matrix) + interleaved position/colour
-        GL(void, glUniformMatrix4fv, int, int, unsigned char, const float *)
+        GL(void, glUniformMatrix4fv, int, int, unsigned char, const float *) GL(void, glDisableVertexAttribArray, unsigned)
         const char *mvs = "attribute vec3 p; attribute vec3 col; uniform mat4 m; varying vec3 vc; void main() { vc = col; gl_Position = m * vec4(p, 1.0); }";
         const char *mfs = "precision mediump float; varying vec3 vc; uniform vec4 tint; void main() { gl_FragColor = vec4(vc, 1.0) * tint; }";
         unsigned ma = glCreateShader(0x8B31), mb = glCreateShader(0x8B30), mp = glCreateProgram();
