@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla | --forge] [--software] [--size WxH] [--dry-run] [--debug]
+//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla | --forge | --ornithe] [--software] [--size WxH] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -15,7 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
-    static final String BUILD = "2026-09-27b";
+    static final String BUILD = "2026-09-27c";
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static HttpClient HTTP;
     static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
@@ -47,7 +47,7 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
-        boolean packOnly = false, forge = false, software = false, forceGpu = false;
+        boolean packOnly = false, forge = false, ornithe = false, software = false, forceGpu = false;
         System.out.println("MayOS Minecraft launcher, build " + BUILD);
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
         // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
@@ -66,6 +66,7 @@ public class Launcher {
             else if (args[i].equals("--pack-only")) { mods = true; packOnly = true; }
             else if (args[i].equals("--vanilla")) mods = false;
             else if (args[i].equals("--forge")) { mods = true; forge = true; }
+            else if (args[i].equals("--ornithe")) { mods = true; ornithe = true; }
             else if (args[i].equals("--software")) software = true;
             else if (args[i].equals("--gpu")) forceGpu = true;
             else if (args[i].equals("--size") && i + 1 < args.length) x11Size = args[++i];
@@ -110,6 +111,12 @@ public class Launcher {
         // the Ornithe loader and the legacy-lwjgl3 mod (LWJGL 3 on Wayland).
         boolean legacy = v.get("arguments") == null;
         if (mods == null) mods = legacy;
+        // 1.8.9 with mods: Forge + OptiFine on X11 (Java 8) when installed.
+        if (legacy && mods && !forge && !ornithe && version.equals("1.8.9")
+                && (Files.exists(Paths.get("/usr/lib/jvm/java-1.8-openjdk/bin/java")) || Files.exists(Paths.get("/usr/lib/jvm/java-1.8-openjdk/jre/bin/java")))) {
+            forge = true;
+            System.out.println("Using Forge + OptiFine (--ornithe for the Ornithe/Fabric pack)");
+        }
         if (legacy && !mods) System.out.println("Warning: " + version + " needs --mods (LWJGL 3) to open a window on MayOS");
         if (forge && !legacy) throw new RuntimeException("--forge is for versions before 1.13 (it runs them on X11 through Xwayland); use --mods for Fabric");
         Map<String, Object> loader = !mods ? null : forge ? forgeProfile(mc, version) : loaderProfile(version, legacy);
@@ -223,7 +230,7 @@ public class Launcher {
             String common = "renderDistance:6\nparticles:2\nmaxFps:260\nenableVsync:false\nentityShadows:false\nrenderClouds:false\nmipmapLevels:0\n";
             Files.writeString(opts, common + (legacy || forge
                     ? "fancyGraphics:false\nao:0\n"
-                    : "graphicsMode:0\nao:false\nsimulationDistance:5\nbiomeBlendRadius:0\nrenderClouds:\"false\"\n"));
+                    : "graphicsMode:0\nao:false\nsimulationDistance:5\nbiomeBlendRadius:0\nrenderClouds:\"false\"\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n"));
             if (forge) Files.writeString(gameDir.resolve("optionsof.txt"),
                     "ofFastRender:true\nofFastMath:true\nofSmoothFps:false\nofChunkUpdates:2\nofChunkUpdatesDynamic:true\nofAaLevel:0\nofAfLevel:1\nofClouds:3\nofTrees:1\nofDroppedItems:1\nofRainSplash:false\nofAnimatedWater:1\nofAnimatedLava:1\nofVignette:1\nofSky:true\nofDynamicFov:false\n");
         }

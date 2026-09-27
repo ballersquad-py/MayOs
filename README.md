@@ -82,10 +82,10 @@ Settings app are done.
 - **Minecraft mods**: `minecraft 1.21.11 --mods` installs Fabric and a
   performance pack from Modrinth (Sodium, Lithium, FerriteCore,
   ImmediatelyFast, EntityCulling, MoreCulling, Dynamic FPS, Clumps, Krypton);
-  `minecraft 1.8.9` uses the Ornithe loader with legacy-lwjgl3 (LWJGL 3 on
-  Wayland; old LWJGL 2 needs X11). Each modded version has its own folder,
+  `minecraft 1.8.9` runs Forge with OptiFine (below); `--ornithe` uses the
+  Ornithe loader with legacy-lwjgl3 instead (LWJGL 3 on Wayland). Each modded version has its own folder,
   `~/.minecraft/instances/<version>-<loader>/`; put your own mods in its
-  `mods/` folder. `minecraft 1.8.9 --forge` runs Forge with OptiFine,
+  `mods/` folder. `minecraft 1.8.9` (or `--forge`) runs Forge with OptiFine,
   EntityCulling, FoamFix, PolyPatcher and more on X11 (LWJGL 2) through
   Xwayland with Java 8; `--size 1600x900` sets the window size; `--software` forces CPU rendering.
 - **File sharing**: a built-in web server. Open it in a browser on your
