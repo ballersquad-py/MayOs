@@ -256,6 +256,7 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
                 _ => String::from("unknown command"),
             };
             journal_done("ERROR");
+            ERRORS.lock().push(alloc::format!("{} ms device error on a {}-byte submission", crate::time::uptime_ms(), bytes.len()));
             return Err(alloc::format!("device status {} at offset {} of {}: {}", s, off, bytes.len(), what));
         }
         let waited = crate::time::uptime_ms() - start;
@@ -450,6 +451,30 @@ fn journal_add(bytes: &[u8], dx: Option<u32>) {
     }
 }
 
+/// A free-form line in the journal (failed DRM requests and the like).
+pub fn journal_note(line: String) {
+    {
+        let mut e = ERRORS.lock();
+        if e.len() < 300 {
+            e.push(line.clone());
+        }
+    }
+    let start = {
+        let mut j = JOURNAL.lock();
+        if j.0.len() >= 200 {
+            j.0.pop_front();
+        }
+        j.0.push_back(line);
+        !core::mem::replace(&mut j.1, true)
+    };
+    if start {
+        crate::proc::sched::spawn_kernel("gpu-journal", journal_thread, 0);
+    }
+}
+
+/// Every problem since boot (kept, unlike the rolling journal).
+static ERRORS: crate::sync::Spin<Vec<String>> = crate::sync::Spin::new(Vec::new());
+
 fn journal_done(what: &str) {
     if let Some(l) = JOURNAL.lock().0.back_mut() {
         l.push_str(" -> ");
@@ -462,8 +487,19 @@ extern "C" fn journal_thread(_: usize) {
     loop {
         crate::proc::sched::sleep_ms(250);
         let text: String = {
+            let e = ERRORS.lock();
             let j = JOURNAL.lock();
-            j.0.iter().map(|l| alloc::format!("{}\n", l)).collect()
+            let mut t = alloc::format!("== problems since boot ({})\n", e.len());
+            for l in e.iter() {
+                t.push_str(l);
+                t.push('\n');
+            }
+            t.push_str("== last GPU submissions\n");
+            for l in j.0.iter() {
+                t.push_str(l);
+                t.push('\n');
+            }
+            t
         };
         if text != last {
             let _ = crate::fs::write_file("/gpu-last.txt", text.as_bytes());

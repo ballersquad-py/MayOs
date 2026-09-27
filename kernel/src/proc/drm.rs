@@ -89,6 +89,7 @@ static CONTEXT_IDS: crate::sync::Spin<Ids> = crate::sync::Spin::new(Ids::new(0))
 static FENCE_SEQ: AtomicU32 = AtomicU32::new(1);
 
 fn gpu_log(what: &str, e: &str) {
+    svga3d::journal_note(alloc::format!("{} ms drm: {}: {}", crate::time::uptime_ms(), what, e));
     static N: AtomicU32 = AtomicU32::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 32 {
         crate::kprintln!("drm: {}: {}", what, e);
@@ -497,6 +498,24 @@ fn put_str(pml4: u64, arg: u64, len_at: u64, ptr_at: u64, s: &str) -> bool {
 }
 
 pub fn ioctl(pml4: u64, cmd: u64, arg: u64) -> i64 {
+    let r = ioctl_inner(pml4, cmd, arg);
+    // Failed requests go to /gpu-last.txt: Mesa carries on after most of
+    // them, drawing with whatever is missing.
+    if r < 0 {
+        let nr = cmd & 0xff;
+        let mut words = alloc::string::String::new();
+        for i in 0..16u64 {
+            match rd32(pml4, arg + i * 4) {
+                Some(w) => words.push_str(&alloc::format!(" {:x}", w)),
+                None => break,
+            }
+        }
+        svga3d::journal_note(alloc::format!("{} ms DRM ioctl {:#x} (cmd {:#x}) FAILED {} args:{}", crate::time::uptime_ms(), nr, cmd, r, words));
+    }
+    r
+}
+
+fn ioctl_inner(pml4: u64, cmd: u64, arg: u64) -> i64 {
     if (cmd >> 8) & 0xff != 0x64 {
         return -ENOTTY;
     }
