@@ -152,6 +152,9 @@ public class Launcher {
             cmd.add("-Djavax.net.ssl.trustStoreType=PKCS12");
             cmd.add("-Djavax.net.ssl.trustStorePassword=changeit");
         }
+        // LWJGL's bundled jemalloc is a glibc build that crashes in its
+        // init under musl: use the C library's malloc.
+        cmd.add("-Dorg.lwjgl.system.allocator=system");
         cmd.add("-Xmx" + Optional.ofNullable(System.getenv("MC_MEMORY")).orElse("1G"));
         // Use Alpine's (musl) GLFW, OpenAL and Mesa instead of the glibc
         // builds inside Mojang's LWJGL jars.
