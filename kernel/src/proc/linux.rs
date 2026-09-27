@@ -3396,7 +3396,27 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         }
         273 => 0, // set_robust_list
         288 => sys_accept(p, a0 as i64, a1, a2, a3),
-        86 | 265 => -EPERM, // link: FAT32 has no hard links
+        86 | 265 => {
+            // link / linkat. FAT32 has no hard links: make a copy. Programs
+            // mostly link to claim a name atomically (X servers' lock files),
+            // so an existing target still fails with EEXIST.
+            static LINK: Mutex<()> = Mutex::new(());
+            let (from, to) = if f.rax == 86 { (path_at(p, -100, a0), path_at(p, -100, a1)) } else { (path_at(p, a0 as i64, a1), path_at(p, a2 as i64, a3)) };
+            match (from, to) {
+                (Ok(a), Ok(b)) => {
+                    let _g = LINK.lock();
+                    if fs::exists(&b) {
+                        -EEXIST
+                    } else {
+                        match fs::read_file(&a) {
+                            Ok(data) => fs::write_file(&b, &data).map(|_| 0).unwrap_or_else(fs_err),
+                            Err(e) => fs_err(e),
+                        }
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => e,
+            }
+        }
         292 => {
             let r = sys_dup(p, a0 as i64, Some(a1 as i64), 0);
             if r >= 0 && a2 & O_CLOEXEC != 0
