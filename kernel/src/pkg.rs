@@ -339,6 +339,15 @@ case "$MC_LAUNCHER" in
 esac
 "#;
 
+/// Refresh an installed launcher once per boot when `minecraft` starts,
+/// so launcher fixes arrive with a new MayOS without reinstalling.
+pub fn minecraft_setup_once() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if fs::exists("/usr/share/minecraft") && !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        minecraft_setup();
+    }
+}
+
 /// The launcher (one Java source file) and the `minecraft` command.
 fn minecraft_setup() {
     let _ = mkdirs("/usr/share/minecraft");

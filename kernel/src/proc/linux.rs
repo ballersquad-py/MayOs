@@ -341,6 +341,9 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
     if path.contains("firefox") {
         crate::pkg::firefox_setup_once();
     }
+    if path.contains("minecraft") {
+        crate::pkg::minecraft_setup_once();
+    }
     let (entry, at_base) = load_interp(pml4, image)?;
     let (rsp, stack) = build_stack(pml4, image, at_base, &argv, &default_env(cwd), path)?;
     let state = LinuxState {
@@ -3885,6 +3888,9 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     let mut path = path_at(p, dirfd, pathp)?;
     if path.contains("firefox") {
         crate::pkg::firefox_setup_once();
+    }
+    if path.contains("minecraft") {
+        crate::pkg::minecraft_setup_once();
     }
     let mut argv = read_strv(p.pml4(), argvp)?;
     let env = read_strv(p.pml4(), envp)?;
