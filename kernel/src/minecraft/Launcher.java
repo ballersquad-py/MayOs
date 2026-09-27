@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla] [--dry-run] [--debug]
+//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla | --forge] [--software] [--size WxH] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -46,7 +46,7 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
-        boolean packOnly = false, forge = false;
+        boolean packOnly = false, forge = false, software = false;
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
         // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
         String memory = System.getenv("MC_MEMORY");
@@ -64,6 +64,8 @@ public class Launcher {
             else if (args[i].equals("--pack-only")) { mods = true; packOnly = true; }
             else if (args[i].equals("--vanilla")) mods = false;
             else if (args[i].equals("--forge")) { mods = true; forge = true; }
+            else if (args[i].equals("--software")) software = true;
+            else if (args[i].equals("--size") && i + 1 < args.length) x11Size = args[++i];
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -289,11 +291,16 @@ public class Launcher {
         // wl_shm buffers. Otherwise Mesa may try zink/Vulkan, which is not
         // installed, and never produce a window.
         int cpus = Runtime.getRuntime().availableProcessors();
-        boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128")) && !"0".equals(System.getenv("MC_GPU"));
+        boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128")) && !"0".equals(System.getenv("MC_GPU")) && !software;
         System.out.println("CPUs: " + cpus + (cpus == 1 ? " (give the VM more cores for more speed)" : ""));
         System.out.println(gpu ? "Graphics: GPU (VMware SVGA 3D through Mesa's svga driver)"
                 : "Graphics: software (llvmpipe, " + cpus + " threads). For the GPU: VirtualBox display VMSVGA with\n"
                 + "  'Enable 3D Acceleration' on, then 'touch /etc/gpu3d' in MayOS and reboot.");
+        if (forge) {
+            // X11 (Xwayland) has no GPU sharing on MayOS yet: software GL.
+            gpu = false;
+            System.out.println("Graphics under X11: software (llvmpipe, " + cpus + " threads)");
+        }
         if (gpu) {
             // MayOS starts Linux programs on software OpenGL unless
             // Firefox's GPU mode is on: undo that for the game.
@@ -368,19 +375,22 @@ public class Launcher {
         return x.length > y.length;
     }
 
+    static String x11Size = null;
+
     // Rootful Xwayland on a free display; the game gets DISPLAY.
     static Process startXwayland(ProcessBuilder game) throws Exception {
         Files.createDirectories(Paths.get("/tmp/.X11-unix"));
         int d = 7;
         while (Files.exists(Paths.get("/tmp/.X11-unix/X" + d))) d++;
-        String geometry = Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
+        String geometry = x11Size != null ? x11Size : Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
         ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
         xb.environment().putAll(game.environment());
         Process x = xb.start();
         Path sock = Paths.get("/tmp/.X11-unix/X" + d);
-        for (int i = 0; i < 300 && !Files.exists(sock) && x.isAlive(); i++) Thread.sleep(100);
+        // X clients use the abstract socket; the file may never appear.
+        for (int i = 0; i < 30 && !Files.exists(sock) && x.isAlive(); i++) Thread.sleep(100);
         if (!x.isAlive()) throw new RuntimeException("Xwayland did not start (pkg install minecraft installs it)");
-        System.out.println("X11: Xwayland on display :" + d + " (" + geometry + ", change with MC_X11_SIZE=1600x900)");
+        System.out.println("X11: Xwayland on display :" + d + " (" + geometry + ", change with --size 1600x900)");
         game.environment().put("DISPLAY", ":" + d);
         game.environment().remove("WAYLAND_DISPLAY");
         return x;

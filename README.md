@@ -87,7 +87,7 @@ Settings app are done.
   `~/.minecraft/instances/<version>-<loader>/`; put your own mods in its
   `mods/` folder. `minecraft 1.8.9 --forge` runs Forge with OptiFine,
   EntityCulling, FoamFix, PolyPatcher and more on X11 (LWJGL 2) through
-  Xwayland with Java 8; `MC_X11_SIZE=1600x900` sets the window size.
+  Xwayland with Java 8; `--size 1600x900` sets the window size; `--software` forces CPU rendering.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
