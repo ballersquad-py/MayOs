@@ -310,6 +310,8 @@ fn context_destroy(cid: u32) {
         let _ = svga3d::submit(&c);
         // The id is handed out again: forget this context's bindings.
         CB_BINDINGS.lock().retain(|&(c, _, _), _| c != cid);
+        VB_BINDINGS.lock().retain(|&(c, _), _| c != cid);
+        IB_BINDINGS.lock().remove(&cid);
         for t in ctx.cotables {
             bo_close(t);
         }
@@ -419,6 +421,10 @@ fn flush_coherent() {
 
 /// Constant buffer bound per (DX context, shader type, slot): surface and size.
 static CB_BINDINGS: crate::sync::Spin<BTreeMap<(u32, u32, u32), (u32, u32)>> = crate::sync::Spin::new(BTreeMap::new());
+/// Vertex buffer surface per (DX context, slot), and index buffer surface
+/// per DX context, for rewriting the *_OFFSET_AND_SIZE commands.
+static VB_BINDINGS: crate::sync::Spin<BTreeMap<(u32, u32), u32>> = crate::sync::Spin::new(BTreeMap::new());
+static IB_BINDINGS: crate::sync::Spin<BTreeMap<u32, u32>> = crate::sync::Spin::new(BTreeMap::new());
 
 /// VirtualBox mishandles DX_SET_{VS..CS}_CONSTANT_BUFFER_OFFSET (1220..1225,
 /// which Mesa uses to move within one big constant upload buffer): shaders
@@ -439,13 +445,60 @@ fn rewrite_cb_offsets(cid: u32, bytes: Vec<u8>) -> Vec<u8> {
     if off != bytes.len() {
         return bytes;
     }
+    // DX3 devices: Mesa also moves vertex/index buffers within one upload
+    // buffer with DX_SET_VERTEX_BUFFERS_OFFSET_AND_SIZE (1286) and
+    // DX_SET_INDEX_BUFFER_OFFSET_AND_SIZE (1287); VirtualBox drew
+    // Minecraft's meshes from wrong offsets (stretched, flying triangles).
+    // Those become the classic full binds (1158, 1159).
+    const SET_VBS: u32 = 1158;
+    const SET_IB: u32 = 1159;
+    const SET_VBS_V2: u32 = 1284;
+    const SET_IB_V2: u32 = 1285;
+    const SET_VBS_OFS: u32 = 1286;
+    const SET_IB_OFS: u32 = 1287;
+    let mut vbs = VB_BINDINGS.lock();
+    let mut ibs = IB_BINDINGS.lock();
     let mut map = CB_BINDINGS.lock();
     let mut out = Vec::with_capacity(bytes.len() + 64);
     let mut off = 0;
     while off < bytes.len() {
         let (id, size) = (word(&bytes, off), word(&bytes, off + 4) as usize);
         let body = &bytes[off + 8..off + 8 + size];
-        if id == SET_SINGLE_CB && size >= 20 {
+        if (id == SET_VBS || id == SET_VBS_V2) && size >= 4 {
+            let per = if id == SET_VBS { 12 } else { 16 };
+            let start = word(body, 0);
+            for (i, e) in body[4..].chunks_exact(per).enumerate() {
+                vbs.insert((cid, start + i as u32), word(e, 0));
+            }
+        } else if (id == SET_IB || id == SET_IB_V2) && size >= 12 {
+            ibs.insert(cid, word(body, 0));
+        } else if id == SET_VBS_OFS && size >= 4 {
+            let start = word(body, 0);
+            let entries: Vec<(u32, u32, u32)> = body[4..].chunks_exact(12).map(|e| (word(e, 0), word(e, 4), word(e, 8))).collect();
+            let sids: Option<Vec<u32>> = (0..entries.len()).map(|i| vbs.get(&(cid, start + i as u32)).copied()).collect();
+            if let Some(sids) = sids {
+                let len = 4 + 12 * entries.len() as u32;
+                for v in [SET_VBS, len, start] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                for (&(stride, offset, _size), sid) in entries.iter().zip(sids) {
+                    for v in [sid, stride, offset] {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                off += 8 + size;
+                continue;
+            }
+        } else if id == SET_IB_OFS && size >= 12 {
+            if let Some(&sid) = ibs.get(&cid) {
+                let (format, offset) = (word(body, 0), word(body, 4));
+                for v in [SET_IB, 12, sid, format, offset] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                off += 8 + size;
+                continue;
+            }
+        } else if id == SET_SINGLE_CB && size >= 20 {
             let (slot, ty, sid, _o, sz) = (word(body, 0), word(body, 4), word(body, 8), word(body, 12), word(body, 16));
             map.insert((cid, ty, slot), (sid, sz));
         } else if (1220..=1225).contains(&id) && size >= 8 {
