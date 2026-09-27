@@ -19,6 +19,7 @@ const EFAULT: i64 = 14;
 const ENOTTY: i64 = 25;
 const EAGAIN: i64 = 11;
 const EBADFD: i64 = 77;
+const EPIPE: i64 = 32;
 const ENOENT: i64 = 2;
 const EINTR: i64 = 4;
 
@@ -49,6 +50,7 @@ const OPEN: i32 = 0;
 const SETUP: i32 = 1;
 const PREPARED: i32 = 2;
 const RUNNING: i32 = 3;
+const XRUN: i32 = 4;
 const DRAINING: i32 = 5;
 const PAUSED: i32 = 6;
 
@@ -509,7 +511,8 @@ impl Pcm {
             {
                 let mut s = self.st.lock();
                 if !matches!(s.state, PREPARED | RUNNING) {
-                    return if done > 0 { done as i64 } else { -EBADFD };
+                    let err = if s.state == XRUN { -EPIPE } else { -EBADFD };
+                    return if done > 0 { done as i64 } else { err };
                 }
                 let n = s.avail().min(frames - done);
                 if n > 0 {
@@ -742,6 +745,17 @@ pub fn pcm_ioctl(pcm: &Arc<Pcm>, pml4: u64, cmd: u64, arg: u64, nonblock: bool) 
             if let Some(st) = &s.stream {
                 st.set_paused(on);
             }
+            0
+        }
+        0x4148 => {
+            // XRUN: alsa-lib calls this when it sees an underrun, then
+            // expects EPIPE from the stream until PREPARE (OpenAL Soft
+            // looped on ENOTTY without it).
+            let mut s = pcm.st.lock();
+            if let Some(st) = &s.stream {
+                st.set_paused(true);
+            }
+            s.state = XRUN;
             0
         }
         0x4147 => 0, // RESUME
