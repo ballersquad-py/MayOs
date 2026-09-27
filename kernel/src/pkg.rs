@@ -321,13 +321,13 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
 /// musl builds of the native libraries Minecraft's LWJGL loads (GLFW on
 /// the Wayland compositor, Mesa OpenGL, OpenAL); gcompat for LWJGL's own
 /// glibc-built core library.
-const MINECRAFT_PKGS: &[&str] = &["openjdk25-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
+const MINECRAFT_PKGS: &[&str] = &["openjdk21-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
 
 /// `minecraft`: a custom launcher when one is set (`--launcher FILE`,
 /// $MC_LAUNCHER or the path in /etc/minecraft-launcher; a .jar runs with
 /// the JDK, anything else is executed), otherwise MayOS's own launcher.
 const MINECRAFT_SH: &[u8] = br#"#!/bin/sh
-JAVA=/usr/lib/jvm/java-25-openjdk/bin/java
+JAVA=/usr/lib/jvm/java-21-openjdk/bin/java
 if [ "$1" = "--launcher" ]; then MC_LAUNCHER="$2"; shift 2; fi
 if [ -z "$MC_LAUNCHER" ] && [ -f /etc/minecraft-launcher ]; then MC_LAUNCHER=$(cat /etc/minecraft-launcher); fi
 export XDG_SESSION_TYPE=wayland

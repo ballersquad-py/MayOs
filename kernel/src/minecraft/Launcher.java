@@ -31,8 +31,20 @@ public class Launcher {
         Path mc = home.resolve(".minecraft");
 
         Map<String, Object> manifest = obj(Json.parse(fetchString(MANIFEST)));
-        if (version == null) version = str(obj(manifest.get("latest")).get("release"));
         String versionUrl = null;
+        if (version == null) {
+            // The newest release this Java can run (Alpine 3.22 has Java 21).
+            for (Object o : list(manifest.get("versions"))) {
+                Map<String, Object> m = obj(o);
+                if (!"release".equals(m.get("type"))) continue;
+                Map<String, Object> jv = obj(obj(Json.parse(fetchString(str(m.get("url"))))).get("javaVersion"));
+                if (jv == null || num(jv.get("majorVersion")) <= Runtime.version().feature()) {
+                    version = str(m.get("id"));
+                    versionUrl = str(m.get("url"));
+                    break;
+                }
+            }
+        }
         for (Object v : list(manifest.get("versions")))
             if (str(obj(v).get("id")).equals(version)) versionUrl = str(obj(v).get("url"));
         if (versionUrl == null) throw new RuntimeException("no Minecraft version " + version);

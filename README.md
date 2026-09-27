@@ -73,7 +73,7 @@ Settings app are done.
   SDL programs appear as normal MayOS windows. Needs about 150 MB of
   disk for NetSurf.
 - **Minecraft: Java Edition**: `pkg install minecraft`, then `minecraft`
-  (or `minecraft 1.20.1 --user Steve`). Installs OpenJDK 25, GLFW, Mesa
+  (or `minecraft 1.20.1 --user Steve`). Installs OpenJDK 21, GLFW, Mesa
   and OpenAL from Alpine; the first start downloads the game from Mojang
   (~700 MB) and runs it offline (singleplayer). Give the VM 2+ GB of RAM;
   `MC_MEMORY=2G minecraft` sets the Java heap. Custom launcher:
