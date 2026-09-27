@@ -692,6 +692,14 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
     }
     if flags & MAP_ANONYMOUS == 0
         && let Some(d) = get_fd(p, fd)
+        && matches!(&*d.lock(), Desc::DmaBuf(_))
+    {
+        // CPU access to a shared GPU buffer would see stale memory; programs
+        // fall back to copying (glReadPixels) when this fails.
+        return -ENODEV;
+    }
+    if flags & MAP_ANONYMOUS == 0
+        && let Some(d) = get_fd(p, fd)
         && matches!(&*d.lock(), Desc::Drm(_))
     {
         // A GPU buffer: its pages, shared with the device.

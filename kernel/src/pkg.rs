@@ -142,7 +142,7 @@ pref("browser.startup.preXulSkeletonUI", false);
     // driver. Page drawing stays in software: WebRender on VirtualBox's
     // DX backend draws wrongly and can crash VirtualBox itself.
     let prefs = if crate::proc::drm::firefox_gpu() {
-        prefs.replace("// WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.", "// WebGL on the GPU (Mesa svga); pages in software WebRender.")
+        prefs.replace("// WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.", "// WebGL on the GPU (Mesa svga); pages in software WebRender.\n// WebGL frames reach the page by glReadPixels, not shared dma-bufs\n// (MayOS does not sync a dma-buf's memory with the GPU for CPU readers).\npref(\"widget.dmabuf-webgl.enabled\", false);\npref(\"widget.dmabuf.enabled\", false);\npref(\"webgl.dmabuf.enabled\", false);\npref(\"gfx.webgl.dmabuf\", false);")
     } else {
         String::from(prefs)
     };
