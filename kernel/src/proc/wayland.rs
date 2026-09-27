@@ -312,6 +312,8 @@ const GLOBALS: &[Global] = &[
 struct State {
     /// The client's process (for the log).
     pid: u64,
+    /// Requests written to the log so far.
+    req_logged: u32,
     objs: BTreeMap<u32, Obj>,
     versions: BTreeMap<u32, u32>,
     inbuf: Vec<u8>,
@@ -411,6 +413,41 @@ extern "C" fn wlog_thread(_: usize) {
     }
 }
 
+fn obj_name(o: &Obj) -> &'static str {
+    match o {
+        Obj::Display => "wl_display",
+        Obj::Registry => "wl_registry",
+        Obj::Callback => "wl_callback",
+        Obj::Compositor => "wl_compositor",
+        Obj::SubCompositor => "wl_subcompositor",
+        Obj::Subsurface { .. } => "wl_subsurface",
+        Obj::Shm => "wl_shm",
+        Obj::ShmPool { .. } => "wl_shm_pool",
+        Obj::Buffer(_) => "wl_buffer",
+        Obj::Surface(_) => "wl_surface",
+        Obj::Region(_) => "wl_region",
+        Obj::Seat => "wl_seat",
+        Obj::Pointer => "wl_pointer",
+        Obj::Keyboard => "wl_keyboard",
+        Obj::Touch => "wl_touch",
+        Obj::Output => "wl_output",
+        Obj::WmBase => "xdg_wm_base",
+        Obj::Positioner(_) => "xdg_positioner",
+        Obj::XdgSurface { .. } => "xdg_surface",
+        Obj::Toplevel { .. } => "xdg_toplevel",
+        Obj::Popup { .. } => "xdg_popup",
+        Obj::Shell => "wl_shell",
+        Obj::ShellSurface { .. } => "wl_shell_surface",
+        Obj::DataDeviceManager => "wl_data_device_manager",
+        Obj::DataSource => "wl_data_source",
+        Obj::DataDevice => "wl_data_device",
+        Obj::DecorationManager => "zxdg_decoration_manager",
+        Obj::Decoration => "zxdg_toplevel_decoration",
+        Obj::Drm => "wl_drm",
+        Obj::Other => "other",
+    }
+}
+
 fn now_ms() -> u32 {
     crate::time::uptime_ms() as u32
 }
@@ -494,6 +531,14 @@ impl State {
             };
         }
         let _ = kind;
+        if self.req_logged < 300 {
+            self.req_logged += 1;
+            let name = match self.objs.get(&id) {
+                Some(o) => obj_name(o),
+                None => "?",
+            };
+            wlog(alloc::format!("pid {}: {}@{} op {}", self.pid, name, id, op));
+        }
         if is!(Obj::Display) {
             match op {
                 0 => {
