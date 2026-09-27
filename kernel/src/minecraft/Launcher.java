@@ -46,7 +46,7 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
-        boolean packOnly = false;
+        boolean packOnly = false, forge = false;
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
         // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
         String memory = System.getenv("MC_MEMORY");
@@ -63,6 +63,7 @@ public class Launcher {
             else if (args[i].equals("--mods")) mods = true;
             else if (args[i].equals("--pack-only")) { mods = true; packOnly = true; }
             else if (args[i].equals("--vanilla")) mods = false;
+            else if (args[i].equals("--forge")) { mods = true; forge = true; }
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -104,11 +105,13 @@ public class Launcher {
         boolean legacy = v.get("arguments") == null;
         if (mods == null) mods = legacy;
         if (legacy && !mods) System.out.println("Warning: " + version + " needs --mods (LWJGL 3) to open a window on MayOS");
-        Map<String, Object> loader = mods ? loaderProfile(version, legacy) : null;
-        Path gameDir = mods ? mc.resolve("instances").resolve(version + "-" + (legacy ? "ornithe" : "fabric")) : mc;
+        if (forge && !legacy) throw new RuntimeException("--forge is for versions before 1.13 (it runs them on X11 through Xwayland); use --mods for Fabric");
+        Map<String, Object> loader = !mods ? null : forge ? forgeProfile(mc, version) : loaderProfile(version, legacy);
+        String loaderName = forge ? "forge" : legacy ? "ornithe" : "fabric";
+        Path gameDir = mods ? mc.resolve("instances").resolve(version + "-" + loaderName) : mc;
         if (mods) System.out.println("Mod loader: " + str(loader.get("id")) + "; mods in " + gameDir.resolve("mods"));
         if (packOnly) {
-            installPack(gameDir.resolve("mods"), version, legacy);
+            installPack(gameDir.resolve("mods"), version, legacy, forge);
             return;
         }
 
@@ -119,9 +122,11 @@ public class Launcher {
         jobs.add(new String[] {str(cd.get("url")), client.toString(), String.valueOf(num(cd.get("size")))});
         List<String> cp = new ArrayList<>();
         Set<String> loaderArtifacts = new HashSet<>();
+        List<Path> nativeJars = new ArrayList<>();
         if (loader != null) {
             for (Object lo : list(loader.get("libraries"))) {
                 Map<String, Object> lib = obj(lo);
+                if (Boolean.FALSE.equals(lib.get("clientreq"))) continue; // server only
                 String[] n = str(lib.get("name")).split(":");
                 String path = n[0].replace('.', '/') + "/" + n[1] + "/" + n[2] + "/" + n[1] + "-" + n[2] + ".jar";
                 String base = lib.get("url") == null ? "https://libraries.minecraft.net/" : str(lib.get("url"));
@@ -132,7 +137,7 @@ public class Launcher {
                 loaderArtifacts.add(n[0] + ":" + n[1]);
             }
         }
-        if (legacy && mods) {
+        if (legacy && mods && !forge) {
             // Libraries legacy-lwjgl3 and Ornithe's standard libraries use that old
             // versions do not ship (SLF4J, fastutil, a newer log4j).
             for (String path : new String[] {"org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar", "org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar", "it/unimi/dsi/fastutil/8.5.15/fastutil-8.5.15.jar",
@@ -147,8 +152,20 @@ public class Launcher {
             if (!allowed(lib.get("rules"))) continue;
             String[] n = String.valueOf(lib.get("name")).split(":");
             if (n.length > 1 && loaderArtifacts.contains(n[0] + ":" + n[1])) continue; // the loader's newer copy
-            if (legacy && mods && n[0].equals("org.lwjgl.lwjgl")) continue; // LWJGL 2: replaced by legacy-lwjgl3
-            if (legacy && mods && n[0].equals("org.apache.logging.log4j")) continue; // 2.0-beta9: replaced by 2.19 below
+            if (legacy && mods && !forge && n[0].equals("org.lwjgl.lwjgl")) continue; // LWJGL 2: replaced by legacy-lwjgl3
+            if (legacy && mods && !forge && n[0].equals("org.apache.logging.log4j")) continue; // 2.0-beta9: replaced by 2.19 below
+            // Native libraries (LWJGL 2, jinput): unpacked below.
+            Map<String, Object> nat = obj(lib.get("natives"));
+            if (nat != null && nat.get("linux") != null) {
+                Map<String, Object> dlc = obj(lib.get("downloads"));
+                Map<String, Object> cls = dlc == null ? null : obj(dlc.get("classifiers"));
+                Map<String, Object> na = cls == null ? null : obj(cls.get(str(nat.get("linux")).replace("${arch}", "64")));
+                if (na != null) {
+                    Path p = mc.resolve("libraries").resolve(str(na.get("path")));
+                    jobs.add(new String[] {str(na.get("url")), p.toString(), String.valueOf(num(na.get("size")))});
+                    nativeJars.add(p);
+                }
+            }
             Map<String, Object> dl = obj(lib.get("downloads"));
             if (dl == null || dl.get("artifact") == null) continue;
             Map<String, Object> a = obj(dl.get("artifact"));
@@ -177,11 +194,21 @@ public class Launcher {
         // Command line.
         Path natives = vdir.resolve("natives");
         Files.createDirectories(natives);
+        for (Path jar : nativeJars) {
+            if (!Files.exists(jar)) continue;
+            try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(Files.newInputStream(jar))) {
+                for (java.util.zip.ZipEntry e; (e = z.getNextEntry()) != null; ) {
+                    String name = e.getName();
+                    if (e.isDirectory() || name.startsWith("META-INF") || name.contains("/")) continue;
+                    Files.copy(z, natives.resolve(name), StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
         Map<String, String> vars = new HashMap<>();
         vars.put("auth_player_name", user);
         vars.put("version_name", version);
         vars.put("game_directory", gameDir.toString());
-        if (mods && !dry) installPack(gameDir.resolve("mods"), version, legacy);
+        if (mods && !dry) installPack(gameDir.resolve("mods"), version, legacy, forge);
         vars.put("assets_root", assets.toString());
         vars.put("game_assets", assets.toString());
         vars.put("assets_index_name", assetsId);
@@ -201,6 +228,11 @@ public class Launcher {
         vars.put("library_directory", mc.resolve("libraries").toString());
 
         String java = ProcessHandle.current().info().command().orElse("java");
+        // Forge 1.8.9 (LaunchWrapper) needs Java 8.
+        if (forge) {
+            java = "/usr/lib/jvm/java-1.8-openjdk/bin/java";
+            if (!Files.exists(Paths.get(java))) java = "/usr/lib/jvm/java-1.8-openjdk/jre/bin/java";
+        }
         List<String> cmd = new ArrayList<>();
         cmd.add(java);
         if (store != null) {
@@ -234,9 +266,10 @@ public class Launcher {
             cmd.add("-Djava.library.path=" + natives);
             cmd.add("-cp");
             cmd.add(vars.get("classpath"));
-            if (loader != null) addArgs(cmd, obj(loader.get("arguments")).get("jvm"), vars);
+            if (loader != null && loader.get("arguments") != null) addArgs(cmd, obj(loader.get("arguments")).get("jvm"), vars);
             cmd.add(str((loader != null ? loader : v).get("mainClass")));
-            for (String a : str(v.get("minecraftArguments")).split(" ")) cmd.add(subst(a, vars));
+            Map<String, Object> argSrc = loader != null && loader.get("minecraftArguments") != null ? loader : v;
+            for (String a : str(argSrc.get("minecraftArguments")).split(" ")) cmd.add(subst(a, vars));
         }
         if (dry) {
             System.out.println(String.join(" ", cmd));
@@ -249,6 +282,9 @@ public class Launcher {
         if (legacy && mods) pb.environment().put("LEGACY_LWJGL3_USE_SDL", "false");
         pb.environment().put("XDG_SESSION_TYPE", "wayland");
         pb.environment().remove("DISPLAY");
+        // Cursor theme for GLFW/Xwayland (adwaita-icon-theme).
+        pb.environment().putIfAbsent("XCURSOR_THEME", "Adwaita");
+        pb.environment().putIfAbsent("XCURSOR_PATH", "/usr/share/icons");
         // No GPU device: Mesa's software renderer (llvmpipe) drawing into
         // wl_shm buffers. Otherwise Mesa may try zink/Vulkan, which is not
         // installed, and never produce a window.
@@ -276,7 +312,14 @@ public class Launcher {
         // to mean itself, so gcompat's glibc symbols (__snprintf_chk, ...)
         // are only there when preloaded; unresolved ones jump to nowhere.
         if (Files.exists(Paths.get("/lib/libgcompat.so.0"))) pb.environment().merge("LD_PRELOAD", "/lib/libgcompat.so.0", (a, b) -> b + ":" + a);
-        System.exit(pb.start().waitFor());
+        Process xserver = null;
+        if (forge) {
+            // LWJGL 2 needs X11: a rootful Xwayland is an X server in a MayOS window.
+            xserver = startXwayland(pb);
+        }
+        int code = pb.start().waitFor();
+        if (xserver != null) xserver.destroy();
+        System.exit(code);
     }
 
     // Fabric (1.14+) or Ornithe (older versions) launcher profile.
@@ -288,17 +331,73 @@ public class Launcher {
         return obj(Json.parse(fetchString(meta + version + "/" + lv + "/profile/json")));
     }
 
+    // Forge for old versions: the installer carries the version profile and
+    // the Forge jar itself (no need to run it).
+    static Map<String, Object> forgeProfile(Path mc, String version) throws Exception {
+        String meta = fetchString("https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml");
+        String best = null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("<version>(" + java.util.regex.Pattern.quote(version) + "-[^<]+)</version>").matcher(meta);
+        while (m.find()) if (best == null || newer(m.group(1), best)) best = m.group(1);
+        if (best == null) throw new RuntimeException("no Forge for Minecraft " + version);
+        Path inst = mc.resolve("libraries/net/minecraftforge/forge/" + best + "/forge-" + best + "-installer.jar");
+        download("https://maven.minecraftforge.net/net/minecraftforge/forge/" + best + "/forge-" + best + "-installer.jar", inst, -1);
+        Map<String, Object> profile;
+        try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(inst.toFile())) {
+            profile = obj(Json.parse(new String(z.getInputStream(z.getEntry("install_profile.json")).readAllBytes(), "UTF-8")));
+            Map<String, Object> install = obj(profile.get("install"));
+            String[] n = str(install.get("path")).split(":");
+            Path jar = mc.resolve("libraries").resolve(n[0].replace('.', '/') + "/" + n[1] + "/" + n[2] + "/" + n[1] + "-" + n[2] + ".jar");
+            if (!Files.exists(jar)) {
+                Files.createDirectories(jar.getParent());
+                Files.copy(z.getInputStream(z.getEntry(str(install.get("filePath")))), jar, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        Map<String, Object> vi = obj(profile.get("versionInfo"));
+        vi.put("id", str(vi.get("id")));
+        return vi;
+    }
+
+    // Compare version strings by their numbers.
+    static boolean newer(String a, String b) {
+        String[] x = a.split("\\D+"), y = b.split("\\D+");
+        for (int i = 0; i < Math.min(x.length, y.length); i++) {
+            if (x[i].isEmpty() || y[i].isEmpty()) continue;
+            long p = Long.parseLong(x[i]), q = Long.parseLong(y[i]);
+            if (p != q) return p > q;
+        }
+        return x.length > y.length;
+    }
+
+    // Rootful Xwayland on a free display; the game gets DISPLAY.
+    static Process startXwayland(ProcessBuilder game) throws Exception {
+        Files.createDirectories(Paths.get("/tmp/.X11-unix"));
+        int d = 7;
+        while (Files.exists(Paths.get("/tmp/.X11-unix/X" + d))) d++;
+        String geometry = Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
+        ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
+        xb.environment().putAll(game.environment());
+        Process x = xb.start();
+        Path sock = Paths.get("/tmp/.X11-unix/X" + d);
+        for (int i = 0; i < 300 && !Files.exists(sock) && x.isAlive(); i++) Thread.sleep(100);
+        if (!x.isAlive()) throw new RuntimeException("Xwayland did not start (pkg install minecraft installs it)");
+        System.out.println("X11: Xwayland on display :" + d + " (" + geometry + ", change with MC_X11_SIZE=1600x900)");
+        game.environment().put("DISPLAY", ":" + d);
+        game.environment().remove("WAYLAND_DISPLAY");
+        return x;
+    }
+
     // The MayOS performance pack (Modrinth project slugs); your own mods
     // can go next to them in the mods folder.
     static final String[] PACK_MODERN = {"fabric-api", "sodium", "lithium", "ferrite-core", "immediatelyfast", "entityculling",
             "modernfix", "moreculling", "dynamic-fps", "fastload", "clumps", "krypton"};
     static final String[] PACK_LEGACY = {"moehreag-legacy-lwjgl3"};
+    static final String[] PACK_FORGE = {"entityculling", "foamfix", "patcher", "ksyxis", "ai-improvements"};
 
-    static void installPack(Path modsDir, String version, boolean legacy) throws Exception {
+    static void installPack(Path modsDir, String version, boolean legacy, boolean forge) throws Exception {
         Files.createDirectories(modsDir);
-        String loaderName = legacy ? "ornithe" : "fabric";
+        String loaderName = forge ? "forge" : legacy ? "ornithe" : "fabric";
         Map<String, String[]> files = new LinkedHashMap<>(); // project -> url, file name
-        Deque<String> todo = new ArrayDeque<>(Arrays.asList(legacy ? PACK_LEGACY : PACK_MODERN));
+        Deque<String> todo = new ArrayDeque<>(Arrays.asList(forge ? PACK_FORGE : legacy ? PACK_LEGACY : PACK_MODERN));
         Set<String> seen = new HashSet<>();
         while (!todo.isEmpty()) {
             String project = todo.pop();
@@ -323,6 +422,17 @@ public class Launcher {
             files.put(project, new String[] {str(file.get("url")), str(file.get("filename"))});
             for (Object d : list(mv.get("dependencies")))
                 if ("required".equals(obj(d).get("dependency_type")) && obj(d).get("project_id") != null) todo.add(str(obj(d).get("project_id")));
+        }
+        if (forge) {
+            // OptiFine (not on Modrinth): its download page carries the link.
+            String of = "OptiFine_" + version + "_HD_U_M5.jar";
+            try {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("downloadx\\?f=[^\"' ]+").matcher(fetchString("https://optifine.net/adloadx?f=" + of));
+                if (m.find()) files.put("optifine", new String[] {"https://optifine.net/" + m.group().replace("&amp;", "&"), of});
+                else System.out.println("  (OptiFine: no download for " + version + ")");
+            } catch (Exception e) {
+                System.out.println("  (OptiFine: " + e.getMessage() + ")");
+            }
         }
         // Replace the jars this pack installed before; leave the user's own.
         Path managed = modsDir.resolve(".mayos-pack");

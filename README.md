@@ -85,7 +85,9 @@ Settings app are done.
   `minecraft 1.8.9` uses the Ornithe loader with legacy-lwjgl3 (LWJGL 3 on
   Wayland; old LWJGL 2 needs X11). Each modded version has its own folder,
   `~/.minecraft/instances/<version>-<loader>/`; put your own mods in its
-  `mods/` folder.
+  `mods/` folder. `minecraft 1.8.9 --forge` runs Forge with OptiFine,
+  EntityCulling, FoamFix, PolyPatcher and more on X11 (LWJGL 2) through
+  Xwayland with Java 8; `MC_X11_SIZE=1600x900` sets the window size.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).
