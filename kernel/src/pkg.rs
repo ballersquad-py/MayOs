@@ -92,6 +92,8 @@ pub fn firefox_setup_once() {
 }
 
 fn firefox_setup() {
+    // A WebGL self-test page: open file:///webgltest.html in Firefox.
+    let _ = fs::write_file("/webgltest.html", include_bytes!("webgltest.html"));
     for dir in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
         if fs::exists(dir) {
             firefox_prefs(dir);
