@@ -76,7 +76,7 @@ Settings app are done.
   (or `minecraft 1.20.1 --user Steve`). Installs OpenJDK 21, GLFW, Mesa
   and OpenAL from Alpine; the first start downloads the game from Mojang
   (~700 MB) and runs it offline (singleplayer). Give the VM 2+ GB of RAM;
-  `MC_MEMORY=2G minecraft` sets the Java heap. Custom launcher:
+  Memory: `minecraft --memory 4G` (or `/etc/minecraft-memory` containing e.g. `4G`; default 2G). The GPU is used when `/etc/gpu3d` is on (`MC_GPU=0` forces software). Custom launcher:
   `minecraft --launcher /path/launcher.jar` (or put the path in
   `/etc/minecraft-launcher` to make it the default).
 - **File sharing**: a built-in web server. Open it in a browser on your

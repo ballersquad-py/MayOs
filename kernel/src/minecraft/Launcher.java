@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--dry-run] [--debug]
+//   minecraft [version] [--user NAME] [--memory 4G] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -46,10 +46,18 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
+        // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
+        String memory = System.getenv("MC_MEMORY");
+        try {
+            if (memory == null) memory = Files.readString(Paths.get("/etc/minecraft-memory")).trim();
+        } catch (IOException e) {
+            // not set
+        }
         for (int i = 0; i < args.length; i++) {
             if (args[i].equals("--user") && i + 1 < args.length) user = args[++i];
             else if (args[i].equals("--dry-run")) dry = true;
             else if (args[i].equals("--debug")) debug = true;
+            else if (args[i].equals("--memory") && i + 1 < args.length) memory = args[++i];
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -156,7 +164,11 @@ public class Launcher {
         // LWJGL's bundled jemalloc is a glibc build that crashes in its
         // init under musl: use the C library's malloc.
         cmd.add("-Dorg.lwjgl.system.allocator=system");
-        cmd.add("-Xmx" + Optional.ofNullable(System.getenv("MC_MEMORY")).orElse("1G"));
+        if (memory == null || memory.isEmpty()) memory = "2G";
+        if (memory.matches("\\d+")) memory += "M";
+        System.out.println("Memory: " + memory + " (change with --memory 4G or echo 4G > /etc/minecraft-memory)");
+        cmd.add("-Xms" + (memory.matches("\\d+[gG]") && Integer.parseInt(memory.replaceAll("\\D", "")) > 1 ? "1G" : "256M"));
+        cmd.add("-Xmx" + memory);
         // (libglfw-mayos.so: Alpine's GLFW without the window icon call,
         // which fails on Wayland and stops older versions.)
         // Use Alpine's (musl) GLFW, OpenAL and Mesa instead of the glibc
@@ -188,12 +200,17 @@ public class Launcher {
         // wl_shm buffers. Otherwise Mesa may try zink/Vulkan, which is not
         // installed, and never produce a window.
         int cpus = Runtime.getRuntime().availableProcessors();
-        boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128"));
+        boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128")) && !"0".equals(System.getenv("MC_GPU"));
         System.out.println("CPUs: " + cpus + (cpus == 1 ? " (give the VM more cores for more speed)" : ""));
         System.out.println(gpu ? "Graphics: GPU (VMware SVGA 3D through Mesa's svga driver)"
                 : "Graphics: software (llvmpipe, " + cpus + " threads). For the GPU: VirtualBox display VMSVGA with\n"
                 + "  'Enable 3D Acceleration' on, then 'touch /etc/gpu3d' in MayOS and reboot.");
-        if (!gpu) {
+        if (gpu) {
+            // MayOS starts Linux programs on software OpenGL unless
+            // Firefox's GPU mode is on: undo that for the game.
+            pb.environment().remove("LIBGL_ALWAYS_SOFTWARE");
+            pb.environment().remove("GALLIUM_DRIVER");
+        } else {
             pb.environment().putIfAbsent("LIBGL_ALWAYS_SOFTWARE", "1");
             pb.environment().putIfAbsent("GALLIUM_DRIVER", "llvmpipe");
         }
