@@ -66,7 +66,7 @@ pub fn job(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
         _ => {
             say(
                 c,
-                "usage: pkg install <name>...   install Alpine Linux packages\n       pkg search <word>         find packages\n       pkg list                  installed packages\n       pkg update                refresh the package index\nexample: pkg install netsurf   (a web browser)\n",
+                "usage: pkg install <name>...   install Alpine Linux packages\n       pkg search <word>         find packages\n       pkg list                  installed packages\n       pkg update                refresh the package index\nexample: pkg install netsurf   (a web browser)\n         pkg install minecraft (Minecraft: Java Edition)\n",
             );
             Ok(())
         }
@@ -296,7 +296,7 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
             continue;
         };
         // Firefox uses Mesa's software OpenGL (llvmpipe) for WebGL.
-        let wants_gl = names.iter().any(|n| n.starts_with("firefox"));
+        let wants_gl = names.iter().any(|n| n.starts_with("firefox") || MINECRAFT_PKGS.contains(n));
         if SKIP.contains(&pkg.as_str()) && !names.contains(&pkg.as_str()) && !wants_gl {
             continue;
         }
@@ -317,7 +317,31 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
 
 // --- install ---------------------------------------------------------------
 
+/// What `pkg install minecraft` installs: a JDK for the launcher, and
+/// musl builds of the native libraries Minecraft's LWJGL loads (GLFW on
+/// the Wayland compositor, Mesa OpenGL, OpenAL); gcompat for LWJGL's own
+/// glibc-built core library.
+const MINECRAFT_PKGS: &[&str] = &["openjdk25-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
+
+/// The launcher (one Java source file) and the `minecraft` command.
+fn minecraft_setup() {
+    let _ = mkdirs("/usr/share/minecraft");
+    let _ = fs::write_file("/usr/share/minecraft/Launcher.java", include_bytes!("minecraft/Launcher.java"));
+    let _ = fs::write_file(
+        "/usr/bin/minecraft",
+        b"#!/bin/sh\nexec /usr/lib/jvm/java-25-openjdk/bin/java /usr/share/minecraft/Launcher.java \"$@\"\n",
+    );
+}
+
 fn install(names: &[&str], c: &Console, cancel: &AtomicBool) -> Result<(), String> {
+    if names.contains(&"minecraft") {
+        let mut n: Vec<&str> = names.iter().copied().filter(|&n| n != "minecraft").collect();
+        n.extend_from_slice(MINECRAFT_PKGS);
+        install(&n, c, cancel)?;
+        minecraft_setup();
+        say(c, "Start Minecraft with: minecraft [version] [--user NAME]\n(the first start downloads about 700 MB from Mojang)\n");
+        return Ok(());
+    }
     let idx = load_index(c, false)?;
     let all = resolve(&idx, names, c)?;
     let mut have = installed();

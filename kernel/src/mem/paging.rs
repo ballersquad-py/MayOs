@@ -211,6 +211,8 @@ pub fn new_address_space() -> Option<u64> {
 
 /// Free every user page and page table of an address space, then the PML4.
 pub fn destroy_address_space(pml4: u64) {
+    // GPU buffer mappings recorded for this address space are gone too.
+    crate::proc::drm::forget_maps(pml4, 0, u64::MAX);
     let _g = LOCK.lock();
     fn free_level(t: u64, level: u32) {
         for &e in table(t).iter() {

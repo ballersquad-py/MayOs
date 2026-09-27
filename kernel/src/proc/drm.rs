@@ -308,6 +308,8 @@ fn context_destroy(cid: u32) {
         c.cmd(svga3d::CMD_DX_BIND_CONTEXT, &[cid, INVALID, 0]);
         c.cmd(svga3d::CMD_DX_DESTROY_CONTEXT, &[cid]);
         let _ = svga3d::submit(&c);
+        // The id is handed out again: forget this context's bindings.
+        CB_BINDINGS.lock().retain(|&(c, _, _), _| c != cid);
         for t in ctx.cotables {
             bo_close(t);
         }
@@ -357,6 +359,18 @@ pub fn note_map(off: u64, pml4: u64, va: u64, len: u64) {
     let mut m = MAPS.lock();
     m.retain(|&(_, p, v, _)| !(p == pml4 && v == va));
     m.push((bo, pml4, va, len));
+}
+
+/// Drop the recorded buffer mappings of `pml4` inside `start..end`
+/// (munmap, or the address space going away). A stale entry would make
+/// `flush_coherent` walk freed page tables and clear bits in whatever
+/// memory reused them.
+pub fn forget_maps(pml4: u64, start: u64, end: u64) {
+    let mut m = MAPS.lock();
+    if m.is_empty() {
+        return;
+    }
+    m.retain(|&(_, p, va, len)| !(p == pml4 && va < end && va + len > start));
 }
 
 const CMD_UPDATE_GB_SURFACE: u32 = 1102;

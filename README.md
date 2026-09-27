@@ -72,6 +72,11 @@ Settings app are done.
   compositor** (`wl_shm`, `xdg_shell`, keyboard and pointer), so GTK and
   SDL programs appear as normal MayOS windows. Needs about 150 MB of
   disk for NetSurf.
+- **Minecraft: Java Edition**: `pkg install minecraft`, then `minecraft`
+  (or `minecraft 1.20.1 --user Steve`). Installs OpenJDK 25, GLFW, Mesa
+  and OpenAL from Alpine; the first start downloads the game from Mojang
+  (~700 MB) and runs it offline (singleplayer). Give the VM 2+ GB of RAM;
+  `MC_MEMORY=2G minecraft` sets the Java heap.
 - **File sharing**: a built-in web server. Open it in a browser on your
   PC to drag files onto MayOS, download files, and create, rename or
   delete them (`share` in the terminal, or Settings → Network).

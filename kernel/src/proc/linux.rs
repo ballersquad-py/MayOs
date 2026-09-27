@@ -609,6 +609,7 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 }
 
 fn unmap_range(p: &Process, start: u64, end: u64) {
+    super::drm::forget_maps(p.pml4(), start, end);
     let mut a = start;
     let mut any = false;
     while a < end {
