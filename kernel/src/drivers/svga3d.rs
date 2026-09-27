@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::drivers::vmware_svga::{reg_read, reg_write, IO_BASE};
+use crate::drivers::vmware_svga::{reg_write, IO_BASE};
 use crate::mem::{phys_to_virt, pmm};
 
 const REG_COMMAND_LOW: u32 = 48;
