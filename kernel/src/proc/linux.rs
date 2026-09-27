@@ -184,7 +184,9 @@ pub struct LinuxState {
     /// Window for /dev/fb0 and /dev/input, made on first use.
     pub screen: Spin<Option<Arc<Screen>>>,
     /// Shared memory mapped into this process (kept while it lives).
-    pub shared: Spin<Vec<Arc<Shm>>>,
+    /// Shared memory mapped by this process, by address range: it stays
+    /// alive while mapped and is released on munmap.
+    pub shared: Spin<Vec<(u64, u64, Arc<Shm>)>>,
     /// Signal handlers, masks and pending signals.
     pub sig: Spin<super::signal::Signals>,
     /// Files with mappings (see `Region::file`).
@@ -608,6 +610,11 @@ fn unmap_range(p: &Process, start: u64, end: u64) {
     if any {
         crate::smp::tlb_shootdown(p.pml4());
     }
+    // Shared memory mapped entirely inside the range is no longer used here
+    // (the device may still hold it through its own reference).
+    if let Some(l) = linux(p) {
+        l.shared.lock().retain(|(s, e, _)| !(*s >= start && *e <= end));
+    }
 }
 
 fn remove_regions(l: &LinuxState, start: u64, end: u64) {
@@ -688,7 +695,7 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
                 return -ENOMEM;
             }
         }
-        l.shared.lock().push(shm);
+        l.shared.lock().push((start, start + len, shm));
         return start as i64;
     }
     const MAP_SHARED: u64 = 1;
@@ -711,7 +718,7 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
                 return -ENOMEM;
             }
         }
-        l.shared.lock().push(shm.clone());
+        l.shared.lock().push((start, start + len, shm.clone()));
         return start as i64;
     }
     let writable = prot & 2 != 0 || flags & MAP_ANONYMOUS == 0;

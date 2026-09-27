@@ -237,8 +237,14 @@ fn submit_raw(st: &mut State, ctx: u32, bytes: &[u8], dx_context: Option<u32>) -
             if s == CB_STATUS_COMPLETED {
                 return Ok(());
             }
-            let off = unsafe { h.add(1).read_volatile() };
-            return Err(alloc::format!("device status {} at command offset {}", s, off));
+            let off = unsafe { h.add(1).read_volatile() } as usize;
+            // Name the command the device stopped at.
+            let word = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+            let what = match (word(off), word(off + 4)) {
+                (Some(id), Some(size)) => alloc::format!("command {} ({} bytes of arguments, first {:x?})", id, size, word(off + 8)),
+                _ => String::from("unknown command"),
+            };
+            return Err(alloc::format!("device status {} at offset {} of {}: {}", s, off, bytes.len(), what));
         }
         let waited = crate::time::uptime_ms() - start;
         if waited > 2000 {
