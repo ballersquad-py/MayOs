@@ -187,7 +187,13 @@ public class Launcher {
         // No GPU device: Mesa's software renderer (llvmpipe) drawing into
         // wl_shm buffers. Otherwise Mesa may try zink/Vulkan, which is not
         // installed, and never produce a window.
-        if (!Files.exists(Paths.get("/dev/dri/renderD128"))) {
+        int cpus = Runtime.getRuntime().availableProcessors();
+        boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128"));
+        System.out.println("CPUs: " + cpus + (cpus == 1 ? " (give the VM more cores for more speed)" : ""));
+        System.out.println(gpu ? "Graphics: GPU (VMware SVGA 3D through Mesa's svga driver)"
+                : "Graphics: software (llvmpipe, " + cpus + " threads). For the GPU: VirtualBox display VMSVGA with\n"
+                + "  'Enable 3D Acceleration' on, then 'touch /etc/gpu3d' in MayOS and reboot.");
+        if (!gpu) {
             pb.environment().putIfAbsent("LIBGL_ALWAYS_SOFTWARE", "1");
             pb.environment().putIfAbsent("GALLIUM_DRIVER", "llvmpipe");
         }

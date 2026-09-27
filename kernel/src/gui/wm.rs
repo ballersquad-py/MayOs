@@ -262,6 +262,8 @@ pub struct Wm {
     cfg_gen: u64,
     /// Remaining sub-pixel motion for pointer-speed scaling.
     motion_rem: (i32, i32),
+    /// Last absolute pointer position while the pointer is locked.
+    lock_abs: (i32, i32),
     dock_shadow: Option<ShadowMask>,
     /// Dock slide animation for auto-hide: (from, to, start) offsets in px.
     dock_slide: (i32, i32, u64),
@@ -339,6 +341,7 @@ impl Wm {
             cfg_gen: settings::generation(),
             cfg,
             motion_rem: (0, 0),
+            lock_abs: (i32::MIN, i32::MIN),
             dock_shadow: None,
             dock_slide: (0, 0, 0),
             dock_leave_at: 0,
@@ -913,6 +916,29 @@ impl Wm {
     // -----------------------------------------------------------------
 
     pub fn handle(&mut self, ev: InputEvent) {
+        if let Some(w) = crate::proc::wayland::pointer_lock() {
+            match ev {
+                InputEvent::MouseMove { dx, dy } => {
+                    // A game captured the mouse: raw motion, the pointer stays put.
+                    let speed = self.cfg.pointer_speed as i32;
+                    w.pointer_relative(dx * speed / 5, dy * speed / 5);
+                    return;
+                }
+                InputEvent::MouseAbsolute { x, y } => {
+                    // Absolute devices (VirtualBox mouse integration): send the
+                    // change; it stops at the screen edge, so turn integration
+                    // off (Host+I) for games.
+                    let nx = x.map(|v| (v as i64 * self.width as i64 / 65536) as i32).unwrap_or(self.lock_abs.0);
+                    let ny = y.map(|v| (v as i64 * self.height as i64 / 65536) as i32).unwrap_or(self.lock_abs.1);
+                    if self.lock_abs != (i32::MIN, i32::MIN) {
+                        w.pointer_relative(nx - self.lock_abs.0, ny - self.lock_abs.1);
+                    }
+                    self.lock_abs = (nx, ny);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match ev {
             InputEvent::MouseMove { dx, dy } => {
                 // Pointer speed (1..=10, 5 = 1:1) plus acceleration.
@@ -925,6 +951,7 @@ impl Wm {
                 self.pointer_moved(x, y);
             }
             InputEvent::MouseAbsolute { x, y } => {
+                self.lock_abs = (i32::MIN, i32::MIN);
                 let nx = x.map(|v| (v as i64 * self.width as i64 / 65536) as i32).unwrap_or(self.pointer.0);
                 let ny = y.map(|v| (v as i64 * self.height as i64 / 65536) as i32).unwrap_or(self.pointer.1);
                 self.pointer_moved(nx, ny);

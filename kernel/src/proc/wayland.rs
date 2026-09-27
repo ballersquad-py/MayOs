@@ -139,6 +139,11 @@ impl Window {
         self.with_client(|c, st| st.key(c, s, k));
     }
 
+    /// Mouse motion while this window holds the pointer lock.
+    pub fn pointer_relative(&self, dx: i32, dy: i32) {
+        self.with_client(|_, st| st.relative_motion(dx, dy));
+    }
+
     pub fn focus(&self, on: bool) {
         let s = self.surface;
         self.with_client(|c, st| st.keyboard_focus(c, s, on));
@@ -248,6 +253,11 @@ enum Obj {
     Decoration { toplevel: u32 },
     /// wl_drm: how Mesa hands GPU-drawn buffers to the compositor.
     Drm,
+    RelPointerManager,
+    RelPointer,
+    PointerConstraints,
+    LockedPointer { surface: u32 },
+    ConfinedPointer,
     Other,
 }
 
@@ -310,7 +320,24 @@ const GLOBALS: &[Global] = &[
     Global { name: 8, iface: "wl_data_device_manager", version: 3 },
     Global { name: 9, iface: "zxdg_decoration_manager_v1", version: 1 },
     Global { name: 10, iface: "wl_drm", version: 2 },
+    // Mouse capture for games (GLFW's disabled cursor).
+    Global { name: 11, iface: "zwp_relative_pointer_manager_v1", version: 1 },
+    Global { name: 12, iface: "zwp_pointer_constraints_v1", version: 1 },
 ];
+
+/// The window whose program locked the pointer (zwp_locked_pointer_v1):
+/// the desktop sends it raw mouse motion instead of moving the pointer.
+static POINTER_LOCK: Spin<Option<Weak<Window>>> = Spin::new(None);
+
+/// The window holding the pointer lock, if any.
+pub fn pointer_lock() -> Option<Arc<Window>> {
+    let w = POINTER_LOCK.lock().as_ref().and_then(|w| w.upgrade())?;
+    if w.gone.load(Ordering::Relaxed) {
+        *POINTER_LOCK.lock() = None;
+        return None;
+    }
+    Some(w)
+}
 
 #[derive(Default)]
 struct State {
@@ -328,6 +355,9 @@ struct State {
     /// Frame callbacks of committed surfaces, answered at the next tick.
     frame_ready: Vec<u32>,
     pointers: Vec<u32>,
+    rel_pointers: Vec<u32>,
+    /// zwp_locked_pointer_v1 object and its surface, while one exists.
+    lock: Option<(u32, u32)>,
     keyboards: Vec<u32>,
     /// Surface under the pointer and its origin in toplevel coordinates.
     pointer_on: Option<(u32, i32, i32)>,
@@ -448,6 +478,11 @@ fn obj_name(o: &Obj) -> &'static str {
         Obj::DecorationManager => "zxdg_decoration_manager",
         Obj::Decoration { .. } => "zxdg_toplevel_decoration",
         Obj::Drm => "wl_drm",
+        Obj::RelPointerManager => "zwp_relative_pointer_manager",
+        Obj::RelPointer => "zwp_relative_pointer",
+        Obj::PointerConstraints => "zwp_pointer_constraints",
+        Obj::LockedPointer { .. } => "zwp_locked_pointer",
+        Obj::ConfinedPointer => "zwp_confined_pointer",
         Obj::Other => "other",
     }
 }
@@ -857,6 +892,50 @@ impl State {
             if op == 2 {
                 self.destroy(id);
             }
+        } else if is!(Obj::RelPointerManager) {
+            match op {
+                0 => self.destroy(id),
+                1 => {
+                    let new = a.u();
+                    self.new_obj(new, Obj::RelPointer, 1);
+                    self.rel_pointers.push(new);
+                }
+                _ => {}
+            }
+        } else if is!(Obj::RelPointer) {
+            if op == 0 {
+                self.rel_pointers.retain(|&r| r != id);
+                self.destroy(id);
+            }
+        } else if is!(Obj::PointerConstraints) {
+            match op {
+                0 => self.destroy(id),
+                1 => {
+                    // lock_pointer(id, surface, pointer, region, lifetime)
+                    let new = a.u();
+                    let surface = a.u();
+                    self.new_obj(new, Obj::LockedPointer { surface }, 1);
+                    self.lock = Some((new, surface));
+                    self.activate_lock(true);
+                }
+                2 => {
+                    // confine_pointer: accepted, not enforced
+                    let new = a.u();
+                    self.new_obj(new, Obj::ConfinedPointer, 1);
+                    self.ev(new, 0, vec![]);
+                }
+                _ => {}
+            }
+        } else if is!(Obj::LockedPointer { .. }) {
+            if op == 0 {
+                self.activate_lock(false);
+                self.lock = None;
+                self.destroy(id);
+            }
+        } else if is!(Obj::ConfinedPointer) {
+            if op == 0 {
+                self.destroy(id);
+            }
         } else if is!(Obj::DecorationManager) {
             match op {
                 0 => self.destroy(id),
@@ -894,6 +973,8 @@ impl State {
             "wl_data_device_manager" => Obj::DataDeviceManager,
             "zxdg_decoration_manager_v1" => Obj::DecorationManager,
             "wl_drm" => Obj::Drm,
+            "zwp_relative_pointer_manager_v1" => Obj::RelPointerManager,
+            "zwp_pointer_constraints_v1" => Obj::PointerConstraints,
             _ => Obj::Other,
         };
         self.new_obj(new, obj, ver);
@@ -1399,7 +1480,38 @@ impl State {
         }
     }
 
+    /// Start or stop sending raw motion to the locked window.
+    fn activate_lock(&mut self, on: bool) {
+        let Some((obj, surface)) = self.lock else { return };
+        let win = self.root_of(surface).and_then(|r| self.window_of(r));
+        let mut g = POINTER_LOCK.lock();
+        let ours = g.as_ref().and_then(|w| w.upgrade()).is_some_and(|w| win.as_ref().is_some_and(|x| Arc::ptr_eq(&w, x)));
+        if on && !ours {
+            if let Some(w) = &win {
+                *g = Some(Arc::downgrade(w));
+                drop(g);
+                self.ev(obj, 0, vec![]); // locked
+            }
+        } else if !on && ours {
+            *g = None;
+            drop(g);
+            self.ev(obj, 1, vec![]); // unlocked
+        }
+    }
+
+    /// Raw mouse motion for zwp_relative_pointer_v1.
+    fn relative_motion(&mut self, dx: i32, dy: i32) {
+        let us = crate::time::uptime_us();
+        let rs: Vec<u32> = self.rel_pointers.clone();
+        for r in rs {
+            self.ev(r, 0, vec![A::U((us >> 32) as u32), A::U(us as u32), A::F(dx * 256), A::F(dy * 256), A::F(dx * 256), A::F(dy * 256)]);
+        }
+        self.pointer_frame();
+    }
+
     fn keyboard_focus(&mut self, _c: &Client, surface: u32, on: bool) {
+        // The lock follows focus (GLFW asks for a persistent lock).
+        self.activate_lock(on);
         let ks: Vec<u32> = self.keyboards.clone();
         let serial = self.next_serial();
         if on {
