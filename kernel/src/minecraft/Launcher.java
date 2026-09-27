@@ -132,12 +132,23 @@ public class Launcher {
                 loaderArtifacts.add(n[0] + ":" + n[1]);
             }
         }
+        if (legacy && mods) {
+            // Libraries legacy-lwjgl3 and Ornithe's standard libraries use that old
+            // versions do not ship (SLF4J, fastutil, a newer log4j).
+            for (String path : new String[] {"org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar", "org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar", "it/unimi/dsi/fastutil/8.5.15/fastutil-8.5.15.jar",
+                    "org/apache/logging/log4j/log4j-api/2.19.0/log4j-api-2.19.0.jar", "org/apache/logging/log4j/log4j-core/2.19.0/log4j-core-2.19.0.jar"}) {
+                Path p = mc.resolve("libraries").resolve(path);
+                jobs.add(new String[] {"https://repo1.maven.org/maven2/" + path, p.toString(), "-1"});
+                cp.add(p.toString());
+            }
+        }
         for (Object lo : list(v.get("libraries"))) {
             Map<String, Object> lib = obj(lo);
             if (!allowed(lib.get("rules"))) continue;
             String[] n = String.valueOf(lib.get("name")).split(":");
             if (n.length > 1 && loaderArtifacts.contains(n[0] + ":" + n[1])) continue; // the loader's newer copy
             if (legacy && mods && n[0].equals("org.lwjgl.lwjgl")) continue; // LWJGL 2: replaced by legacy-lwjgl3
+            if (legacy && mods && n[0].equals("org.apache.logging.log4j")) continue; // 2.0-beta9: replaced by 2.19 below
             Map<String, Object> dl = obj(lib.get("downloads"));
             if (dl == null || dl.get("artifact") == null) continue;
             Map<String, Object> a = obj(dl.get("artifact"));
@@ -153,7 +164,7 @@ public class Launcher {
         Path assets = mc.resolve("assets");
         Path indexFile = assets.resolve("indexes").resolve(assetsId + ".json");
         download(str(ai.get("url")), indexFile, num(ai.get("size")));
-        if (!dry) {
+        if (!dry && System.getenv("MC_SKIP_ASSETS") == null) {
             for (Map.Entry<String, Object> e : obj(obj(Json.parse(Files.readString(indexFile))).get("objects")).entrySet()) {
                 String hash = str(obj(e.getValue()).get("hash"));
                 String sub = hash.substring(0, 2) + "/" + hash;
