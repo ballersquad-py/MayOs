@@ -241,7 +241,7 @@ enum Obj {
     DataSource,
     DataDevice,
     DecorationManager,
-    Decoration,
+    Decoration { toplevel: u32 },
     /// wl_drm: how Mesa hands GPU-drawn buffers to the compositor.
     Drm,
     Other,
@@ -442,7 +442,7 @@ fn obj_name(o: &Obj) -> &'static str {
         Obj::DataSource => "wl_data_source",
         Obj::DataDevice => "wl_data_device",
         Obj::DecorationManager => "zxdg_decoration_manager",
-        Obj::Decoration => "zxdg_toplevel_decoration",
+        Obj::Decoration { .. } => "zxdg_toplevel_decoration",
         Obj::Drm => "wl_drm",
         Obj::Other => "other",
     }
@@ -858,15 +858,16 @@ impl State {
                 0 => self.destroy(id),
                 1 => {
                     let new = a.u();
-                    self.new_obj(new, Obj::Decoration, 1);
-                    self.ev(new, 0, vec![A::U(2)]); // server side
+                    let toplevel = a.u();
+                    self.new_obj(new, Obj::Decoration { toplevel }, 1);
+                    self.decoration_configure(new, toplevel);
                 }
                 _ => {}
             }
-        } else if is!(Obj::Decoration) {
+        } else if let Some(&Obj::Decoration { toplevel }) = self.objs.get(&id) {
             match op {
                 0 => self.destroy(id),
-                _ => self.ev(id, 0, vec![A::U(2)]),
+                _ => self.decoration_configure(id, toplevel),
             }
         } else if matches!(self.objs.get(&id), Some(Obj::Callback | Obj::Other)) {
             // nothing to do
@@ -1155,6 +1156,25 @@ impl State {
     }
 
     // --- configure / close --------------------------------------------------
+
+    /// Server-side decorations, followed by a new xdg_surface.configure:
+    /// the protocol makes a decoration mode take effect only with the next
+    /// surface configure, and GLFW keeps a window hidden (dropping every
+    /// buffer swap) until it has seen both.
+    fn decoration_configure(&mut self, deco: u32, toplevel: u32) {
+        self.ev(deco, 0, vec![A::U(2)]); // server side
+        let surface = match self.objs.get(&toplevel) {
+            Some(Obj::Toplevel { xdg_surface }) => match self.objs.get(xdg_surface) {
+                Some(Obj::XdgSurface { surface, .. }) => Some(*surface),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(surface) = surface {
+            let size = self.window_of(surface).and_then(|w| w.image.lock().as_ref().map(|i| (i.0, i.1))).unwrap_or((0, 0));
+            self.configure_toplevel(surface, size.0, size.1, true);
+        }
+    }
 
     fn configure_toplevel(&mut self, surface: u32, w: i32, h: i32, activated: bool) {
         let xdg = self.objs.iter().find_map(|(k, o)| match o {
