@@ -161,8 +161,9 @@ pub fn ctl_ioctl(pml4: u64, cmd: u64, arg: u64) -> i64 {
             str_at(&mut b, 168, 80, "MayOS mixer");
             put(pml4, arg, &b)
         }
-        0xc004_5530 => {
-            // PCM_NEXT_DEVICE: device 0 only
+        0xc004_5530 | 0x8004_5530 => {
+            // PCM_NEXT_DEVICE (_IOR in the kernel headers; some builds
+            // use _IOWR): device 0 only
             let Some(v) = usermem::read_bytes(pml4, arg, 4) else { return -EFAULT };
             let cur = i32::from_le_bytes(v.try_into().unwrap());
             put(pml4, arg, &(if cur < 0 { 0i32 } else { -1i32 }).to_le_bytes())

@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--dry-run]
+//   minecraft [version] [--user NAME] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -45,10 +45,11 @@ public class Launcher {
 
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
-        boolean dry = false;
+        boolean dry = false, debug = false;
         for (int i = 0; i < args.length; i++) {
             if (args[i].equals("--user") && i + 1 < args.length) user = args[++i];
             else if (args[i].equals("--dry-run")) dry = true;
+            else if (args[i].equals("--debug")) debug = true;
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -183,6 +184,18 @@ public class Launcher {
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(mc.toFile()).inheritIO();
         pb.environment().put("XDG_SESSION_TYPE", "wayland");
         pb.environment().remove("DISPLAY");
+        // No GPU device: Mesa's software renderer (llvmpipe) drawing into
+        // wl_shm buffers. Otherwise Mesa may try zink/Vulkan, which is not
+        // installed, and never produce a window.
+        if (!Files.exists(Paths.get("/dev/dri/renderD128"))) {
+            pb.environment().putIfAbsent("LIBGL_ALWAYS_SOFTWARE", "1");
+            pb.environment().putIfAbsent("GALLIUM_DRIVER", "llvmpipe");
+        }
+        if (debug) {
+            pb.environment().put("EGL_LOG_LEVEL", "debug");
+            pb.environment().put("LIBGL_DEBUG", "verbose");
+            pb.environment().put("MESA_DEBUG", "1");
+        }
         // LWJGL's natives are glibc builds. musl takes libc.so.6 and friends
         // to mean itself, so gcompat's glibc symbols (__snprintf_chk, ...)
         // are only there when preloaded; unresolved ones jump to nowhere.
