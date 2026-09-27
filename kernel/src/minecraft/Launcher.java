@@ -234,6 +234,12 @@ public class Launcher {
         if (forge) {
             java = "/usr/lib/jvm/java-1.8-openjdk/bin/java";
             if (!Files.exists(Paths.get(java))) java = "/usr/lib/jvm/java-1.8-openjdk/jre/bin/java";
+            if (!Files.exists(Paths.get(java))) throw new RuntimeException("Java 8 is missing: run pkg install minecraft");
+            // Which Java really runs (Forge 1.8.9 fails on anything newer than 8).
+            Process v8 = new ProcessBuilder(java, "-version").redirectErrorStream(true).start();
+            String vtext = new String(v8.getInputStream().readAllBytes()).trim();
+            v8.waitFor();
+            System.out.println("Java for Forge: " + java + ": " + vtext.replace('\n', ' '));
         }
         List<String> cmd = new ArrayList<>();
         cmd.add(java);
