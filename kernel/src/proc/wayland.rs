@@ -1108,7 +1108,8 @@ impl State {
                                     lit += 1;
                                 }
                             }
-                            wlog(alloc::format!("pid {}: frame {} on surface {} {}x{} stride {} offset {} ({} of 64 samples not black){}", self.pid, n, id, b.w, b.h, b.stride, b.off, lit, if size_changed { " NEW SIZE" } else { "" }));
+                            let need = b.off + b.stride.max(0) as u64 * b.h.max(0) as u64;
+                            wlog(alloc::format!("pid {}: frame {} on surface {} {}x{} stride {} offset {} ({} of 64 samples not black){} pool {} bytes, frame needs {}{}", self.pid, n, id, b.w, b.h, b.stride, b.off, lit, if size_changed { " NEW SIZE" } else { "" }, b.shm.size(), need, if b.gpu.is_some() { " GPU" } else { "" }));
                         }
                         if FRAMES_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
                             let role = self.surface(id).map(|s| match s.role { Role::Toplevel(_) => "window", Role::Sub { .. } => "subsurface", Role::Popup { .. } => "popup", Role::None => "no role" }).unwrap_or("?");
