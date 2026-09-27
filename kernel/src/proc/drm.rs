@@ -56,9 +56,31 @@ struct Objects {
 }
 
 static OBJ: Mutex<Objects> = Mutex::new(Objects { bos: BTreeMap::new(), surfaces: BTreeMap::new(), contexts: BTreeMap::new() });
-static NEXT_BO: AtomicU32 = AtomicU32::new(1);
-static NEXT_SID: AtomicU32 = AtomicU32::new(1);
-static NEXT_CID: AtomicU32 = AtomicU32::new(0);
+/// Device ids are table slots (the object tables have a fixed number of
+/// entries), so freed ids are handed out again.
+struct Ids {
+    next: u32,
+    free: Vec<u32>,
+}
+
+impl Ids {
+    const fn new(first: u32) -> Ids {
+        Ids { next: first, free: Vec::new() }
+    }
+    fn get(&mut self) -> u32 {
+        self.free.pop().unwrap_or_else(|| {
+            self.next += 1;
+            self.next - 1
+        })
+    }
+    fn put(&mut self, id: u32) {
+        self.free.push(id);
+    }
+}
+
+static BO_IDS: crate::sync::Spin<Ids> = crate::sync::Spin::new(Ids::new(1));
+static SURFACE_IDS: crate::sync::Spin<Ids> = crate::sync::Spin::new(Ids::new(1));
+static CONTEXT_IDS: crate::sync::Spin<Ids> = crate::sync::Spin::new(Ids::new(0));
 static FENCE_SEQ: AtomicU32 = AtomicU32::new(1);
 
 fn gpu_log(what: &str, e: &str) {
@@ -86,9 +108,10 @@ fn bo_new(size: u64) -> Option<u32> {
         return None;
     }
     let mob = Mob::over(shm.clone(), size as usize)?;
-    let h = NEXT_BO.fetch_add(1, Ordering::Relaxed);
+    let h = BO_IDS.lock().get();
     if let Err(e) = svga3d::define_mob(h, &mob) {
         gpu_log("define buffer", &e);
+        BO_IDS.lock().put(h);
         return None;
     }
     OBJ.lock().bos.insert(h, Bo { shm, _mob: mob, size });
@@ -98,6 +121,7 @@ fn bo_new(size: u64) -> Option<u32> {
 fn bo_close(h: u32) {
     if OBJ.lock().bos.remove(&h).is_some() {
         let _ = svga3d::destroy_mob(h);
+        BO_IDS.lock().put(h);
     }
 }
 
@@ -140,7 +164,7 @@ fn surface_define(pml4: u64, arg: u64, req: &[u32], ext: bool) -> i64 {
     let (flags, format, mips, drm_flags, msaa, filter, buf, array) = (req[0], req[1], req[2], req[3], req[4], req[5], req[6], req[7]);
     let (w, h, d) = (req[8], req[9], req[10]);
     let (flags_hi, ms_pattern, quality, stride) = if ext { (req[12], req[13], req[14], req[15]) } else { (0, 0, 0, 0) };
-    let sid = NEXT_SID.fetch_add(1, Ordering::Relaxed);
+    let sid = SURFACE_IDS.lock().get();
     let size = surface_bytes(format, w, h, d, mips, if flags & (1 << 0) != 0 && array == 0 { 6 } else { array });
     let (backup, own) = if buf != INVALID && buf != 0 && OBJ.lock().bos.contains_key(&buf) {
         (buf, false)
@@ -160,6 +184,7 @@ fn surface_define(pml4: u64, arg: u64, req: &[u32], ext: bool) -> i64 {
         if own {
             bo_close(backup);
         }
+        SURFACE_IDS.lock().put(sid);
         return -EINVAL;
     }
     let bsize = OBJ.lock().bos.get(&backup).map(|b| b.size).unwrap_or(size);
@@ -214,6 +239,7 @@ fn surface_destroy(sid: u32) {
         if s.own_backup {
             bo_close(s.backup);
         }
+        SURFACE_IDS.lock().put(sid);
     }
 }
 
@@ -235,8 +261,11 @@ const COTABLES: [(u32, u32); 12] = [
 ];
 
 fn dx_context_new() -> Option<u32> {
-    let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed);
-    let mob = bo_new(8192)?;
+    let cid = CONTEXT_IDS.lock().get();
+    let Some(mob) = bo_new(8192) else {
+        CONTEXT_IDS.lock().put(cid);
+        return None;
+    };
     let mut c = Cmds::default();
     c.cmd(svga3d::CMD_DX_DEFINE_CONTEXT, &[cid]);
     c.cmd(svga3d::CMD_DX_BIND_CONTEXT, &[cid, mob, 0]);
@@ -247,6 +276,7 @@ fn dx_context_new() -> Option<u32> {
                 bo_close(t);
             }
             bo_close(mob);
+            CONTEXT_IDS.lock().put(cid);
             return None;
         };
         c.cmd(svga3d::CMD_DX_SET_COTABLE, &[cid, t, ty as u32, 0]);
@@ -258,6 +288,7 @@ fn dx_context_new() -> Option<u32> {
             bo_close(t);
         }
         bo_close(mob);
+        CONTEXT_IDS.lock().put(cid);
         return None;
     }
     OBJ.lock().contexts.insert(cid, Context { mob, cotables });
@@ -284,6 +315,7 @@ fn context_destroy(cid: u32) {
             bo_close(t);
         }
         bo_close(ctx.mob);
+        CONTEXT_IDS.lock().put(cid);
     }
 }
 

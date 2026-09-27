@@ -271,8 +271,8 @@ pub fn submit_dx(c: &Cmds, dx_context: u32) -> Result<(), String> {
 
 /// Entries per object table (size / entry size is the device's limit).
 const OTABLE_BYTES: [usize; 6] = [
-    64 << 10,  // MOB (16384 x 16 bytes... enough ids for us)
-    512 << 10, // SURFACE
+    1 << 20,   // MOB: 65536 ids x 16 bytes
+    2 << 20,   // SURFACE: 32768 ids x 64 bytes
     16 << 10,  // CONTEXT
     64 << 10,  // SHADER
     16 << 10,  // SCREENTARGET

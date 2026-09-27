@@ -125,6 +125,34 @@ static const char *FS[4] = {
     " gl_FragColor = vec4(col, 1.0); }",
 };
 
+/* A 3x5 pixel font for the fps counter: digits, '.', ' ', 'F', 'P', 'S'. */
+static const char *GLYPHS = "0123456789. FPS";
+static const uint16_t FONT[] = {
+    0x7B6F, 0x2492, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF, 0x0002, 0x0000, 0x79A4, 0x7BE4, 0x79CF,
+};
+
+/* Draw text at (x, y) with each font pixel as a `sc` x `sc` block, on a
+ * dark box so it stays readable over any picture. */
+static void draw_text(uint32_t *scr, int W, int H, int x, int y, int sc, const char *t) {
+    int n = strlen(t);
+    for (int yy = y - sc; yy < y + 6 * sc && yy < H; yy++)
+        for (int xx = x - sc; xx < x + n * 4 * sc && xx < W; xx++)
+            if (yy >= 0 && xx >= 0) scr[yy * W + xx] = 0x101010;
+    for (int i = 0; i < n; i++) {
+        const char *g = strchr(GLYPHS, t[i]);
+        if (!g) continue;
+        uint16_t bits = FONT[g - GLYPHS];
+        for (int r = 0; r < 5; r++)
+            for (int c = 0; c < 3; c++)
+                if (bits & (1 << (14 - (r * 3 + c))))
+                    for (int dy = 0; dy < sc; dy++)
+                        for (int dx = 0; dx < sc; dx++) {
+                            int px = x + (i * 4 + c) * sc + dx, py = y + r * sc + dy;
+                            if (px < W && py < H) scr[py * W + px] = 0x40ff40;
+                        }
+    }
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
     int sw = argc > 2 && !strcmp(argv[2], "-sw");
@@ -161,6 +189,7 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     last = t0;
     int frames = 0;
+    char fps_text[32] = "... FPS";
     printf("Drawing in the window; Ctrl+C to stop.\n");
     for (;;) {
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -192,10 +221,12 @@ int main(int argc, char **argv) {
             for (int x = 0; x < W; x++)
                 d[x] = (s[x * 4] << 16) | (s[x * 4 + 1] << 8) | s[x * 4 + 2];
         }
+        draw_text(screen, W, H, 12, 12, 4, fps_text);
         frames++;
         double since = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
-        if (since >= 2.0) {
+        if (since >= 1.0) {
             printf("%.1f fps\n", frames / since);
+            snprintf(fps_text, sizeof fps_text, "%.0f FPS", frames / since);
             fflush(stdout);
             frames = 0;
             last = now;
