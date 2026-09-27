@@ -559,10 +559,7 @@ fn ioctl_inner(pml4: u64, cmd: u64, arg: u64) -> i64 {
             let dc = |i: usize| g.dev_caps.get(i).copied().unwrap_or(0) != 0;
             let dx = g.caps & 0x1000_0000 != 0 && dc(95);
             let sm41 = dx && g.cap2 & 0x4 != 0 && dc(244);
-            // Shader model 5 only on request (/etc/gpu-sm5): VirtualBox's
-            // SM5 shader translation mis-renders large WebGL shaders
-            // (three.js lighting/shadows); SM4.1 covers WebGL 2 / GLES 3.
-            let sm5 = sm41 && g.cap2 & 0x400 != 0 && dc(258) && crate::fs::exists("/etc/gpu-sm5");
+            let sm5 = sm41 && g.cap2 & 0x400 != 0 && dc(258);
             let gl43 = sm5 && dc(261);
             let v = match param {
                 0 | 1 => 0,                        // video overlay streams
