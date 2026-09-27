@@ -135,26 +135,15 @@ fn bo_alloc(pml4: u64, arg: u64) -> i64 {
     if ok { 0 } else { -EFAULT }
 }
 
-/// Bytes per pixel (or per 4x4 block for compressed formats, counted
-/// per pixel generously); only used to size backing buffers.
-fn bytes_per_pixel(format: u32) -> u64 {
-    match format {
-        // 8-bit and 16-bit formats
-        5 | 6 | 7 | 24 | 25 | 26 | 27 | 28 | 55 | 60 | 61 | 62 | 63 | 64 | 65 | 66 => 2,
-        // 64-bit formats (R16G16B16A16 family, R32G32 family)
-        16 | 17 | 36 | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 => 8,
-        // 128-bit formats (R32G32B32A32 family)
-        29 | 30 | 31 | 32 | 33 | 34 | 35 => 16,
-        _ => 4,
-    }
-}
-
+/// Bytes a surface's backing memory needs: every mip level of every
+/// array slice, in the format's blocks (the device's guest-backed layout).
 fn surface_bytes(format: u32, w: u32, h: u32, d: u32, mips: u32, array: u32) -> u64 {
+    // Unknown formats: assume the largest (16 bytes a pixel).
+    let (bw, bh, bd, bpb) = crate::drivers::svga3d_formats::format_block(format).unwrap_or((1, 1, 1, 16));
     let mut total = 0u64;
     for m in 0..mips.max(1) {
-        let (mw, mh, md) = ((w >> m).max(1) as u64, (h >> m).max(1) as u64, (d >> m).max(1) as u64);
-        // Round to 4x4 blocks (compressed formats) and be generous.
-        total += mw.div_ceil(4) * 4 * mh.div_ceil(4) * 4 * md * bytes_per_pixel(format).max(4);
+        let (mw, mh, md) = ((w >> m).max(1), (h >> m).max(1), (d >> m).max(1));
+        total += mw.div_ceil(bw) as u64 * mh.div_ceil(bh) as u64 * md.div_ceil(bd) as u64 * bpb as u64;
     }
     total * array.max(1) as u64
 }
