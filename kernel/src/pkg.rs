@@ -353,6 +353,8 @@ pub fn minecraft_setup_once() {
 /// The launcher (one Java source file) and the `minecraft` command.
 fn minecraft_setup() {
     let _ = mkdirs("/usr/share/minecraft");
+    // Fresh files (not overwritten in place): the launcher must never be stale.
+    let _ = fs::remove("/usr/share/minecraft/Launcher.java");
     let _ = fs::write_file("/usr/share/minecraft/Launcher.java", include_bytes!("minecraft/Launcher.java"));
     let _ = fs::write_file("/usr/share/minecraft/libglfw-mayos.so", include_bytes!("minecraft/libglfw-mayos.so"));
     let _ = fs::write_file(

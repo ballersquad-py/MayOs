@@ -15,6 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
+    static final String BUILD = "2026-09-27b";
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static HttpClient HTTP;
     static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
@@ -46,7 +47,8 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
-        boolean packOnly = false, forge = false, software = false;
+        boolean packOnly = false, forge = false, software = false, forceGpu = false;
+        System.out.println("MayOS Minecraft launcher, build " + BUILD);
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
         // Java heap: --memory 4G, or $MC_MEMORY, or /etc/minecraft-memory.
         String memory = System.getenv("MC_MEMORY");
@@ -65,6 +67,7 @@ public class Launcher {
             else if (args[i].equals("--vanilla")) mods = false;
             else if (args[i].equals("--forge")) { mods = true; forge = true; }
             else if (args[i].equals("--software")) software = true;
+            else if (args[i].equals("--gpu")) forceGpu = true;
             else if (args[i].equals("--size") && i + 1 < args.length) x11Size = args[++i];
             else version = args[i];
         }
@@ -298,6 +301,12 @@ public class Launcher {
         // installed, and never produce a window.
         int cpus = Runtime.getRuntime().availableProcessors();
         boolean gpu = Files.exists(Paths.get("/dev/dri/renderD128")) && !"0".equals(System.getenv("MC_GPU")) && !software;
+        // 1.21.5+ (new renderer) draws black on VirtualBox's GPU: software
+        // unless --gpu.
+        if (gpu && !forceGpu && String.valueOf(v.get("releaseTime")).compareTo("2025-03-25") >= 0) {
+            gpu = false;
+            System.out.println("Note: " + version + " shows a black screen on VirtualBox's GPU; using software (try --gpu to test)");
+        }
         System.out.println("CPUs: " + cpus + (cpus == 1 ? " (give the VM more cores for more speed)" : ""));
         System.out.println(gpu ? "Graphics: GPU (VMware SVGA 3D through Mesa's svga driver)"
                 : "Graphics: software (llvmpipe, " + cpus + " threads). For the GPU: VirtualBox display VMSVGA with\n"
