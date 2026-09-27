@@ -295,6 +295,9 @@ fn base_env(cwd: &str) -> Vec<String> {
         // Firefox: Wayland, software drawing, no sandboxes (they need
         // seccomp and namespaces), no crash reporter.
         String::from("MOZ_ENABLE_WAYLAND=1"),
+        // The Wayland proxy thread only relays messages (a workaround for
+        // other compositors); here it cost as much CPU as WebGL itself.
+        String::from("MOZ_DISABLE_WAYLAND_PROXY=1"),
         String::from("MOZ_DISABLE_CONTENT_SANDBOX=1"),
         String::from("MOZ_DISABLE_GMP_SANDBOX=1"),
         String::from("MOZ_DISABLE_RDD_SANDBOX=1"),
