@@ -380,15 +380,35 @@ static LOG: Spin<Vec<String>> = Spin::new(Vec::new());
 static FRAMES_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn wlog(line: String) {
-    let text = {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    {
         let mut l = LOG.lock();
         if l.len() >= 400 {
             l.drain(..100);
         }
         l.push(alloc::format!("{} ms {}", crate::time::uptime_ms(), line));
-        l.join("\n")
-    };
-    let _ = crate::fs::write_file("/wayland-log.txt", text.as_bytes());
+    }
+    // Written by a kernel thread: file writes from inside a program's
+    // socket call do not reach the disk.
+    if !STARTED.swap(true, Ordering::AcqRel) {
+        crate::proc::sched::spawn_kernel("wayland-log", wlog_thread, 0);
+    }
+}
+
+extern "C" fn wlog_thread(_: usize) {
+    let mut written = 0;
+    loop {
+        crate::proc::sched::sleep_ms(500);
+        let text = {
+            let l = LOG.lock();
+            if l.len() == written {
+                continue;
+            }
+            written = l.len();
+            l.join("\n")
+        };
+        let _ = crate::fs::write_file("/wayland-log.txt", text.as_bytes());
+    }
 }
 
 fn now_ms() -> u32 {
