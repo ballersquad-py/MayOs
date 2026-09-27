@@ -4293,6 +4293,14 @@ fn readlink(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
         return r;
     }
     let path = path_at(p, dirfd, ptr)?;
+    // Directories and big files are never links: EINVAL ("not a link"),
+    // which musl's realpath needs for every component it walks (EISDIR
+    // made it fail, so the JVM could not find its home), without reading
+    // a whole large file just to look at its start.
+    let e = fs::stat(&path).map_err(fs_err)?;
+    if e.is_dir || e.size >= 1024 {
+        return Err(-EINVAL);
+    }
     let data = fs::read_file(&path).map_err(fs_err)?;
     if data.len() < 1024 && data.starts_with(fs::LINK_MAGIC) {
         Ok(String::from_utf8_lossy(&data[fs::LINK_MAGIC.len()..]).trim().to_string())
