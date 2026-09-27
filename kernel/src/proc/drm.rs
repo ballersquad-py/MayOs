@@ -42,6 +42,11 @@ struct Surface {
     backup: u32,     // buffer handle
     backup_size: u32,
     own_backup: bool,
+    /// DRM_VMW_SURFACE_FLAG_COHERENT: the program writes the buffer through
+    /// its mapping and never asks for an upload; the kernel must notice the
+    /// writes and update the device's copy before commands run (vmwgfx
+    /// does this with page-fault dirty tracking, we use the PTE dirty bits).
+    coherent: bool,
 }
 
 struct Context {
@@ -119,6 +124,7 @@ fn bo_new(size: u64) -> Option<u32> {
 }
 
 fn bo_close(h: u32) {
+    MAPS.lock().retain(|m| m.0 != h);
     if OBJ.lock().bos.remove(&h).is_some() {
         let _ = svga3d::destroy_mob(h);
         BO_IDS.lock().put(h);
@@ -179,7 +185,7 @@ fn surface_define(pml4: u64, arg: u64, req: &[u32], ext: bool) -> i64 {
     }
     let bsize = OBJ.lock().bos.get(&backup).map(|b| b.size).unwrap_or(size);
     let create: Vec<u8> = req.iter().flat_map(|w| w.to_le_bytes()).collect();
-    OBJ.lock().surfaces.insert(sid, Surface { create, backup, backup_size: bsize as u32, own_backup: own });
+    OBJ.lock().surfaces.insert(sid, Surface { create, backup, backup_size: bsize as u32, own_backup: own, coherent: drm_flags & 0x8 != 0 });
     // rep: handle, backup_size, buffer_handle, buffer_size, buffer_map_handle
     let ok = usermem::write_u32(pml4, arg, sid)
         && usermem::write_u32(pml4, arg + 4, bsize as u32)
@@ -319,6 +325,7 @@ fn execbuf(pml4: u64, arg: u64) -> i64 {
     let cid = w[8];
     let Some(bytes) = usermem::read_bytes(pml4, cmds, size as u64) else { return -EFAULT };
     let bytes = if cid != INVALID { rewrite_cb_offsets(cid, bytes) } else { bytes };
+    flush_coherent();
     let c = Cmds(bytes);
     let r = if cid != INVALID && OBJ.lock().contexts.contains_key(&cid) { svga3d::submit_dx(&c, cid) } else { svga3d::submit(&c) };
     let seq = FENCE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -338,6 +345,61 @@ fn execbuf(pml4: u64, arg: u64) -> i64 {
         let _ = usermem::write_bytes(pml4, fence_rep, &rep);
     }
     if err != 0 { err as i64 } else { 0 }
+}
+
+/// Where buffers are mapped into programs: (buffer, pml4, address, length).
+static MAPS: crate::sync::Spin<Vec<(u32, u64, u64, u64)>> = crate::sync::Spin::new(Vec::new());
+
+/// Called by mmap of the DRM device.
+pub fn note_map(off: u64, pml4: u64, va: u64, len: u64) {
+    let bo = (off >> 32) as u32;
+    let mut m = MAPS.lock();
+    m.retain(|&(_, p, v, _)| !(p == pml4 && v == va));
+    m.push((bo, pml4, va, len));
+}
+
+const CMD_UPDATE_GB_SURFACE: u32 = 1102;
+
+/// Upload every coherent surface whose memory the CPU wrote since the last
+/// command submission (vmwgfx: vmw_bo_dirty_* + vmw_resource_dirty_update).
+fn flush_coherent() {
+    let (coh, bos): (Vec<(u32, u32)>, BTreeMap<u32, Arc<Shm>>) = {
+        let o = OBJ.lock();
+        let coh: Vec<(u32, u32)> = o.surfaces.iter().filter(|(_, s)| s.coherent).map(|(&id, s)| (id, s.backup)).collect();
+        if coh.is_empty() {
+            return;
+        }
+        let bos = coh.iter().filter_map(|&(_, b)| o.bos.get(&b).map(|x| (b, x.shm.clone()))).collect();
+        (coh, bos)
+    };
+    let maps = MAPS.lock().clone();
+    let mut dirty_bos = alloc::collections::BTreeSet::new();
+    let mut flush = alloc::collections::BTreeSet::new();
+    for &(bo, pml4, va, len) in maps.iter() {
+        let Some(shm) = bos.get(&bo) else { continue };
+        for i in 0..len.div_ceil(4096) {
+            let Some(phys) = shm.page(i as usize) else { break };
+            if crate::mem::paging::take_dirty(pml4, va + i * 4096, phys) {
+                dirty_bos.insert(bo);
+                flush.insert(pml4);
+            }
+        }
+    }
+    for p in flush {
+        crate::smp::tlb_shootdown(p);
+    }
+    if dirty_bos.is_empty() {
+        return;
+    }
+    let mut c = Cmds::default();
+    for &(sid, b) in coh.iter() {
+        if dirty_bos.contains(&b) {
+            c.cmd(CMD_UPDATE_GB_SURFACE, &[sid]);
+        }
+    }
+    if let Err(e) = svga3d::submit(&c) {
+        gpu_log("coherent upload", &e);
+    }
 }
 
 /// Constant buffer bound per (DX context, shader type, slot): surface and size.

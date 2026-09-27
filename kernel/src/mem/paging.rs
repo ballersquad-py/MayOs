@@ -282,6 +282,29 @@ pub fn clone_address_space(src: u64) -> Option<u64> {
     Some(dst)
 }
 
+pub const DIRTY: u64 = 1 << 6;
+
+/// If the 4 KiB page at `virt` maps `phys` and was written since the last
+/// call (the CPU's dirty bit), clear the bit and return true. The caller
+/// flushes the TLB afterwards so the next write sets the bit again.
+pub fn take_dirty(pml4: u64, virt: u64, phys: u64) -> bool {
+    let _g = LOCK.lock();
+    let mut t = pml4;
+    for level in (2..=4).rev() {
+        let e = table(t)[index(virt, level)];
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return false;
+        }
+        t = e & ADDR_MASK;
+    }
+    let e = &mut table(t)[index(virt, 1)];
+    if *e & PRESENT == 0 || *e & ADDR_MASK != phys & ADDR_MASK || *e & DIRTY == 0 {
+        return false;
+    }
+    *e &= !DIRTY;
+    true
+}
+
 /// Change the flags of a present page (mprotect). Returns false if the
 /// page is not mapped.
 pub fn set_flags(pml4: u64, virt: u64, flags: u64) -> bool {

@@ -718,6 +718,7 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
             }
         }
         l.shared.lock().push((start, start + len, shm));
+        super::drm::note_map(off, p.pml4(), start, len);
         return start as i64;
     }
     const MAP_SHARED: u64 = 1;
