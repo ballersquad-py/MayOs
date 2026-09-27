@@ -138,12 +138,11 @@ pref("browser.newtabpage.activity-stream.feeds.topsites", false);
 pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
 pref("browser.startup.preXulSkeletonUI", false);
 "#;
-    // GPU mode (/etc/gpu3d): WebRender and WebGL on the GPU through Mesa's
-    // VMware driver; otherwise everything in software.
+    // GPU mode (/etc/firefox-gpu): WebGL on the GPU through Mesa's VMware
+    // driver. Page drawing stays in software: WebRender on VirtualBox's
+    // DX backend draws wrongly and can crash VirtualBox itself.
     let prefs = if crate::proc::drm::firefox_gpu() {
-        prefs
-            .replace("pref(\"gfx.webrender.software\", true);", "pref(\"gfx.webrender.software\", false);\npref(\"gfx.webrender.all\", true);\npref(\"layers.acceleration.force-enabled\", true);\npref(\"webgl.force-enabled\", true);")
-            .replace("pref(\"layers.acceleration.disabled\", true);", "pref(\"layers.acceleration.disabled\", false);")
+        prefs.replace("// WebGL through Mesa's software OpenGL (llvmpipe): no GPU driver yet.", "// WebGL on the GPU (Mesa svga); pages in software WebRender.")
     } else {
         String::from(prefs)
     };
