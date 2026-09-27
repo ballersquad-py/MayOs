@@ -880,7 +880,9 @@ fn virtual_file(path: &str) -> Option<Desc> {
             }
             t
         }
-        "/etc/hosts" => String::from("127.0.0.1 localhost\n::1 localhost\n"),
+        // The host name (uname, /etc/hostname) must resolve: Java's
+        // InetAddress.getLocalHost() fails otherwise.
+        "/etc/hosts" => String::from("127.0.0.1 localhost mayos\n::1 localhost mayos\n"),
         "/etc/asound.conf" => String::from(super::alsa::ASOUND_CONF),
         "/etc/passwd" => String::from("root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home:/bin/sh\n"),
         "/etc/group" => String::from("root:x:0:\nuser:x:1000:\n"),
