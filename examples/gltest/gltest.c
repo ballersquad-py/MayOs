@@ -35,11 +35,12 @@ int main(int argc, char **argv) {
         setenv("LIBGL_DEBUG", "verbose", 1);
         setenv("SVGA_DEBUG", "", 0);
     }
-    int sw = 0, wl = 0, tex = 0; // -sw: software check, -wl: through the compositor, -tex: texture upload
+    int sw = 0, wl = 0, tex = 0, full = 0; // -sw: software check, -wl: through the compositor, -tex: texture upload
     for (int i = 1; i < argc; i++) {
         sw |= !strcmp(argv[i], "-sw");
         wl |= !strcmp(argv[i], "-wl");
         tex |= !strcmp(argv[i], "-tex");
+        full |= !strcmp(argv[i], "-full");
     }
     int fd = sw || wl ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     if (fd < 0 && !sw && !wl) { printf("FAIL no /dev/dri/renderD128 (touch /etc/gpu3d and reboot)\n"); return 1; }
@@ -200,6 +201,119 @@ int main(int argc, char **argv) {
         printf("%s presented %d of 30 frames through the compositor\n", swapped == 30 ? "ok  " : "FAIL", swapped);
         green = W * H * (swapped == 30);
         if (sw) green = green;
+    }
+    if (full) {
+        // One check per GL feature games use; each clears, draws, reads a pixel.
+        GL(void, glGenBuffers, int, unsigned *) GL(void, glBindBuffer, unsigned, unsigned)
+        GL(void, glBufferData, unsigned, long, const void *, unsigned) GL(void, glBufferSubData, unsigned, long, long, const void *)
+        GL(void, glDrawElements, unsigned, int, unsigned, const void *) GL(void, glEnable, unsigned) GL(void, glDisable, unsigned)
+        GL(void, glDepthFunc, unsigned) GL(void, glClearDepthf, float) GL(void, glUniform4f, int, float, float, float, float)
+        GL(int, glGetUniformLocation, unsigned, const char *) GL(void, glGenTextures, int, unsigned *) GL(void, glBindTexture, unsigned, unsigned)
+        GL(void, glTexImage2D, unsigned, int, int, int, int, int, unsigned, unsigned, const void *)
+        GL(void, glTexSubImage2D, unsigned, int, int, int, int, int, unsigned, unsigned, const void *)
+        GL(void, glTexParameteri, unsigned, unsigned, int) GL(void, glFramebufferTexture2D, unsigned, unsigned, unsigned, unsigned, int)
+        GL(void, glGenRenderbuffers, int, unsigned *)
+        const char *vs2 = "attribute vec3 p; void main() { gl_Position = vec4(p, 1.0); }";
+        const char *fs2 = "precision mediump float; uniform vec4 c; void main() { gl_FragColor = c; }";
+        unsigned a = glCreateShader(0x8B31), b = glCreateShader(0x8B30), pr = glCreateProgram();
+        glShaderSource(a, 1, &vs2, 0); glCompileShader(a); glShaderSource(b, 1, &fs2, 0); glCompileShader(b);
+        glAttachShader(pr, a); glAttachShader(pr, b); glBindAttribLocation(pr, 0, "p"); glLinkProgram(pr);
+        glUseProgram(pr);
+        int uc = glGetUniformLocation(pr, "c");
+        glBindFramebuffer(0x8D40, fb);
+        glViewport(0, 0, W, H);
+        int passed = 0, total = 0;
+#define PIX(x, y) (px + (((y) * W + (x)) * 4))
+#define CHECK_PIXEL(name, x, y, r, g, b_) do { \
+            glReadPixels(0, 0, W, H, 0x1908, 0x1401, px); uint8_t *q = PIX(x, y); total++; \
+            int okp = abs(q[0] - (r)) < 8 && abs(q[1] - (g)) < 8 && abs(q[2] - (b_)) < 8; passed += okp; \
+            printf("%s %-34s pixel (%d,%d,%d) want (%d,%d,%d)\n", okp ? "ok  " : "FAIL", name, q[0], q[1], q[2], r, g, b_); } while (0)
+        float full_quad[] = {-1, -1, 0, 1, -1, 0, -1, 1, 0, 1, 1, 0};
+        unsigned vbo, ibo;
+        // 1: vertex buffer object, static
+        glGenBuffers(1, &vbo); glBindBuffer(0x8892, vbo);
+        glBufferData(0x8892, sizeof full_quad, full_quad, 0x88E4);
+        glVertexAttribPointer(0, 3, 0x1406, 0, 0, 0); glEnableVertexAttribArray(0);
+        glClearColor(0, 0, 0, 1); glClear(0x4000);
+        glUniform4f(uc, 1, 0, 0, 1); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("vertex buffer (static)", 128, 128, 255, 0, 0);
+        // 2: glBufferSubData update: shrink the quad to the left half
+        float left[] = {-1, -1, 0, 0, -1, 0, -1, 1, 0, 0, 1, 0};
+        glBufferSubData(0x8892, 0, sizeof left, left);
+        glClear(0x4000); glUniform4f(uc, 0, 1, 0, 1); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("buffer update, inside", 64, 128, 0, 255, 0);
+        CHECK_PIXEL("buffer update, outside", 192, 128, 0, 0, 0);
+        // 3: orphaning (glBufferData every frame, like games do)
+        for (int i = 0; i < 50; i++) {
+            float x = -1 + i * 0.04f;
+            float q2[] = {-1, -1, 0, x, -1, 0, -1, 1, 0, x, 1, 0};
+            glBufferData(0x8892, sizeof q2, q2, 0x88E8);
+            glClear(0x4000); glUniform4f(uc, 0, 0, 1, 1); glDrawArrays(5, 0, 4);
+        }
+        CHECK_PIXEL("buffer re-upload x50 (orphaning)", 100, 128, 0, 0, 255);
+        CHECK_PIXEL("buffer re-upload, right side", 254, 128, 0, 0, 0);
+        // 4: indexed draw from an index buffer
+        glBufferData(0x8892, sizeof full_quad, full_quad, 0x88E4);
+        unsigned short idx[] = {0, 1, 2, 2, 1, 3};
+        glGenBuffers(1, &ibo); glBindBuffer(0x8893, ibo); glBufferData(0x8893, sizeof idx, idx, 0x88E4);
+        glClear(0x4000); glUniform4f(uc, 1, 1, 0, 1); glDrawElements(4, 6, 0x1403, 0);
+        CHECK_PIXEL("index buffer draw", 200, 50, 255, 255, 0);
+        // 5: many draws with changing uniforms in one frame
+        glClear(0x4000);
+        for (int i = 0; i < 16; i++) {
+            float x0 = -1 + i * 0.125f, x1 = x0 + 0.125f;
+            float strip[] = {x0, -1, 0, x1, -1, 0, x0, 1, 0, x1, 1, 0};
+            glBufferData(0x8892, sizeof strip, strip, 0x88E8);
+            glUniform4f(uc, i / 15.0f, 0, 1 - i / 15.0f, 1);
+            glDrawArrays(5, 0, 4);
+        }
+        CHECK_PIXEL("16 draws, uniform changes (first)", 4, 128, 0, 0, 255);
+        CHECK_PIXEL("16 draws, uniform changes (last)", 252, 128, 255, 0, 0);
+        glBindBuffer(0x8893, 0);
+        glBufferData(0x8892, sizeof full_quad, full_quad, 0x88E4);
+        // 6: depth test with a depth buffer
+        unsigned dfb, crb, drb;
+        glGenFramebuffers(1, &dfb); glBindFramebuffer(0x8D40, dfb);
+        glGenRenderbuffers(1, &crb); glBindRenderbuffer(0x8D41, crb); glRenderbufferStorage(0x8D41, 0x8058, W, H);
+        glFramebufferRenderbuffer(0x8D40, 0x8CE0, 0x8D41, crb);
+        glGenRenderbuffers(1, &drb); glBindRenderbuffer(0x8D41, drb); glRenderbufferStorage(0x8D41, 0x81A5, W, H);
+        glFramebufferRenderbuffer(0x8D40, 0x8D00, 0x8D41, drb);
+        glEnable(0x0B71); glDepthFunc(0x0201); glClearDepthf(1); glClear(0x4000 | 0x100);
+        float nearq[] = {-1, -1, -0.5f, 1, -1, -0.5f, -1, 1, -0.5f, 1, 1, -0.5f};
+        float farq[] = {-1, -1, 0.5f, 1, -1, 0.5f, -1, 1, 0.5f, 1, 1, 0.5f};
+        glBufferData(0x8892, sizeof nearq, nearq, 0x88E8); glUniform4f(uc, 0, 1, 0, 1); glDrawArrays(5, 0, 4);
+        glBufferData(0x8892, sizeof farq, farq, 0x88E8); glUniform4f(uc, 1, 0, 0, 1); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("depth test (near wins)", 128, 128, 0, 255, 0);
+        glDisable(0x0B71);
+        // 7: render to texture, then sample it
+        unsigned rtex, tfb;
+        glGenTextures(1, &rtex); glBindTexture(0x0DE1, rtex);
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);
+        glTexImage2D(0x0DE1, 0, 0x1908, 64, 64, 0, 0x1908, 0x1401, 0);
+        glGenFramebuffers(1, &tfb); glBindFramebuffer(0x8D40, tfb); glFramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, rtex, 0);
+        glViewport(0, 0, 64, 64); glClearColor(1, 0, 1, 1); glClear(0x4000);
+        glBindFramebuffer(0x8D40, fb); glViewport(0, 0, W, H); glClearColor(0, 0, 0, 1); glClear(0x4000);
+        const char *tvs = "attribute vec3 p; varying vec2 uv; void main() { uv = p.xy * 0.5 + 0.5; gl_Position = vec4(p, 1.0); }";
+        const char *tfs = "precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = texture2D(t, uv); }";
+        unsigned ta = glCreateShader(0x8B31), tb = glCreateShader(0x8B30), tp = glCreateProgram();
+        glShaderSource(ta, 1, &tvs, 0); glCompileShader(ta); glShaderSource(tb, 1, &tfs, 0); glCompileShader(tb);
+        glAttachShader(tp, ta); glAttachShader(tp, tb); glBindAttribLocation(tp, 0, "p"); glLinkProgram(tp);
+        glUseProgram(tp); glBufferData(0x8892, sizeof full_quad, full_quad, 0x88E4); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("render to texture, then sample", 128, 128, 255, 0, 255);
+        // 8: big texture, partial update with glTexSubImage2D
+        static uint8_t big[1024 * 1024 * 4];
+        memset(big, 0x40, sizeof big);
+        unsigned bt; glGenTextures(1, &bt); glBindTexture(0x0DE1, bt);
+        glTexParameteri(0x0DE1, 0x2801, 0x2600); glTexParameteri(0x0DE1, 0x2800, 0x2600);
+        glTexImage2D(0x0DE1, 0, 0x1908, 1024, 1024, 0, 0x1908, 0x1401, big);
+        static uint8_t patch[512 * 512 * 4];
+        for (int i = 0; i < 512 * 512; i++) { patch[i * 4] = 0; patch[i * 4 + 1] = 200; patch[i * 4 + 2] = 255; patch[i * 4 + 3] = 255; }
+        glTexSubImage2D(0x0DE1, 0, 512, 512, 512, 512, 0x1908, 0x1401, patch);
+        glClear(0x4000); glDrawArrays(5, 0, 4);
+        CHECK_PIXEL("1024 texture, updated corner", 200, 200, 0, 200, 255);
+        CHECK_PIXEL("1024 texture, untouched part", 50, 50, 0x40, 0x40, 0x40);
+        printf("%s %d of %d feature checks passed\n", passed == total ? "ok  " : "FAIL", passed, total);
+        green = passed == total ? W * H : 0;
     }
     if (tex) {
         // Texture upload: a 256x256 gradient drawn full-screen, then checked.
