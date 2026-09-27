@@ -1343,6 +1343,16 @@ fn sys_write(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
         return super::alsa::pcm_write(&pcm, p.pml4(), ptr, len, nb);
     }
     let Some(data) = usermem::read_bytes(p.pml4(), ptr, len.min(16 * 1024 * 1024)) else { return -EFAULT };
+    // Firefox GPU mode: Firefox blocks GPU rendering for drivers named
+    // "vmwgfx" (it treats them as unstable virtual-machine drivers). Its
+    // probe (glxtest) reports the name through a pipe; report Mesa's own
+    // name for the same driver instead.
+    if data.starts_with(b"DRI_DRIVER\nvmwgfx\n") && super::drm::firefox_gpu() && exe_name(p).contains("glxtest") {
+        let mut patched = b"DRI_DRIVER\nsvga\n".to_vec();
+        patched.extend_from_slice(&data[b"DRI_DRIVER\nvmwgfx\n".len()..]);
+        let r = write_desc(p, &d, &patched);
+        return if r == patched.len() as i64 { data.len() as i64 } else { r };
+    }
     write_desc(p, &d, &data)
 }
 
