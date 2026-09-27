@@ -188,6 +188,10 @@ struct Surface {
     /// Rectangles changed since the last commit (surface = buffer
     /// coordinates: MayOS uses scale 1).
     damage: Vec<(i32, i32, i32, i32)>,
+    /// set_opaque_region with a non-empty region: alpha in the buffer is
+    /// meaningless (GLFW/Mesa pick ARGB buffers for opaque windows and
+    /// Minecraft leaves alpha at 0, which drew black).
+    opaque: bool,
 }
 
 /// A wl_region: rectangles added (true) or subtracted (false), in order.
@@ -966,8 +970,15 @@ impl State {
                     s.damage.push((x, y, w, h));
                 }
             }
+            4 => {
+                let rid = a.u();
+                let opaque = matches!(self.objs.get(&rid), Some(Obj::Region(v)) if v.iter().any(|r| r.4 && r.2 > 0 && r.3 > 0));
+                if let Some(s) = self.surface(id) {
+                    s.opaque = opaque;
+                }
+            }
             6 => self.commit(id),
-            _ => {} // opaque region, transform, scale
+            _ => {} // transform, scale
         }
     }
 
@@ -1032,6 +1043,15 @@ impl State {
                             }
                         } else {
                             s.image = copy_buffer(&b);
+                        }
+                        if let Some(s) = self.surface(id)
+                            && s.opaque
+                            && !b.opaque
+                            && let Some(img) = s.image.as_mut()
+                        {
+                            for v in Arc::make_mut(&mut img.2).iter_mut() {
+                                *v |= 0xff00_0000;
+                            }
                         }
                         // Pixels are copied: the program may reuse the buffer.
                         self.ev(bid, 0, vec![]);
