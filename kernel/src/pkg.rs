@@ -321,7 +321,7 @@ fn resolve(idx: &Index, names: &[&str], c: &Console) -> Result<Vec<String>, Stri
 /// musl builds of the native libraries Minecraft's LWJGL loads (GLFW on
 /// the Wayland compositor, Mesa OpenGL, OpenAL); gcompat for LWJGL's own
 /// glibc-built core library.
-const MINECRAFT_PKGS: &[&str] = &["openjdk21-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
+const MINECRAFT_PKGS: &[&str] = &["openjdk21-jdk", "glfw", "mesa-gl", "mesa-egl", "mesa-dri-gallium", "openal-soft-libs", "gcompat", "ca-certificates-bundle", "libxkbcommon", "wayland-libs-egl", "wayland-libs-cursor"];
 
 /// `minecraft`: a custom launcher when one is set (`--launcher FILE`,
 /// $MC_LAUNCHER or the path in /etc/minecraft-launcher; a .jar runs with

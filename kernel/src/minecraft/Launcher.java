@@ -16,7 +16,32 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
-    static final HttpClient HTTP = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+    static HttpClient HTTP;
+    static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+
+    // Alpine makes Java's cacerts in a package trigger that MayOS does not
+    // run, so Java would trust nobody: build a trust store from the
+    // system's PEM bundle and use it here and in the game.
+    static Path trustStore(Path mc) throws Exception {
+        Path pem = Paths.get(CA_BUNDLE);
+        if (!Files.exists(pem)) return null;
+        Path store = mc.resolve("cacerts.p12");
+        if (!Files.exists(store) || Files.getLastModifiedTime(store).compareTo(Files.getLastModifiedTime(pem)) < 0) {
+            java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+            ks.load(null, null);
+            int n = 0;
+            try (InputStream in = Files.newInputStream(pem)) {
+                for (java.security.cert.Certificate c : java.security.cert.CertificateFactory.getInstance("X.509").generateCertificates(in))
+                    ks.setCertificateEntry("ca" + n++, c);
+            }
+            Files.createDirectories(mc);
+            try (OutputStream out = Files.newOutputStream(store)) { ks.store(out, "changeit".toCharArray()); }
+        }
+        System.setProperty("javax.net.ssl.trustStore", store.toString());
+        System.setProperty("javax.net.ssl.trustStoreType", "PKCS12");
+        System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+        return store;
+    }
 
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
@@ -29,6 +54,8 @@ public class Launcher {
         Path home = Paths.get(System.getProperty("user.home", "/home"));
         if (!Files.isWritable(home)) home = Paths.get("/home");
         Path mc = home.resolve(".minecraft");
+        Path store = trustStore(mc);
+        HTTP = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
 
         Map<String, Object> manifest = obj(Json.parse(fetchString(MANIFEST)));
         String versionUrl = null;
@@ -120,6 +147,11 @@ public class Launcher {
         String java = ProcessHandle.current().info().command().orElse("java");
         List<String> cmd = new ArrayList<>();
         cmd.add(java);
+        if (store != null) {
+            cmd.add("-Djavax.net.ssl.trustStore=" + store);
+            cmd.add("-Djavax.net.ssl.trustStoreType=PKCS12");
+            cmd.add("-Djavax.net.ssl.trustStorePassword=changeit");
+        }
         cmd.add("-Xmx" + Optional.ofNullable(System.getenv("MC_MEMORY")).orElse("1G"));
         // Use Alpine's (musl) GLFW, OpenAL and Mesa instead of the glibc
         // builds inside Mojang's LWJGL jars.
