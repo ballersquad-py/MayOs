@@ -990,6 +990,21 @@ impl State {
                 Some(bid) => {
                     if let Some(Obj::Buffer(b)) = self.objs.get(&bid) {
                         let b = b.clone();
+                        // Size changes and every 300th frame: size and how much of the
+                        // picture is not black (renderer or compositor at fault?).
+                        let n = FRAMES_LOGGED.load(Ordering::Relaxed);
+                        let size_changed = self.surface(id).is_some_and(|s| s.image.as_ref().is_none_or(|i| i.0 != b.w || i.1 != b.h));
+                        if size_changed || n % 300 == 0 {
+                            let mut lit = 0;
+                            let mut px = [0u8; 4];
+                            for k in 0..64i32 {
+                                let (x, y) = ((k % 8) * b.w / 8 + b.w / 16, (k / 8) * b.h / 8 + b.h / 16);
+                                if b.shm.copy_out(b.off + y as u64 * b.stride as u64 + x as u64 * 4, &mut px) && px[..3] != [0, 0, 0] {
+                                    lit += 1;
+                                }
+                            }
+                            wlog(alloc::format!("pid {}: frame {} on surface {} {}x{} stride {} offset {} ({} of 64 samples not black){}", self.pid, n, id, b.w, b.h, b.stride, b.off, lit, if size_changed { " NEW SIZE" } else { "" }));
+                        }
                         if FRAMES_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
                             let role = self.surface(id).map(|s| match s.role { Role::Toplevel(_) => "window", Role::Sub { .. } => "subsurface", Role::Popup { .. } => "popup", Role::None => "no role" }).unwrap_or("?");
                             wlog(alloc::format!("pid {}: frame on surface {} ({}) {}x{} stride {}{}", self.pid, id, role, b.w, b.h, b.stride, if b.gpu.is_some() { " GPU" } else { "" }));
