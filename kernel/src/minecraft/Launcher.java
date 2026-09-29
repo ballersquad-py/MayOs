@@ -232,7 +232,15 @@ public class Launcher {
                     ? "fancyGraphics:false\nao:0\n"
                     : "graphicsMode:0\nao:false\nsimulationDistance:5\nbiomeBlendRadius:0\nrenderClouds:\"false\"\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n"));
             if (forge) Files.writeString(gameDir.resolve("optionsof.txt"),
-                    "ofFastRender:true\nofFastMath:true\nofSmoothFps:false\nofChunkUpdates:2\nofChunkUpdatesDynamic:true\nofAaLevel:0\nofAfLevel:1\nofClouds:3\nofTrees:1\nofDroppedItems:1\nofRainSplash:false\nofAnimatedWater:1\nofAnimatedLava:1\nofVignette:1\nofSky:true\nofDynamicFov:false\n");
+                    "ofFastRender:false\nofFastMath:true\nofSmoothFps:false\nofChunkUpdates:2\nofChunkUpdatesDynamic:true\nofAaLevel:0\nofAfLevel:1\nofClouds:3\nofTrees:1\nofDroppedItems:1\nofRainSplash:false\nofAnimatedWater:1\nofAnimatedLava:1\nofVignette:1\nofSky:true\nofDynamicFov:false\n");
+        }
+        if (forge && !dry) {
+            // OptiFine's Fast Render leaves the world undrawn on llvmpipe.
+            Path of = gameDir.resolve("optionsof.txt");
+            if (Files.exists(of)) {
+                String t = Files.readString(of);
+                if (t.contains("ofFastRender:true")) Files.writeString(of, t.replace("ofFastRender:true", "ofFastRender:false"));
+            }
         }
         if (forge) {
             // Forge's loading splash draws from a second thread with a shared
