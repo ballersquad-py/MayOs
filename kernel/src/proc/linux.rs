@@ -4388,6 +4388,10 @@ fn proc_file(p: &Process, path: &str) -> Option<Desc> {
     if let Some(data) = super::drm::sys_file(&path) {
         return Some(Desc::Virtual { data, pos: 0 });
     }
+    if path == "/sys/class/graphics/fb0/virtual_size" {
+        let (w, h) = crate::gui::display_mode();
+        return Some(Desc::Virtual { data: alloc::format!("{},{}\n", w, h).into_bytes(), pos: 0 });
+    }
     let l = linux(p)?;
     let name = l.exe.lock().rsplit('/').next().unwrap_or("").chars().take(15).collect::<String>();
     let threads = sched::process_thread_count(p.pid);

@@ -97,6 +97,11 @@ pub struct Window {
     /// GPU frame shown straight from the memory the GPU copied it to (no
     /// copy into `image`): opaque single-surface windows such as games.
     pub direct: Spin<Option<Direct>>,
+    /// Fullscreen asked for by the program (set_fullscreen): 1 on, 2 off,
+    /// 0 nothing new. The desktop window carries it out.
+    pub want_fullscreen: core::sync::atomic::AtomicU8,
+    /// Currently fullscreen (sent in configure states).
+    pub fullscreen: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -266,6 +271,8 @@ enum Obj {
     /// wl_drm: how Mesa hands GPU-drawn buffers to the compositor.
     Drm,
     RelPointerManager,
+    Viewporter,
+    Viewport,
     RelPointer,
     PointerConstraints,
     LockedPointer { surface: u32 },
@@ -335,6 +342,9 @@ const GLOBALS: &[Global] = &[
     // Mouse capture for games (GLFW's disabled cursor).
     Global { name: 11, iface: "zwp_relative_pointer_manager_v1", version: 1 },
     Global { name: 12, iface: "zwp_pointer_constraints_v1", version: 1 },
+    // Accepted, drawn unscaled: Xwayland's -fullscreen needs it and asks
+    // for the output's own size.
+    Global { name: 13, iface: "wp_viewporter", version: 1 },
 ];
 
 /// The window whose program locked the pointer (zwp_locked_pointer_v1):
@@ -491,6 +501,8 @@ fn obj_name(o: &Obj) -> &'static str {
         Obj::Decoration { .. } => "zxdg_toplevel_decoration",
         Obj::Drm => "wl_drm",
         Obj::RelPointerManager => "zwp_relative_pointer_manager",
+        Obj::Viewporter => "wp_viewporter",
+        Obj::Viewport => "wp_viewport",
         Obj::RelPointer => "zwp_relative_pointer",
         Obj::PointerConstraints => "zwp_pointer_constraints",
         Obj::LockedPointer { .. } => "zwp_locked_pointer",
@@ -857,6 +869,13 @@ impl State {
                         *win.min_size.lock() = (w, h);
                     }
                 }
+                // set_maximized / set_fullscreen: the desktop makes the window
+                // fill the screen; unset_* restores it.
+                9 | 11 | 10 | 12 => {
+                    if let Some(win) = self.window_of(surface) {
+                        win.want_fullscreen.store(if op == 9 || op == 11 { 1 } else { 2 }, Ordering::Relaxed);
+                    }
+                }
                 _ => {}
             }
         } else if let Some(Obj::Popup { xdg_surface }) = self.objs.get(&id) {
@@ -902,6 +921,19 @@ impl State {
             }
         } else if is!(Obj::DataDevice) {
             if op == 2 {
+                self.destroy(id);
+            }
+        } else if is!(Obj::Viewporter) {
+            match op {
+                0 => self.destroy(id),
+                1 => {
+                    let new = a.u();
+                    self.new_obj(new, Obj::Viewport, 1);
+                }
+                _ => {}
+            }
+        } else if is!(Obj::Viewport) {
+            if op == 0 {
                 self.destroy(id);
             }
         } else if is!(Obj::RelPointerManager) {
@@ -986,6 +1018,7 @@ impl State {
             "zxdg_decoration_manager_v1" => Obj::DecorationManager,
             "wl_drm" => Obj::Drm,
             "zwp_relative_pointer_manager_v1" => Obj::RelPointerManager,
+            "wp_viewporter" => Obj::Viewporter,
             "zwp_pointer_constraints_v1" => Obj::PointerConstraints,
             _ => Obj::Other,
         };
@@ -1246,6 +1279,8 @@ impl State {
             opened: AtomicBool::new(false),
             pid: c.pid,
             direct: Spin::new(None),
+            want_fullscreen: core::sync::atomic::AtomicU8::new(0),
+            fullscreen: AtomicBool::new(false),
         });
         if let Some(s) = self.surface(surface) {
             s.role = Role::Toplevel(w);
@@ -1369,7 +1404,10 @@ impl State {
             })
         });
         if let (Some(x), Some(t)) = (xdg, top) {
-            let states: Vec<u8> = if activated { 4u32.to_le_bytes().to_vec() } else { Vec::new() };
+            let mut states: Vec<u8> = if activated { 4u32.to_le_bytes().to_vec() } else { Vec::new() };
+            if self.window_of(surface).is_some_and(|w| w.fullscreen.load(Ordering::Relaxed)) {
+                states.extend_from_slice(&2u32.to_le_bytes());
+            }
             self.ev(t, 0, vec![A::I(w), A::I(h), A::Arr(&states)]);
             let serial = self.next_serial();
             self.ev(x, 0, vec![A::U(serial)]);

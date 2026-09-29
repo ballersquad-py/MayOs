@@ -1,7 +1,7 @@
 // MayOS's Minecraft launcher: downloads Minecraft: Java Edition from
 // Mojang's servers and starts it in offline mode (singleplayer).
 //
-//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla | --forge | --ornithe] [--software] [--size WxH] [--dry-run] [--debug]
+//   minecraft [version] [--user NAME] [--memory 4G] [--mods | --vanilla | --forge | --ornithe] [--software] [--size WxH] [--fullscreen] [--dry-run] [--debug]
 //
 // Needs only a JDK (runs as a single source file). Files go to
 // $HOME/.minecraft, like the official launcher.
@@ -15,7 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
-    static final String BUILD = "2026-09-27d";
+    static final String BUILD = "2026-09-29";
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static HttpClient HTTP;
     static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
@@ -70,6 +70,7 @@ public class Launcher {
             else if (args[i].equals("--software")) software = true;
             else if (args[i].equals("--gpu")) forceGpu = true;
             else if (args[i].equals("--size") && i + 1 < args.length) x11Size = args[++i];
+            else if (args[i].equals("--fullscreen")) x11Fullscreen = true;
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -229,7 +230,7 @@ public class Launcher {
             Files.createDirectories(gameDir);
             String common = "renderDistance:6\nparticles:2\nmaxFps:260\nenableVsync:false\nentityShadows:false\nrenderClouds:false\nmipmapLevels:0\n";
             Files.writeString(opts, common + (legacy || forge
-                    ? "fancyGraphics:false\nao:0\n"
+                    ? "fancyGraphics:false\nao:0\npauseOnLostFocus:false\n"
                     : "graphicsMode:0\nao:false\nsimulationDistance:5\nbiomeBlendRadius:0\nrenderClouds:\"false\"\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n"));
             if (forge) Files.writeString(gameDir.resolve("optionsof.txt"),
                     "ofFastRender:false\nofFastMath:true\nofSmoothFps:false\nofChunkUpdates:2\nofChunkUpdatesDynamic:true\nofAaLevel:0\nofAfLevel:1\nofClouds:3\nofTrees:1\nofDroppedItems:1\nofRainSplash:false\nofAnimatedWater:1\nofAnimatedLava:1\nofVignette:1\nofSky:true\nofDynamicFov:false\n");
@@ -240,6 +241,14 @@ public class Launcher {
             if (Files.exists(of)) {
                 String t = Files.readString(of);
                 if (t.contains("ofFastRender:true")) Files.writeString(of, t.replace("ofFastRender:true", "ofFastRender:false"));
+            }
+            // X11 focus comes and goes without a window manager; losing it
+            // would reopen the pause menu at once.
+            Path op = gameDir.resolve("options.txt");
+            if (Files.exists(op)) {
+                String t = Files.readString(op);
+                if (!t.contains("pauseOnLostFocus:false"))
+                    Files.writeString(op, t.replace("pauseOnLostFocus:true\n", "") + (t.endsWith("\n") || t.isEmpty() ? "" : "\n") + "pauseOnLostFocus:false\n");
             }
         }
         if (forge) {
@@ -437,8 +446,18 @@ public class Launcher {
     }
 
     static String x11Size = null;
+    static boolean x11Fullscreen = false;
 
     static String x11Geometry() {
+        if (x11Fullscreen && x11Size == null) {
+            // The display's size (MayOS: /sys/class/graphics/fb0/virtual_size = "W,H").
+            try {
+                String[] wh = Files.readString(Paths.get("/sys/class/graphics/fb0/virtual_size")).trim().split(",");
+                return Integer.parseInt(wh[0]) + "x" + Integer.parseInt(wh[1]);
+            } catch (Exception e) {
+                // fall through
+            }
+        }
         String g = x11Size != null ? x11Size : Optional.ofNullable(System.getenv("MC_X11_SIZE")).orElse("1280x720");
         return g.matches("\\d+x\\d+") ? g : "1280x720";
     }
@@ -450,7 +469,9 @@ public class Launcher {
         int d = 7;
         while (Files.exists(Paths.get("/tmp/.X11-unix/X" + d))) d++;
         String geometry = x11Geometry();
-        ProcessBuilder xb = new ProcessBuilder("Xwayland", ":" + d, "-geometry", geometry, "-shm", "-ac", "-noreset", "-nolisten", "tcp").inheritIO();
+        ProcessBuilder xb = new ProcessBuilder(x11Fullscreen
+                ? List.of("Xwayland", ":" + d, "-fullscreen", "-geometry", geometry, "-shm", "-ac", "-noreset", "-nolisten", "tcp")
+                : List.of("Xwayland", ":" + d, "-geometry", geometry, "-shm", "-ac", "-noreset", "-nolisten", "tcp")).inheritIO();
         xb.environment().putAll(game.environment());
         Process x = xb.start();
         Path sock = Paths.get("/tmp/.X11-unix/X" + d);

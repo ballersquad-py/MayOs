@@ -132,6 +132,17 @@ impl App for WaylandWindow {
             self.configured = self.size;
             self.win.resize(self.size.0, self.size.1, self.focused);
         }
+        match self.win.want_fullscreen.swap(0, Ordering::Relaxed) {
+            1 => {
+                self.win.fullscreen.store(true, Ordering::Relaxed);
+                ctx.set_fullscreen(true);
+            }
+            2 => {
+                self.win.fullscreen.store(false, Ordering::Relaxed);
+                ctx.set_fullscreen(false);
+            }
+            _ => {}
+        }
         let v = self.win.version.load(Ordering::Relaxed);
         if v != self.shown {
             self.shown = v;
