@@ -29,6 +29,7 @@ pub struct Nic {
 enum NicDev {
     E1000(E1000),
     Rtl(Rtl8169),
+    Usb(alloc::sync::Arc<crate::drivers::usbnet::UsbNet>),
 }
 
 impl From<E1000> for Nic {
@@ -48,24 +49,28 @@ impl Nic {
         match &self.dev {
             NicDev::E1000(n) => n.link_up(),
             NicDev::Rtl(n) => n.link_up(),
+            NicDev::Usb(n) => n.link_up(),
         }
     }
     pub fn speed_mbps(&self) -> u32 {
         match &self.dev {
             NicDev::E1000(n) => n.speed_mbps(),
             NicDev::Rtl(n) => n.speed_mbps(),
+            NicDev::Usb(_) => 480,
         }
     }
     fn send(&mut self, f: &[u8]) -> bool {
         match &mut self.dev {
             NicDev::E1000(n) => n.send(f),
             NicDev::Rtl(n) => n.send(f),
+            NicDev::Usb(n) => n.send(f),
         }
     }
     fn recv(&mut self) -> Option<Vec<u8>> {
         match &mut self.dev {
             NicDev::E1000(n) => n.recv(),
             NicDev::Rtl(n) => n.recv(),
+            NicDev::Usb(n) => n.recv(),
         }
     }
 }
@@ -133,6 +138,35 @@ static NEXT_PORT: Spin<u16> = Spin::new(49152);
 
 const ARP_TTL_MS: u64 = 5 * 60 * 1000;
 
+/// The wired card put aside while a phone or USB adapter is in use.
+static PARKED: Spin<Option<Nic>> = Spin::new(None);
+
+impl Nic {
+    fn gone(&self) -> bool {
+        matches!(&self.dev, NicDev::Usb(n) if n.gone.load(core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A phone (USB tethering) or USB network adapter was plugged in: use it
+/// (a wired card without a cable is put aside until it is unplugged).
+pub fn add_usb(n: alloc::sync::Arc<crate::drivers::usbnet::UsbNet>) {
+    let nic = Nic { mac: n.mac, model: n.model, dev: NicDev::Usb(n) };
+    let mut g = IFACE.lock();
+    match g.as_mut() {
+        None => {
+            drop(g);
+            init(nic);
+        }
+        Some(i) => {
+            let old = core::mem::replace(&mut i.nic, nic);
+            if !matches!(old.dev, NicDev::Usb(_)) {
+                *PARKED.lock() = Some(old);
+            }
+            i.new_link();
+        }
+    }
+}
+
 pub fn is_present() -> bool {
     IFACE.lock().is_some()
 }
@@ -171,6 +205,12 @@ extern "C" fn net_thread(_: usize) {
         {
             let mut g = IFACE.lock();
             if let Some(i) = g.as_mut() {
+                if i.nic.gone()
+                    && let Some(wired) = PARKED.lock().take()
+                {
+                    i.nic = wired;
+                    i.new_link();
+                }
                 i.poll();
                 i.dhcp_tick();
                 i.retry_pending();
@@ -383,6 +423,16 @@ impl Iface {
             DhcpState::Bound if now >= self.dhcp_renew_at => self.restart_dhcp(),
             _ => {}
         }
+    }
+
+    /// Another network card took over: start over on it.
+    fn new_link(&mut self) {
+        self.ip = Ipv4::UNSPECIFIED;
+        self.gateway = Ipv4::UNSPECIFIED;
+        self.arp.clear();
+        self.arp_asked.clear();
+        self.pending.clear();
+        self.restart_dhcp();
     }
 
     fn restart_dhcp(&mut self) {

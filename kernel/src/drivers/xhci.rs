@@ -11,10 +11,13 @@
 //! "nousb" on the kernel command line leaves the controller to the
 //! firmware (its PS/2 emulation keeps the keyboard working).
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use super::pci::PciDevice;
+use super::usbnet::{self, Proto, UsbNet};
+use net::Mac;
 use crate::input::{self, InputEvent};
 use crate::mem::{paging, DmaBuf};
 use crate::time::uptime_ms;
@@ -134,6 +137,120 @@ struct Device {
     /// Output device context (kept alive for the controller).
     _out: DmaBuf,
     hids: Vec<Hid>,
+    net: Option<NetDev>,
+}
+
+/// A USB network function (phone tethering).
+struct NetDev {
+    proto: Proto,
+    usb: Arc<UsbNet>,
+    in_dci: u8,
+    out_dci: u8,
+    in_ring: Ring,
+    out_ring: Ring,
+    in_bufs: Vec<DmaBuf>,
+    in_next: usize,
+    in_len: usize,
+    out_bufs: Vec<DmaBuf>,
+    out_next: usize,
+    inflight: usize,
+    seq: u16,
+    carrier_at: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Ep {
+    addr: u8,
+    attr: u8,
+    mps: u16,
+    interval: u8,
+}
+
+struct Iface {
+    num: u8,
+    alt: u8,
+    class: u8,
+    sub: u8,
+    proto: u8,
+    eps: Vec<Ep>,
+    /// iMACAddress from a CDC Ethernet functional descriptor.
+    mac_string: u8,
+}
+
+fn parse_config(cfg: &[u8]) -> Vec<Iface> {
+    let mut out: Vec<Iface> = Vec::new();
+    let mut i = 0;
+    while i + 2 <= cfg.len() {
+        let len = cfg[i] as usize;
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
+        let d = &cfg[i..i + len];
+        match d[1] {
+            4 if len >= 9 => out.push(Iface { num: d[2], alt: d[3], class: d[5], sub: d[6], proto: d[7], eps: Vec::new(), mac_string: 0 }),
+            5 if len >= 7 => {
+                if let Some(f) = out.last_mut() {
+                    f.eps.push(Ep { addr: d[2], attr: d[3], mps: u16::from_le_bytes([d[4], d[5]]) & 0x7ff, interval: d[6] });
+                }
+            }
+            0x24 if len >= 4 && d[2] == 0x0f => {
+                if let Some(f) = out.last_mut() {
+                    f.mac_string = d[3];
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    out
+}
+
+struct NetPlan {
+    proto: Proto,
+    ctrl_if: u8,
+    data_if: u8,
+    alt: u8,
+    bulk_in: Ep,
+    bulk_out: Ep,
+    mac_string: u8,
+}
+
+fn bulk(f: &Iface) -> Option<(Ep, Ep)> {
+    let i = f.eps.iter().find(|e| e.attr & 3 == 2 && e.addr & 0x80 != 0)?;
+    let o = f.eps.iter().find(|e| e.attr & 3 == 2 && e.addr & 0x80 == 0)?;
+    Some((*i, *o))
+}
+
+/// The best network function among the interfaces of one configuration.
+fn find_net(ifaces: &[Iface]) -> Option<NetPlan> {
+    // iPhone: vendor interface 255/253/1 (any alternate setting with bulk).
+    for f in ifaces {
+        if (f.class, f.sub, f.proto) == (0xff, 0xfd, 1)
+            && let Some((i, o)) = bulk(f)
+        {
+            return Some(NetPlan { proto: Proto::Ipheth, ctrl_if: f.num, data_if: f.num, alt: f.alt, bulk_in: i, bulk_out: o, mac_string: 0 });
+        }
+    }
+    // CDC NCM / ECM / RNDIS: a control interface and the data interface after it.
+    for (kind, test) in [
+        (Proto::Ncm, (|f: &Iface| (f.class, f.sub) == (2, 0x0d)) as fn(&Iface) -> bool),
+        (Proto::Ecm, |f: &Iface| (f.class, f.sub) == (2, 6)),
+        (Proto::Rndis, |f: &Iface| matches!((f.class, f.sub, f.proto), (0xe0, 1, 3) | (2, 2, 0xff) | (0xef, 4, 1))),
+    ] {
+        for (k, c) in ifaces.iter().enumerate() {
+            if !test(c) {
+                continue;
+            }
+            for d in &ifaces[k + 1..] {
+                if d.class == 0x0a
+                    && let Some((i, o)) = bulk(d)
+                {
+                    return Some(NetPlan { proto: kind, ctrl_if: c.num, data_if: d.num, alt: d.alt, bulk_in: i, bulk_out: o, mac_string: c.mac_string });
+                }
+            }
+        }
+    }
+    None
 }
 
 pub struct Xhci {
@@ -362,7 +479,7 @@ impl Xhci {
         let speed = (v >> 10) & 0xf;
         let Some(ev) = self.command(Trb { param: 0, status: 0, control: TRB_ENABLE_SLOT << 10 }) else { return };
         let slot = (ev.control >> 24) as u8;
-        let (Some(out), Some(mut inctx), Some(ep0)) = (DmaBuf::try_new(4096), DmaBuf::try_new(4096), Ring::new()) else { return };
+        let (Some(out), Some(inctx), Some(ep0)) = (DmaBuf::try_new(4096), DmaBuf::try_new(4096), Ring::new()) else { return };
         self.dcbaa.as_mut_slice()[slot as usize * 8..slot as usize * 8 + 8].copy_from_slice(&out.phys.to_le_bytes());
         let mps: u32 = match speed {
             1 | 2 => 8,
@@ -383,7 +500,7 @@ impl Xhci {
             let _ = self.command(Trb { param: 0, status: 0, control: TRB_DISABLE_SLOT << 10 | (slot as u32) << 24 });
             return;
         }
-        self.devices.push(Device { slot, port, ep0, _out: out, hids: Vec::new() });
+        self.devices.push(Device { slot, port, ep0, _out: out, hids: Vec::new(), net: None });
         let dev = self.devices.len() - 1;
         let Some(mut buf) = DmaBuf::try_new(4096) else { return };
         if !self.control(dev, 0x80, 6, 0x0100, 0, Some((&mut buf, 18))) {
@@ -392,95 +509,77 @@ impl Xhci {
         }
         let d = buf.as_slice();
         let (class, vid, pid) = (d[4], u16::from_le_bytes([d[8], d[9]]), u16::from_le_bytes([d[10], d[11]]));
-        if !self.control(dev, 0x80, 6, 0x0200, 0, Some((&mut buf, 9))) {
-            return;
-        }
-        let total = (u16::from_le_bytes([buf.as_slice()[2], buf.as_slice()[3]]) as usize).min(4096);
-        if !self.control(dev, 0x80, 6, 0x0200, 0, Some((&mut buf, total))) {
-            return;
-        }
-        let cfg = buf.as_slice()[..total].to_vec();
-        let config_value = cfg[5];
+        let nconf = d[17].max(1);
         crate::kprintln!("usb: port {} device {:04x}:{:04x} class {:#x} ({})", port, vid, pid, class, speed_name(speed));
         if class == 9 {
             crate::kprintln!("usb: hubs are not supported yet: plug devices straight into the PC");
             return;
         }
-        // Boot keyboards and mice.
-        let mut found: Vec<(Kind, u8, u8, u16, u8)> = Vec::new(); // kind, interface, endpoint, max packet, interval
-        let mut i = 0;
-        let mut iface: Option<(u8, Option<Kind>)> = None;
-        while i + 2 <= cfg.len() {
-            let len = cfg[i] as usize;
-            if len < 2 || i + len > cfg.len() {
+        // Every configuration: phones put tethering in a later one.
+        let mut configs: Vec<Vec<u8>> = Vec::new();
+        for ci in 0..nconf.min(8) {
+            if !self.control(dev, 0x80, 6, 0x0200 | ci as u16, 0, Some((&mut buf, 9))) {
                 break;
             }
-            match cfg[i + 1] {
-                4 if len >= 9 => {
-                    let kind = match (cfg[i + 5], cfg[i + 6], cfg[i + 7]) {
-                        (3, 1, 1) => Some(Kind::Keyboard),
-                        (3, 1, 2) => Some(Kind::Mouse),
-                        _ => None,
-                    };
-                    iface = Some((cfg[i + 2], kind));
-                }
-                5 if len >= 7 => {
-                    if let Some((n, Some(kind))) = iface
-                        && cfg[i + 2] & 0x80 != 0
-                        && cfg[i + 3] & 3 == 3
-                    {
-                        found.push((kind, n, cfg[i + 2] & 0xf, u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]) & 0x7ff, cfg[i + 6]));
-                        iface = Some((n, None));
-                    }
-                }
-                _ => {}
+            let total = (u16::from_le_bytes([buf.as_slice()[2], buf.as_slice()[3]]) as usize).clamp(9, 4096);
+            if !self.control(dev, 0x80, 6, 0x0200 | ci as u16, 0, Some((&mut buf, total))) {
+                break;
             }
-            i += len;
+            configs.push(buf.as_slice()[..total].to_vec());
+        }
+        if configs.is_empty() {
+            return;
+        }
+        let parsed: Vec<Vec<Iface>> = configs.iter().map(|c| parse_config(c)).collect();
+        // A network function (phone tethering) in any configuration.
+        for (ci, ifaces) in parsed.iter().enumerate() {
+            if let Some(plan) = find_net(ifaces) {
+                let value = configs[ci][5];
+                if !self.control(dev, 0x00, 9, value as u16, 0, None) {
+                    return;
+                }
+                self.setup_net(dev, speed, plan, vid, pid);
+                return;
+            }
+        }
+        // Keyboards and mice in the first configuration.
+        let mut found: Vec<(Kind, u8, Ep)> = Vec::new();
+        for i in &parsed[0] {
+            let kind = match (i.class, i.sub, i.proto) {
+                (3, 1, 1) => Kind::Keyboard,
+                (3, 1, 2) => Kind::Mouse,
+                _ => continue,
+            };
+            if let Some(ep) = i.eps.iter().find(|e| e.addr & 0x80 != 0 && e.attr & 3 == 3) {
+                found.push((kind, i.num, *ep));
+            }
         }
         if found.is_empty() {
             return;
         }
-        if !self.control(dev, 0x00, 9, config_value as u16, 0, None) {
+        if !self.control(dev, 0x00, 9, configs[0][5] as u16, 0, None) {
             return;
         }
-        for (kind, ifn, ep, mps, interval) in found {
+        for (kind, ifn, ep) in found {
             // Boot protocol, and keyboards only report changes.
             self.control(dev, 0x21, 0x0b, 0, ifn as u16, None);
             if kind == Kind::Keyboard {
                 self.control(dev, 0x21, 0x0a, 0, ifn as u16, None);
             }
-            let dci = ep * 2 + 1;
-            let (Some(ring), Some(buf), Some(inctx2)) = (Ring::new(), DmaBuf::try_new(64), DmaBuf::try_new(4096)) else { return };
-            inctx = inctx2;
+            let dci = (ep.addr & 0xf) * 2 + 1;
+            let (Some(ring), Some(buf)) = (Ring::new(), DmaBuf::try_new(64)) else { return };
             // Interval: exponent of 125 us units.
             let exp = if speed >= 3 {
-                (interval.clamp(1, 16) - 1) as u32
+                (ep.interval.clamp(1, 16) - 1) as u32
             } else {
-                let frames = (interval.max(1) as u32) * 8;
+                let frames = (ep.interval.max(1) as u32) * 8;
                 31 - frames.leading_zeros()
             };
-            unsafe {
-                write_volatile((self.ctx(&inctx, 0) + 4) as *mut u32, 1 | 1 << dci);
-                // Slot context: copy the current one with more entries.
-                let src = self.devices[dev]._out.virt() as usize;
-                let sl = self.ctx(&inctx, 1);
-                for k in 0..4 {
-                    write_volatile((sl + k * 4) as *mut u32, read_volatile((src + k * 4) as *const u32));
-                }
-                let d0 = read_volatile(sl as *const u32);
-                let entries = ((d0 >> 27) & 0x1f).max(dci as u32);
-                write_volatile(sl as *mut u32, (d0 & !(0x1f << 27)) | entries << 27);
-                let e = self.ctx(&inctx, dci as usize + 1);
-                write_volatile(e as *mut u32, exp << 16);
-                write_volatile((e + 4) as *mut u32, 3 << 1 | 7 << 3 | (mps as u32) << 16);
-                write_volatile((e + 8) as *mut u64, ring.phys() | 1);
-                write_volatile((e + 16) as *mut u32, mps as u32 | (mps as u32) << 16);
-            }
-            if self.command(Trb { param: inctx.phys, status: 0, control: TRB_CONFIGURE_EP << 10 | (slot as u32) << 24 }).is_none() {
+            if !self.configure_ep(dev, dci, 7, ep.mps, exp, &ring) {
                 crate::kprintln!("usb: port {}: configuring the endpoint failed", port);
                 continue;
             }
-            let len = (mps as usize).min(64);
+            let len = (ep.mps as usize).min(64);
             let mut h = Hid { kind, dci, ring, buf, len, last: [0; 8], buttons: 0 };
             h.ring.push(Trb { param: h.buf.phys, status: len as u32, control: TRB_NORMAL << 10 | 1 << 5 | 1 << 2 });
             w32(self.db + slot as usize * 4, dci as u32);
@@ -489,9 +588,137 @@ impl Xhci {
         }
     }
 
+    /// Add one endpoint to the device (Configure Endpoint command).
+    /// Types: 2 bulk OUT, 6 bulk IN, 7 interrupt IN.
+    fn configure_ep(&mut self, dev: usize, dci: u8, ep_type: u32, mps: u16, interval_exp: u32, ring: &Ring) -> bool {
+        let Some(inctx) = DmaBuf::try_new(4096) else { return false };
+        let slot = self.devices[dev].slot;
+        unsafe {
+            write_volatile((self.ctx(&inctx, 0) + 4) as *mut u32, 1 | 1 << dci);
+            // Slot context: the current one with enough entries.
+            let src = self.devices[dev]._out.virt() as usize;
+            let sl = self.ctx(&inctx, 1);
+            for k in 0..4 {
+                write_volatile((sl + k * 4) as *mut u32, read_volatile((src + k * 4) as *const u32));
+            }
+            let d0 = read_volatile(sl as *const u32);
+            let entries = ((d0 >> 27) & 0x1f).max(dci as u32);
+            write_volatile(sl as *mut u32, (d0 & !(0x1f << 27)) | entries << 27);
+            let e = self.ctx(&inctx, dci as usize + 1);
+            write_volatile(e as *mut u32, interval_exp << 16);
+            write_volatile((e + 4) as *mut u32, 3 << 1 | ep_type << 3 | (mps as u32) << 16);
+            write_volatile((e + 8) as *mut u64, ring.phys() | 1);
+            let avg = if ep_type == 7 { mps as u32 | (mps as u32) << 16 } else { 1024 };
+            write_volatile((e + 16) as *mut u32, avg);
+        }
+        self.command(Trb { param: inctx.phys, status: 0, control: TRB_CONFIGURE_EP << 10 | (slot as u32) << 24 }).is_some()
+    }
+
+    fn setup_net(&mut self, dev: usize, speed: u32, plan: NetPlan, vid: u16, pid: u16) {
+        let port = self.devices[dev].port;
+        let slot = self.devices[dev].slot;
+        let Some(mut buf) = DmaBuf::try_new(4096) else { return };
+        if plan.alt != 0 || plan.proto == Proto::Ipheth {
+            self.control(dev, 0x01, 0x0b, plan.alt as u16, plan.data_if as u16, None);
+        }
+        let (Some(in_ring), Some(out_ring)) = (Ring::new(), Ring::new()) else { return };
+        let (in_dci, out_dci) = ((plan.bulk_in.addr & 0xf) * 2 + 1, (plan.bulk_out.addr & 0xf) * 2);
+        let _ = speed;
+        if !self.configure_ep(dev, in_dci, 6, plan.bulk_in.mps, 0, &in_ring) || !self.configure_ep(dev, out_dci, 2, plan.bulk_out.mps, 0, &out_ring) {
+            crate::kprintln!("usb: port {}: network endpoints failed", port);
+            return;
+        }
+        // The adapter's MAC address.
+        let mut mac = None;
+        let ctrl = plan.ctrl_if as u16;
+        match plan.proto {
+            Proto::Ipheth => {
+                if self.control(dev, 0xc0, 0x00, 0, 2, Some((&mut buf, 6))) {
+                    mac = Some(Mac(buf.as_slice()[..6].try_into().unwrap()));
+                }
+            }
+            Proto::Rndis => {
+                let mut id = 1;
+                let ask = |me: &mut Self, msg: Vec<u8>, buf: &mut DmaBuf| -> Option<Vec<u8>> {
+                    buf.as_mut_slice()[..msg.len()].copy_from_slice(&msg);
+                    if !me.control(dev, 0x21, 0x00, 0, ctrl, Some((buf, msg.len()))) {
+                        return None;
+                    }
+                    for _ in 0..50 {
+                        buf.as_mut_slice()[..8].fill(0);
+                        if me.control(dev, 0xa1, 0x01, 0, ctrl, Some((buf, 1024))) && buf.as_slice()[0..4] != [0, 0, 0, 0] {
+                            return Some(buf.as_slice()[..1024].to_vec());
+                        }
+                        crate::proc::sched::sleep_ms(10);
+                    }
+                    None
+                };
+                if ask(self, usbnet::rndis_msg(usbnet::RNDIS_INIT, id, 0, None), &mut buf).is_none() {
+                    crate::kprintln!("usb: port {}: RNDIS did not start", port);
+                    return;
+                }
+                id += 1;
+                if let Some(r) = ask(self, usbnet::rndis_msg(usbnet::RNDIS_QUERY, id, usbnet::OID_PERMANENT_ADDRESS, None), &mut buf)
+                    && let Some(m) = usbnet::rndis_query_result(&r)
+                    && m.len() >= 6
+                {
+                    mac = Some(Mac(m[..6].try_into().unwrap()));
+                }
+                id += 1;
+                ask(self, usbnet::rndis_msg(usbnet::RNDIS_SET, id, usbnet::OID_PACKET_FILTER, Some(0x0000_000f)), &mut buf);
+            }
+            Proto::Ecm | Proto::Ncm => {
+                if plan.mac_string != 0 && self.control(dev, 0x80, 6, 0x0300 | plan.mac_string as u16, 0x0409, Some((&mut buf, 64))) {
+                    let n = (buf.as_slice()[0] as usize).min(64);
+                    mac = usbnet::mac_from_string(&buf.as_slice()[..n]);
+                }
+                // Directed, broadcast and multicast frames.
+                self.control(dev, 0x21, 0x43, 0x0e, ctrl, None);
+            }
+        }
+        let mac = mac.unwrap_or_else(|| usbnet::local_mac(pid ^ vid));
+        let model = match plan.proto {
+            Proto::Ipheth => "iPhone (USB tethering)",
+            Proto::Rndis => "Android phone (USB tethering)",
+            Proto::Ncm => "USB tethering (NCM)",
+            Proto::Ecm => "USB Ethernet",
+        };
+        let big = matches!(plan.proto, Proto::Rndis | Proto::Ncm);
+        let in_len = if big { 16384 } else { 2048 };
+        let mut n = NetDev {
+            proto: plan.proto,
+            usb: Arc::new(UsbNet::new(mac, model)),
+            in_dci,
+            out_dci,
+            in_ring,
+            out_ring,
+            in_bufs: Vec::new(),
+            in_next: 0,
+            in_len,
+            out_bufs: Vec::new(),
+            out_next: 0,
+            inflight: 0,
+            seq: 0,
+            carrier_at: 0,
+        };
+        for _ in 0..8 {
+            let (Some(b), Some(o)) = (DmaBuf::try_new(in_len), DmaBuf::try_new(16384)) else { return };
+            n.in_ring.push(Trb { param: b.phys, status: in_len as u32, control: TRB_NORMAL << 10 | 1 << 5 | 1 << 2 });
+            n.in_bufs.push(b);
+            n.out_bufs.push(o);
+        }
+        w32(self.db + slot as usize * 4, in_dci as u32);
+        crate::kprintln!("usb: port {}: {} mac {}", port, model, mac);
+        crate::network::add_usb(n.usb.clone());
+        self.devices[dev].net = Some(n);
+    }
+
     fn detach(&mut self, port: u8) {
         if let Some(i) = self.devices.iter().position(|d| d.port == port) {
             let d = self.devices.remove(i);
+            if let Some(n) = &d.net {
+                n.usb.gone.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
             let _ = self.command(Trb { param: 0, status: 0, control: TRB_DISABLE_SLOT << 10 | (d.slot as u32) << 24 });
             self.dcbaa.as_mut_slice()[d.slot as usize * 8..d.slot as usize * 8 + 8].fill(0);
             crate::kprintln!("usb: port {} unplugged", port);
@@ -506,6 +733,28 @@ impl Xhci {
                 let code = t.status >> 24;
                 let db = self.db;
                 let Some(d) = self.devices.iter_mut().find(|d| d.slot == slot) else { return };
+                if let Some(n) = d.net.as_mut() {
+                    if dci == n.in_dci {
+                        let i = n.in_next;
+                        n.in_next = (n.in_next + 1) % n.in_bufs.len();
+                        if matches!(code, 1 | 13) {
+                            let got = n.in_len.saturating_sub((t.status & 0xff_ffff) as usize);
+                            let mut frames = Vec::new();
+                            usbnet::unwrap(n.proto, &n.in_bufs[i].as_slice()[..got], &mut frames);
+                            for f in frames {
+                                n.usb.deliver(f);
+                            }
+                        }
+                        let phys = n.in_bufs[i].phys;
+                        n.in_ring.push(Trb { param: phys, status: n.in_len as u32, control: TRB_NORMAL << 10 | 1 << 5 | 1 << 2 });
+                        w32(db + slot as usize * 4, n.in_dci as u32);
+                        return;
+                    }
+                    if dci == n.out_dci {
+                        n.inflight = n.inflight.saturating_sub(1);
+                        return;
+                    }
+                }
                 let Some(h) = d.hids.iter_mut().find(|h| h.dci == dci) else { return };
                 if matches!(code, 1 | 13) {
                     let got = h.len - (t.status & 0xff_ffff) as usize;
@@ -549,6 +798,41 @@ impl Xhci {
         }
         while let Some(t) = self.next_event() {
             self.handle(t);
+        }
+        let db = self.db;
+        let mut carrier: Vec<usize> = Vec::new();
+        let now = uptime_ms();
+        for (k, d) in self.devices.iter_mut().enumerate() {
+            let slot = d.slot;
+            let Some(n) = d.net.as_mut() else { continue };
+            let mut sent = false;
+            while n.inflight < n.out_bufs.len() {
+                let Some(frame) = n.usb.tx.lock().pop_front() else { break };
+                let data = usbnet::wrap(n.proto, &frame, &mut n.seq);
+                let b = &mut n.out_bufs[n.out_next];
+                let len = data.len().min(b.len());
+                b.as_mut_slice()[..len].copy_from_slice(&data[..len]);
+                let phys = b.phys;
+                n.out_next = (n.out_next + 1) % n.out_bufs.len();
+                n.out_ring.push(Trb { param: phys, status: len as u32, control: TRB_NORMAL << 10 | 1 << 5 });
+                n.inflight += 1;
+                sent = true;
+            }
+            if sent {
+                w32(db + slot as usize * 4, n.out_dci as u32);
+            }
+            if n.proto == Proto::Ipheth && now - n.carrier_at > 1000 {
+                n.carrier_at = now;
+                carrier.push(k);
+            }
+        }
+        // iPhone: is Personal Hotspot on?
+        for k in carrier {
+            let Some(mut b) = DmaBuf::try_new(64) else { break };
+            let on = self.control(k, 0xc0, 0x45, 0, 2, Some((&mut b, 1))) && b.as_slice()[0] == 4;
+            if let Some(n) = self.devices[k].net.as_ref() {
+                n.usb.link.store(on, core::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
