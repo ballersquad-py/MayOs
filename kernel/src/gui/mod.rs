@@ -4,6 +4,7 @@
 //! compositor once IPC and shared memory exist (Phase 2).
 
 pub mod about;
+pub mod detached;
 pub mod taskmgr;
 pub mod icons;
 pub mod mclauncher;

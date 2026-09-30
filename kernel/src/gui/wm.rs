@@ -211,6 +211,80 @@ enum Launch {
     Cmd(&'static str, &'static str),
 }
 
+/// A Linux app installed with pkg (from its .desktop file).
+#[derive(Clone)]
+struct DesktopApp {
+    name: String,
+    exec: String,
+    icon: String,
+    terminal: bool,
+}
+
+/// Where the icon named in a .desktop file lives.
+fn find_icon(name: &str) -> String {
+    if name.starts_with('/') {
+        return String::from(name);
+    }
+    for size in ["64x64", "48x48", "128x128", "96x96", "256x256", "32x32"] {
+        let p = format!("/usr/share/icons/hicolor/{}/apps/{}.png", size, name);
+        if crate::fs::exists(&p) {
+            return p;
+        }
+    }
+    let p = format!("/usr/share/pixmaps/{}.png", name);
+    if crate::fs::exists(&p) {
+        return p;
+    }
+    String::new()
+}
+
+/// Apps in /usr/share/applications (and the user's own), sorted by name.
+fn scan_desktop_apps() -> Vec<DesktopApp> {
+    let mut out: Vec<DesktopApp> = Vec::new();
+    for dir in ["/usr/share/applications", "/usr/local/share/applications", "/home/.local/share/applications"] {
+        let Ok(list) = crate::fs::read_dir(dir) else { continue };
+        for e in list {
+            if e.is_dir || !e.name.ends_with(".desktop") {
+                continue;
+            }
+            let Ok(data) = crate::fs::read_file(&crate::fs::join(dir, &e.name)) else { continue };
+            let text = String::from_utf8_lossy(&data);
+            let (mut name, mut exec, mut icon, mut hidden, mut terminal, mut section) = (String::new(), String::new(), String::new(), false, false, false);
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    section = line == "[Desktop Entry]";
+                    continue;
+                }
+                if !section {
+                    continue;
+                }
+                let Some((k, v)) = line.split_once('=') else { continue };
+                match k.trim() {
+                    "Name" => name = String::from(v.trim()),
+                    "Exec" => exec = v.split_whitespace().filter(|a| !a.starts_with('%')).collect::<Vec<_>>().join(" "),
+                    "Icon" => icon = String::from(v.trim()),
+                    "NoDisplay" | "Hidden" => hidden |= v.trim() == "true",
+                    "Terminal" => terminal = v.trim() == "true",
+                    "Type" => hidden |= v.trim() != "Application",
+                    _ => {}
+                }
+            }
+            let exec = String::from(exec.trim_matches('"'));
+            if hidden || name.is_empty() || exec.is_empty() {
+                continue;
+            }
+            // Built-in entries (Firefox, ...) already have their own.
+            if APPS.iter().any(|a| a.name.eq_ignore_ascii_case(&name)) || out.iter().any(|a| a.name == name) {
+                continue;
+            }
+            out.push(DesktopApp { name, icon: find_icon(&icon), exec, terminal });
+        }
+    }
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out
+}
+
 struct AppEntry {
     name: &'static str,
     icon: Icon,
@@ -290,12 +364,17 @@ pub struct Wm {
     menu_hover: Option<usize>,
     /// Text typed into the app menu's search box.
     menu_query: String,
+    /// First app shown in the menu (scrolled with the wheel).
+    menu_scroll: usize,
     /// Thumbnail of the window whose taskbar button is hovered:
     /// (window, since when hovered, picture, when made).
     preview: Option<(WindowId, u64, Option<Surface>, u64)>,
     /// Apps whose program is installed (index into APPS), refreshed now and then.
     apps_ok: Vec<bool>,
     apps_checked: u64,
+    /// Linux apps installed with pkg (menu entries after APPS).
+    desktop_apps: Vec<DesktopApp>,
+    desktop_checked: u64,
     clock: String,
     cascade: i32,
     boot_at: u64,
@@ -377,9 +456,12 @@ impl Wm {
             menu_opened_at: 0,
             menu_hover: None,
             menu_query: String::new(),
+            menu_scroll: 0,
             preview: None,
             apps_ok: APPS.iter().map(|a| !matches!(a.launch, Launch::Cmd(..))).collect(),
             apps_checked: 0,
+            desktop_apps: Vec::new(),
+            desktop_checked: 0,
             clock: String::new(),
             cascade: 0,
             boot_at: uptime_ms(),
@@ -880,11 +962,25 @@ impl Wm {
     }
 
     fn launch(&mut self, i: usize) {
+        if i >= APPS.len() {
+            let Some(a) = self.desktop_apps.get(i - APPS.len()).cloned() else { return };
+            if a.terminal {
+                let t = super::terminal::Terminal::with_command("/home", &a.exec);
+                self.open(Box::new(t), None);
+            } else if let Err(e) = super::detached::run("/home", &a.exec) {
+                let t = super::terminal::Terminal::with_command("/home", &format!("echo '{}'", e));
+                self.open(Box::new(t), None);
+            }
+            return;
+        }
         match APPS[i].launch {
             Launch::Kind(k) => self.dock_click(k, false),
             Launch::Cmd(cmd, _) => {
-                let t = super::terminal::Terminal::with_command("/home", cmd);
-                self.open(Box::new(t), None);
+                // Straight to the app's window; a terminal only to show why not.
+                if let Err(e) = super::detached::run("/home", cmd) {
+                    let t = super::terminal::Terminal::with_command("/home", &format!("echo '{}'", e));
+                    self.open(Box::new(t), None);
+                }
             }
         }
     }
@@ -942,6 +1038,17 @@ impl Wm {
             return;
         }
         self.apps_checked = now;
+        super::detached::poll();
+        if now - self.desktop_checked >= 8000 || self.desktop_checked == 0 {
+            self.desktop_checked = now;
+            let found = scan_desktop_apps();
+            if found.iter().map(|a| &a.name).ne(self.desktop_apps.iter().map(|a| &a.name)) {
+                self.desktop_apps = found;
+                if self.menu_open {
+                    self.damage(self.menu_rect().inset(-20));
+                }
+            }
+        }
         let ok: Vec<bool> = APPS
             .iter()
             .map(|a| match a.launch {
@@ -1025,10 +1132,12 @@ impl Wm {
     /// Apps matching the search text (index into APPS).
     fn menu_apps(&self) -> Vec<usize> {
         let q = self.menu_query.to_lowercase();
-        (0..APPS.len())
+        let mut v: Vec<usize> = (0..APPS.len())
             .filter(|&i| self.apps_ok.get(i).copied().unwrap_or(false))
             .filter(|&i| q.is_empty() || APPS[i].name.to_lowercase().contains(&q))
-            .collect()
+            .collect();
+        v.extend((0..self.desktop_apps.len()).filter(|&k| q.is_empty() || self.desktop_apps[k].name.to_lowercase().contains(&q)).map(|k| APPS.len() + k));
+        v
     }
 
     /// Everything clickable in the app menu, with its rectangle.
@@ -1036,8 +1145,8 @@ impl Wm {
         let m = self.menu_rect();
         let mut out = Vec::new();
         let mut y = m.y + 94;
-        for i in self.menu_apps() {
-            if y + 40 > m.bottom() - 10 {
+        for i in self.menu_apps().into_iter().skip(self.menu_scroll) {
+            if y + 40 > m.bottom() - 60 {
                 break;
             }
             out.push((Rect::new(m.x + 12, y, 350, 40), MenuEntry::App(i)));
@@ -1066,6 +1175,7 @@ impl Wm {
         self.menu_opened_at = if self.cfg.animations { uptime_ms() } else { 0 };
         self.menu_hover = None;
         self.menu_query.clear();
+        self.menu_scroll = 0;
         self.damage(self.menu_rect().inset(-20));
         self.damage(self.dock_damage_rect());
     }
@@ -1404,6 +1514,13 @@ impl Wm {
 
     fn wheel(&mut self, delta: i32) {
         let (x, y) = self.pointer;
+        if self.menu_open && self.menu_rect().contains(x, y) {
+            let n = self.menu_apps().len();
+            let s = self.menu_scroll as i32 - delta.signum() * 2;
+            self.menu_scroll = s.clamp(0, n.saturating_sub(4) as i32) as usize;
+            self.damage(self.menu_rect().inset(-20));
+            return;
+        }
         if let Some(id) = self.window_at(x, y)
             && let Some(i) = self.index_of(id)
         {
@@ -1434,10 +1551,12 @@ impl Wm {
                     }
                     Key::Backspace => {
                         self.menu_query.pop();
+                        self.menu_scroll = 0;
                         self.damage(self.menu_rect());
                     }
                     Key::Char(ch) if !k.ctrl && !k.alt => {
                         self.menu_query.push(ch);
+                        self.menu_scroll = 0;
                         self.damage(self.menu_rect());
                     }
                     _ => {}
@@ -1780,42 +1899,83 @@ impl Wm {
                 continue;
             }
             {
+                // Background and windows, in bands drawn by every CPU at
+                // once (each band only touches its own rows).
                 let Wm { display, background, windows, focused, .. } = self;
+                struct Layer<'a> {
+                    surface: &'a Surface,
+                    shadow: Option<&'a ShadowMask>,
+                    rect: Rect,
+                    dest: Rect,
+                    alpha: u32,
+                    radius: i32,
+                    flat: bool,
+                    color: gfx::Color,
+                }
+                let layers: Vec<Layer> = windows
+                    .iter()
+                    .filter(|w| !(w.minimized && w.anim.is_none()) && w.visual_bounds(now).intersects(&r))
+                    .map(|w| {
+                        let (dest, alpha) = w.visual(now);
+                        Layer {
+                            surface: &w.surface,
+                            shadow: w.shadow.as_ref(),
+                            rect: w.rect,
+                            dest,
+                            alpha,
+                            radius: w.radius(),
+                            flat: w.flat(),
+                            color: if *focused == Some(w.id) { theme::SHADOW } else { theme::SHADOW_INACTIVE },
+                        }
+                    })
+                    .collect();
                 let buf = display.buffer();
-                let mut c = Canvas::new(buf, w, h, w as usize);
-                c.push_clip(r);
-                c.blit_region(background, r, r.x, r.y);
-                for win in windows.iter() {
-                    if win.minimized && win.anim.is_none() {
-                        continue;
+                let (ptr, len) = (buf.as_mut_ptr() as usize, buf.len());
+                let background = &*background;
+                let border = theme::border();
+                let band_h = 48;
+                let parts = (r.h as usize).div_ceil(band_h as usize).max(1);
+                let draw = |i: usize| {
+                    let band = Rect::new(r.x, r.y + i as i32 * band_h, r.w, band_h).intersect(&r);
+                    if band.is_empty() {
+                        return;
                     }
-                    if !win.visual_bounds(now).intersects(&r) {
-                        continue;
-                    }
-                    let shadow = if *focused == Some(win.id) { theme::SHADOW } else { theme::SHADOW_INACTIVE };
-                    let (dest, alpha) = win.visual(now);
-                    if dest == win.rect && alpha >= 255 {
-                        let radius = win.radius();
-                        if !win.flat()
-                            && let Some(m) = &win.shadow
-                        {
-                            if (m.w, m.h) == (win.rect.w, win.rect.h) {
-                                c.draw_shadow_mask(m, win.rect, shadow, 255);
-                            } else {
-                                c.draw_shadow_mask_scaled(m, win.rect, shadow, 255);
+                    // SAFETY: bands are disjoint rows of the frame buffer,
+                    // and the clip keeps each canvas inside its band.
+                    let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u32, len) };
+                    let mut c = Canvas::new(buf, w, h, w as usize);
+                    c.push_clip(band);
+                    c.blit_region(background, band, band.x, band.y);
+                    for l in &layers {
+                        if l.dest == l.rect && l.alpha >= 255 {
+                            if !l.flat
+                                && let Some(m) = l.shadow
+                            {
+                                if (m.w, m.h) == (l.rect.w, l.rect.h) {
+                                    c.draw_shadow_mask(m, l.rect, l.color, 255);
+                                } else {
+                                    c.draw_shadow_mask_scaled(m, l.rect, l.color, 255);
+                                }
                             }
+                            c.blit_rounded(l.surface, l.rect.x, l.rect.y, l.radius);
+                            if !l.flat {
+                                c.stroke_rounded_rect(l.rect, l.radius, 1, border);
+                            }
+                        } else {
+                            let radius = (theme::WINDOW_RADIUS * l.dest.w / l.rect.w.max(1)).max(2);
+                            if let Some(m) = l.shadow {
+                                c.draw_shadow_mask_scaled(m, l.dest, l.color, l.alpha);
+                            }
+                            c.blit_scaled(l.surface, l.dest, l.alpha, radius);
+                            c.stroke_rounded_rect(l.dest, radius, 1, fade(border, l.alpha));
                         }
-                        c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
-                        if !win.flat() {
-                            c.stroke_rounded_rect(win.rect, radius, 1, theme::border());
-                        }
-                    } else {
-                        let radius = (theme::WINDOW_RADIUS * dest.w / win.rect.w.max(1)).max(2);
-                        if let Some(m) = &win.shadow {
-                            c.draw_shadow_mask_scaled(m, dest, shadow, alpha);
-                        }
-                        c.blit_scaled(&win.surface, dest, alpha, radius);
-                        c.stroke_rounded_rect(dest, radius, 1, fade(theme::border(), alpha));
+                    }
+                };
+                if parts > 1 && r.w * r.h > 60_000 {
+                    crate::parallel::run(parts, &draw);
+                } else {
+                    for i in 0..parts {
+                        draw(i);
                     }
                 }
             }
@@ -1858,6 +2018,7 @@ impl Wm {
         let menu_rect = self.menu_rect();
         let menu_entries = if self.menu_open { self.menu_entries() } else { Vec::new() };
         let menu_query = self.menu_query.clone();
+        let desktop_apps = if self.menu_open { self.desktop_apps.clone() } else { Vec::new() };
         let preview = match &self.preview {
             Some((id, _, Some(pic), _)) => {
                 let title = self.windows.iter().find(|w| w.id == *id).map(|w| w.app.title()).unwrap_or_default();
@@ -2026,8 +2187,13 @@ impl Wm {
                         if hovered {
                             c.fill_rounded_rect(*er, 8, fade(accent, a));
                         }
-                        super::icons::draw(&mut c, APPS[i].icon, er.x + 8, er.y + 4, 32);
-                        c.draw_text(&f.ui, er.x + 50, base, APPS[i].name, fade(white, a));
+                        if let Some(d) = i.checked_sub(APPS.len()).and_then(|k| desktop_apps.get(k)) {
+                            super::icons::draw_file(&mut c, &d.icon, Icon::Program, er.x + 8, er.y + 4, 32);
+                            c.draw_text(&f.ui, er.x + 50, base, &d.name, fade(white, a));
+                        } else {
+                            super::icons::draw(&mut c, APPS[i].icon, er.x + 8, er.y + 4, 32);
+                            c.draw_text(&f.ui, er.x + 50, base, APPS[i].name, fade(white, a));
+                        }
                     }
                     MenuEntry::Place(p) => {
                         if hovered {

@@ -26,7 +26,7 @@ use crate::sync::Spin;
 use crate::time::uptime_ms;
 
 const SIDEBAR_W: i32 = 214;
-const ROW_H: i32 = 52;
+const ROW_H: i32 = 58;
 const TOGGLE_MS: u64 = 160;
 const TAG_SETUP_DISK: u32 = 40;
 const PAGE_MS: u64 = 200;
@@ -82,6 +82,8 @@ enum Action {
     Toggle(Toggle),
     Slider(Slider),
     Resolution(u32, u32),
+    OpenResolutions,
+    Theme(bool),
     Wallpaper(usize),
     Picture(usize),
     DockPosition(u8),
@@ -98,6 +100,17 @@ enum Action {
     Input(usize),
     ResetSettings,
     SetupDisk(usize),
+}
+
+fn aspect(w: u32, h: u32) -> &'static str {
+    match (w, h) {
+        (1920, 1080) | (1280, 720) | (1366, 768) | (1600, 900) | (2560, 1440) | (3840, 2160) => "16:9",
+        (1280, 800) | (1440, 900) | (1680, 1050) | (1920, 1200) | (2560, 1600) => "16:10",
+        (1024, 768) | (800, 600) | (1152, 864) | (1600, 1200) => "4:3",
+        (1280, 1024) => "5:4",
+        (2560, 1080) | (3440, 1440) => "21:9",
+        _ => "",
+    }
 }
 
 fn toggle_value(s: &Settings, t: Toggle) -> bool {
@@ -216,6 +229,8 @@ pub struct SettingsApp {
     /// Disks offered on the Storage page: (target, description, erases data).
     disk_targets: Vec<(crate::storage::Target, String, bool)>,
     pending_setup: Option<crate::storage::Target>,
+    /// The open dropdown's button (its list is drawn over the page).
+    dropdown: Option<Rect>,
 }
 
 impl SettingsApp {
@@ -249,6 +264,7 @@ impl SettingsApp {
             bottom: core::cell::Cell::new(0),
             disk_targets: Vec::new(),
             pending_setup: None,
+            dropdown: None,
         }
     }
 
@@ -262,6 +278,7 @@ impl SettingsApp {
             self.page_since = if self.cfg.animations { uptime_ms() } else { 0 };
             self.focused_input = None;
             self.scroll = 0;
+            self.dropdown = None;
         }
     }
 
@@ -332,7 +349,7 @@ impl SettingsApp {
     fn toggle(&mut self, c: &mut Canvas, row: Rect, t: Toggle) {
         let r = Rect::new(row.right() - 18 - 44, row.y + (ROW_H - 26) / 2, 44, 26);
         let pos = self.knob_pos(t);
-        let off = rgb(0xd5, 0xd9, 0xe0);
+        let off = theme::control_off();
         let track = mix(off, theme::accent(), (pos * 255 / 1024) as u32);
         c.fill_rounded_rect(r, 13, track);
         let kx = r.x + 3 + ((r.w - 26) as i64 * pos / 1024) as i32;
@@ -347,7 +364,7 @@ impl SettingsApp {
         let v = slider_value(&self.cfg, sl);
         let track = Rect::new(row.right() - 18 - 240, row.y + ROW_H / 2 - 3, 200, 6);
         let t = ((v - lo) * track.w / (hi - lo).max(1)).clamp(0, track.w);
-        c.fill_rounded_rect(track, 3, rgb(0xd5, 0xd9, 0xe0));
+        c.fill_rounded_rect(track, 3, theme::control_off());
         c.fill_rounded_rect(Rect::new(track.x, track.y, t.max(6), track.h), 3, theme::accent());
         let active = self.dragging.map(|d| d.0) == Some(sl) || self.hovered(Action::Slider(sl));
         c.fill_circle(track.x + t, track.y + 3, if active { 10 } else { 9 }, theme::shade(40));
@@ -409,71 +426,158 @@ impl SettingsApp {
         y + 62
     }
 
+    /// A dropdown button at the right end of a row.
+    fn dropdown_button(&mut self, c: &mut Canvas, row: Rect, text: &str, a: Action) -> Rect {
+        let f = fonts();
+        let bw = (f.ui.measure(text) + 52).max(180);
+        let r = Rect::new(row.right() - 18 - bw, row.y + (ROW_H - 34) / 2, bw, 34);
+        let open = self.dropdown == Some(r);
+        c.fill_rounded_rect(r, 8, if self.hovered(a) || open { theme::hover() } else { theme::panel_bg() });
+        c.stroke_rounded_rect(r, 8, 1, if open { theme::accent() } else { theme::border() });
+        let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
+        c.draw_text(&f.ui, r.x + 14, base, text, theme::text());
+        // Chevron.
+        let (cx, cy) = (r.right() - 20, r.y + r.h / 2 - 2);
+        for k in 0..5 {
+            c.fill_rect(Rect::new(cx - 5 + k, cy + k, 11 - 2 * k, 1), theme::text_dim());
+        }
+        self.hits.push((r, a));
+        r
+    }
+
+    /// The open list of resolutions, over everything else.
+    fn resolution_list(&mut self, c: &mut Canvas) {
+        let Some(b) = self.dropdown else { return };
+        let f = fonts();
+        let modes = super::display_modes();
+        let current = super::display_mode();
+        let item_h = 34;
+        let h = (modes.len() as i32 * item_h + 8).min(self.size.1 - 40);
+        let below = b.bottom() + 6 + h <= self.size.1 - 8;
+        let r = Rect::new(b.x, if below { b.bottom() + 6 } else { (b.y - 6 - h).max(8) }, b.w, h);
+        // Clicking anywhere else closes it.
+        self.hits.push((Rect::new(0, 0, self.size.0, self.size.1), Action::OpenResolutions));
+        c.draw_shadow(r, 10, 16, with_alpha(0x000000, 70));
+        c.fill_rounded_rect(r, 10, theme::card_bg());
+        c.stroke_rounded_rect(r, 10, 1, theme::border());
+        let old = c.push_clip(r.inset(4));
+        for (i, &(mw, mh)) in modes.iter().enumerate() {
+            let ir = Rect::new(r.x + 4, r.y + 4 + i as i32 * item_h, r.w - 8, item_h);
+            let a = Action::Resolution(mw, mh);
+            let sel = (mw, mh) == current;
+            if sel {
+                c.fill_rounded_rect(ir, 7, with_alpha(theme::accent(), 40));
+            } else if self.hovered(a) {
+                c.fill_rounded_rect(ir, 7, theme::hover());
+            }
+            let base = ir.y + (ir.h + f.ui.ascent - f.ui.descent) / 2;
+            c.draw_text(if sel { &f.bold } else { &f.ui }, ir.x + 12, base, &format!("{} \u{00d7} {}", mw, mh), theme::text());
+            let ratio = aspect(mw, mh);
+            let rw = f.ui.measure(ratio);
+            c.draw_text(&f.ui, ir.right() - 12 - rw, base, ratio, theme::text_dim());
+            self.hits.push((ir, a));
+        }
+        c.restore_clip(old);
+    }
+
+    fn section(&self, c: &mut Canvas, x: i32, y: i32, title: &str) -> i32 {
+        c.draw_text(&fonts().small_bold, x + 4, y, &title.to_ascii_uppercase(), theme::text_dim());
+        y + 12
+    }
+
     fn page_display(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
         y = self.page_title(c, x, y, "Display");
         let modes = super::display_modes();
-        let current = super::display_mode();
-        let card = Rect::new(x, y, w, ROW_H * 2);
+        let (mw, mh) = super::display_mode();
+        y = self.section(c, x, y, "Screen");
+        let card = Rect::new(x, y, w, ROW_H * 4);
         self.card(c, card);
-        let r = self.row(c, card, 0, "Graphics device", None, false);
+        let r = self.row(c, card, 0, "Resolution", Some(aspect(mw, mh)), false);
+        if modes.len() > 1 {
+            self.dropdown_button(c, r, &format!("{} \u{00d7} {}", mw, mh), Action::OpenResolutions);
+        } else {
+            self.value(c, r, &format!("{} \u{00d7} {} (fixed)", mw, mh));
+        }
+        let r = self.row(c, card, 1, "Refresh rate", Some("Chosen by the screen's firmware"), false);
+        self.value(c, r, "Monitor default");
+        let r = self.row(c, card, 2, "Graphics", None, false);
         self.value(c, r, &super::display_description());
-        let r = self.row(c, card, 1, "Animations", Some("Window, dock and menu motion"), true);
+        let r = self.row(c, card, 3, "Animations", Some("Window, panel and menu motion"), true);
         self.toggle(c, r, Toggle::Animations);
-        y = card.bottom() + 24;
-        c.draw_text(&fonts().bold, x + 4, y, "Resolution", theme::text());
-        y += 12;
-        let rows = modes.len().max(1) as i32;
-        let card = Rect::new(x, y, w, ROW_H * rows);
-        self.card(c, card);
-        for (i, &(mw, mh)) in modes.iter().enumerate() {
-            let label = format!("{} \u{00d7} {}", mw, mh);
-            let detail = match (mw, mh) {
-                (1920, 1080) | (1280, 720) | (1366, 768) | (1600, 900) => Some("16:9"),
-                (1280, 800) | (1440, 900) | (1680, 1050) => Some("16:10"),
-                (1024, 768) => Some("4:3"),
-                _ => None,
-            };
-            let r = self.row(c, card, i as i32, &label, detail, i as i32 == rows - 1);
-            let a = Action::Resolution(mw, mh);
-            if self.hovered(a) {
-                c.fill_rounded_rect(r.inset(4), 8, with_alpha(theme::accent(), 18));
-                // Redraw the label over the highlight.
-                self.row(c, card, i as i32, &label, detail, true);
-            }
-            let selected = (mw, mh) == current;
-            let cx = r.right() - 30;
-            let cy = r.y + ROW_H / 2;
-            if selected {
-                c.fill_circle(cx, cy, 9, theme::accent());
-                c.fill_circle(cx, cy, 4, rgb(255, 255, 255));
-            } else {
-                c.stroke_rounded_rect(Rect::new(cx - 9, cy - 9, 18, 18), 9, 2, rgb(0xc5, 0xca, 0xd3));
-            }
-            self.hits.push((r, a));
-        }
-        y = card.bottom() + 16;
-        if modes.len() <= 1 {
-            self.note(
-                c,
-                x + 4,
-                y + 4,
-                w - 8,
-                "This screen is the firmware's boot framebuffer, which cannot change resolution. MayOS can switch \
-                 resolution on VirtualBox's VMSVGA, VBoxSVGA and VBoxVGA controllers and on QEMU's virtio, VMware \
-                 and standard VGA adapters. If you started MayOS in safe graphics mode, restart normally.",
-            );
-        }
+        y = card.bottom() + 14;
+        let note = if modes.len() <= 1 {
+            "This screen uses the firmware's boot picture, which keeps one resolution and refresh rate. Choosing \
+             them needs a driver for the graphics card (AMD, NVIDIA and Intel GPUs are not supported yet); in \
+             VirtualBox, QEMU and VMware MayOS can change resolution."
+        } else {
+            "Refresh rate follows the screen; changing it needs a native driver for the graphics card \
+             (not available yet for AMD, NVIDIA and Intel GPUs)."
+        };
+        self.note(c, x + 4, y + 4, w - 8, note);
     }
 
     fn page_personalization(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
         let f = fonts();
         y = self.page_title(c, x, y, "Personalization");
-        c.draw_text(&f.bold, x + 4, y, "Wallpaper", theme::text());
-        y += 14;
+        y = self.section(c, x, y, "Appearance");
+        // Light / dark previews.
+        let card = Rect::new(x, y, w, 176);
+        self.card(c, card);
+        let pw = ((w - 36 - 16) / 2).min(220);
+        for (k, dark) in [false, true].into_iter().enumerate() {
+            let r = Rect::new(x + 18 + k as i32 * (pw + 16), y + 16, pw, 116);
+            let a = Action::Theme(dark);
+            let sel = self.cfg.dark == dark;
+            if sel {
+                c.fill_rounded_rect(r.inset(-3), 12, theme::accent());
+            } else if self.hovered(a) {
+                c.fill_rounded_rect(r.inset(-3), 12, theme::shade(30));
+            }
+            let (bg, win, bar, txt) = if dark {
+                (rgb(0x16, 0x18, 0x1d), rgb(0x1f, 0x21, 0x26), rgb(0x2a, 0x2d, 0x33), rgb(0x55, 0x5b, 0x66))
+            } else {
+                (rgb(0xdd, 0xe3, 0xec), rgb(0xff, 0xff, 0xff), rgb(0xf0, 0xf1, 0xf4), rgb(0xc8, 0xcd, 0xd5))
+            };
+            c.fill_rounded_rect(r, 10, bg);
+            let wr = Rect::new(r.x + 16, r.y + 14, r.w - 32, r.h - 28);
+            c.fill_rounded_rect(wr, 7, win);
+            c.fill_rounded_rect(Rect::new(wr.x, wr.y, wr.w, 16), 7, bar);
+            c.fill_rect(Rect::new(wr.x, wr.y + 10, wr.w, 6), bar);
+            c.fill_rounded_rect(Rect::new(wr.x + 10, wr.y + 26, wr.w / 2, 7), 3, txt);
+            c.fill_rounded_rect(Rect::new(wr.x + 10, wr.y + 40, wr.w / 3, 7), 3, txt);
+            c.fill_rounded_rect(Rect::new(wr.x + 10, wr.y + 56, 40, 12), 6, theme::accent());
+            let label = if dark { "Dark" } else { "Light" };
+            c.draw_text_centered(if sel { &f.bold } else { &f.ui }, Rect::new(r.x, r.bottom() + 8, r.w, 20), label, theme::text());
+            self.hits.push((r, a));
+        }
+        y = card.bottom() + 12;
+        let card = Rect::new(x, y, w, ROW_H * 3);
+        self.card(c, card);
+        let r = self.row(c, card, 0, "Accent colour", Some(theme::ACCENTS[self.cfg.accent.min(theme::ACCENTS.len() - 1)].0), false);
+        let n = theme::ACCENTS.len() as i32;
+        for (i, (_, col)) in theme::ACCENTS.iter().enumerate() {
+            let cx = r.right() - 30 - (n - 1 - i as i32) * 34;
+            let cy = r.y + ROW_H / 2;
+            let hr = Rect::new(cx - 15, cy - 15, 30, 30);
+            if self.cfg.accent == i {
+                c.fill_circle(cx, cy, 14, *col);
+                c.fill_circle(cx, cy, 11, theme::card_bg());
+            } else if self.hovered(Action::Accent(i)) {
+                c.fill_circle(cx, cy, 14, with_alpha(*col, 90));
+            }
+            c.fill_circle(cx, cy, 9, *col);
+            self.hits.push((hr, Action::Accent(i)));
+        }
+        let r = self.row(c, card, 1, "Animations", Some("Window, panel and menu motion"), false);
+        self.toggle(c, r, Toggle::Animations);
+        let r = self.row(c, card, 2, "Hide the panel automatically", Some("Point at the bottom edge to show it"), true);
+        self.toggle(c, r, Toggle::DockAutohide);
+        y = card.bottom() + 26;
+        y = self.section(c, x, y, "Wallpaper");
         if self.thumbs.len() != WALLPAPERS.len() {
             self.thumbs = (0..WALLPAPERS.len()).map(|i| wallpaper::render(i, 160, 100)).collect();
         }
-        let cols = ((w + 16) / 176).max(1);
+        let cols = ((w + 14) / 140).max(2);
         let tw = (w - (cols - 1) * 16) / cols;
         let th = tw * 10 / 16;
         for (i, wp) in WALLPAPERS.iter().enumerate() {
@@ -493,37 +597,7 @@ impl SettingsApp {
         let rows = (WALLPAPERS.len() as i32 + cols - 1) / cols;
         y += rows * (th + 34) + 18;
         y = self.pictures_section(c, x, y, w, cols, tw, th);
-        c.draw_text(&f.bold, x + 4, y, "Accent colour", theme::text());
-        y += 14;
-        let card = Rect::new(x, y, w, 64);
-        self.card(c, card);
-        for (i, (name, col)) in theme::ACCENTS.iter().enumerate() {
-            let cx = x + 36 + i as i32 * 44;
-            let cy = y + 32;
-            let r = Rect::new(cx - 16, cy - 16, 32, 32);
-            if self.cfg.accent == i {
-                c.fill_circle(cx, cy, 16, *col);
-                c.fill_circle(cx, cy, 13, rgb(255, 255, 255));
-            } else if self.hovered(Action::Accent(i)) {
-                c.fill_circle(cx, cy, 15, with_alpha(*col, 90));
-            }
-            c.fill_circle(cx, cy, 11, *col);
-            self.hits.push((r, Action::Accent(i)));
-            if self.cfg.accent == i {
-                let tx = x + 36 + theme::ACCENTS.len() as i32 * 44;
-                let base = card.y + (card.h + f.ui.ascent - f.ui.descent) / 2;
-                c.draw_text(&f.ui, tx, base, name, theme::text_dim());
-            }
-        }
-        y = card.bottom() + 18;
-        let card = Rect::new(x, y, w, ROW_H * 3);
-        self.card(c, card);
-        let r = self.row(c, card, 0, "Dark mode", Some("Dark windows, apps and title bars (also Firefox and other Linux apps)"), false);
-        self.toggle(c, r, Toggle::DarkMode);
-        let r = self.row(c, card, 1, "Animations", Some("Window, panel and menu motion"), false);
-        self.toggle(c, r, Toggle::Animations);
-        let r = self.row(c, card, 2, "Hide the panel automatically", Some("It slides away; point at the bottom edge to show it"), true);
-        self.toggle(c, r, Toggle::DockAutohide);
+        let _ = y;
     }
 
     /// A row of mutually exclusive buttons at the right end of a row.
@@ -552,8 +626,7 @@ impl SettingsApp {
     /// level (and /pictures folder) of other disks, as wallpaper choices.
     fn pictures_section(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32, cols: i32, tw: i32, th: i32) -> i32 {
         let f = fonts();
-        c.draw_text(&f.bold, x + 4, y, "Your pictures", theme::text());
-        y += 14;
+        y = self.section(c, x, y, "Your pictures");
         if self.pictures.is_none() {
             self.pictures = Some(start_picture_scan());
             self.picture_thumbs.clear();
@@ -913,7 +986,14 @@ impl SettingsApp {
                     crate::network::use_dhcp();
                 }
             }
-            Action::Resolution(w, h) => ctx.commands.push(Command::SetResolution(w, h)),
+            Action::Resolution(w, h) => {
+                self.dropdown = None;
+                if (w, h) != super::display_mode() {
+                    ctx.commands.push(Command::SetResolution(w, h));
+                }
+            }
+            Action::OpenResolutions => {}
+            Action::Theme(dark) => settings::update(|s| s.dark = dark),
             Action::Wallpaper(i) => settings::update(|s| {
                 s.wallpaper = i;
                 s.wallpaper_image.clear();
@@ -1031,7 +1111,11 @@ impl App for SettingsApp {
         // Sidebar.
         c.fill_rect(Rect::new(0, 0, SIDEBAR_W, h), theme::sidebar_bg());
         c.vline(SIDEBAR_W - 1, 0, h, theme::separator());
-        let mut y = 16;
+        // Header: the logo, the computer's name.
+        super::icons::draw(c, Icon::MayOS, 20, 18, 36);
+        c.draw_text(&f.bold, 66, 34, "MayOS", theme::text());
+        c.draw_text(&f.ui, 66, 51, &self.cfg.hostname, theme::text_dim());
+        let mut y = 76;
         for &(p, name, color) in PAGES {
             let r = Rect::new(10, y, SIDEBAR_W - 20, 38);
             if self.page == p {
@@ -1058,7 +1142,8 @@ impl App for SettingsApp {
         };
         let old = c.push_clip(area);
         self.bottom.set(0);
-        let (x, cy, cw) = (SIDEBAR_W + 28, 20 + slide - self.scroll, (w - SIDEBAR_W - 56).min(720));
+        let cw = (w - SIDEBAR_W - 72).min(760);
+        let (x, cy) = (SIDEBAR_W + ((w - SIDEBAR_W - cw) / 2).max(28), 24 + slide - self.scroll);
         match self.page {
             Page::Display => self.page_display(c, x, cy, cw),
             Page::Personalization => self.page_personalization(c, x, cy, cw),
@@ -1068,6 +1153,9 @@ impl App for SettingsApp {
             Page::DateTime => self.page_datetime(c, x, cy, cw),
             Page::Storage => self.page_storage(c, x, cy, cw),
             Page::About => self.page_about(c, x, cy, cw),
+        }
+        if self.page == Page::Display {
+            self.resolution_list(c);
         }
         // Scroll bar when the page is taller than the window.
         let content = self.bottom.get() + self.scroll + 24;
@@ -1112,6 +1200,10 @@ impl App for SettingsApp {
             AppEvent::MouseDown { x, y, button: 0, .. } => {
                 let found = self.hits.iter().rev().find(|(r, _)| r.contains(*x, *y)).copied();
                 match found {
+                    Some((r, Action::OpenResolutions)) => {
+                        self.dropdown = if self.dropdown.is_some() { None } else { Some(r) };
+                        ctx.redraw();
+                    }
                     Some((r, Action::Slider(sl))) => {
                         self.dragging = Some((sl, r));
                         self.slider_to(sl, r, *x);
@@ -1142,6 +1234,7 @@ impl App for SettingsApp {
                 let content = self.bottom.get() + self.scroll + 24;
                 let max = (content - self.size.1).max(0);
                 self.scroll = (self.scroll + delta * 40).clamp(0, max);
+                self.dropdown = None;
                 ctx.redraw();
             }
             AppEvent::Key(k) if k.pressed => {

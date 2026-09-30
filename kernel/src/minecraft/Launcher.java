@@ -432,7 +432,9 @@ public class Launcher {
             // LWJGL 2 needs X11: a rootful Xwayland is an X server in a MayOS window.
             xserver = startXwayland(pb);
         }
-        int code = pb.start().waitFor();
+        Process game = pb.start();
+        if (forge) x11Helper(game, pb.environment().get("DISPLAY"));
+        int code = game.waitFor();
         if (xserver != null) xserver.destroy();
         System.exit(code);
     }
@@ -485,6 +487,50 @@ public class Launcher {
 
     static String x11Size = null;
     static boolean x11Fullscreen = false;
+
+    // Xwayland has no window manager: nobody gives the game keyboard focus
+    // (LWJGL 2 then thinks it is in the background and Minecraft keeps
+    // opening the pause menu), and nobody resizes it with the X screen.
+    // This does both, with xdotool and xrandr.
+    static void x11Helper(Process game, String display) {
+        Thread t = new Thread(() -> {
+            String win = null;
+            String size = "";
+            while (game.isAlive()) {
+                try {
+                    Thread.sleep(win == null ? 500 : 700);
+                    if (win == null) {
+                        String out = runOut(display, "xdotool", "search", "--onlyvisible", "--name", "Minecraft").trim();
+                        if (out.isEmpty()) continue;
+                        win = out.split("\\s+")[0];
+                    }
+                    String focus = runOut(display, "xdotool", "getwindowfocus").trim();
+                    if (!focus.equals(win)) runOut(display, "xdotool", "windowfocus", win);
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("current (\\d+) x (\\d+)").matcher(runOut(display, "xrandr", "--current"));
+                    if (m.find()) {
+                        String cur = m.group(1) + "x" + m.group(2);
+                        if (!cur.equals(size)) {
+                            size = cur;
+                            runOut(display, "xdotool", "windowmove", win, "0", "0", "windowsize", win, m.group(1), m.group(2));
+                        }
+                    }
+                } catch (Exception e) {
+                    // xdotool missing or the window went away: try again
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
+    }
+
+    static String runOut(String display, String... cmd) throws Exception {
+        ProcessBuilder b = new ProcessBuilder(cmd).redirectErrorStream(true);
+        b.environment().put("DISPLAY", display);
+        Process p = b.start();
+        String out = new String(p.getInputStream().readAllBytes());
+        p.waitFor();
+        return out;
+    }
 
     static String x11Geometry() {
         if (x11Fullscreen && x11Size == null) {
@@ -828,6 +874,7 @@ class Account {
         System.out.println();
         System.out.println("  On your phone or another computer, open:  " + dc.get("verification_uri"));
         System.out.println("  and enter the code:  " + dc.get("user_code"));
+        System.out.println("MAYOS-LOGIN " + dc.get("verification_uri") + " " + dc.get("user_code"));
         System.out.println();
         long interval = Math.max(5, ((Number) dc.get("interval")).longValue());
         long deadline = System.currentTimeMillis() + ((Number) dc.get("expires_in")).longValue() * 1000;
@@ -844,6 +891,7 @@ class Account {
             Account a = finish((String) t.get("access_token"), (String) t.get("refresh_token"), exp);
             a.save(f);
             System.out.println("Signed in as " + a.name + ". Play from the Minecraft launcher.");
+            System.out.println("MAYOS-LOGIN-OK " + a.name);
             return;
         }
         throw new IOException("the code expired: try again");

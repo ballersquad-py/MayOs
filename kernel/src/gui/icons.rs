@@ -120,6 +120,11 @@ fn picture(n: &'static str, s: i32) -> Option<alloc::sync::Arc<Vec<u32>>> {
 fn make(n: &str, s: i32) -> Option<Vec<u32>> {
     let (_, pngs) = PNGS.iter().find(|(k, _)| *k == n)?;
     let src = if s <= 32 { pngs[0] } else if s <= 64 { pngs[1] } else { pngs[2] };
+    resize(src, s)
+}
+
+/// Decode a PNG/JPEG and box-filter it to s x s.
+fn resize(src: &[u8], s: i32) -> Option<Vec<u32>> {
     let img = image::decode(src).ok()?;
     let (w, h) = (img.width as i32, img.height as i32);
     if w == s && h == s {
@@ -154,6 +159,33 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
     let Some(p) = picture(name(icon), s) else {
         return gfx::icons::draw(c, icon, x, y, s);
     };
+    for j in 0..s {
+        for i in 0..s {
+            let px = p[(j * s + i) as usize];
+            let a = px >> 24;
+            if a != 0 {
+                c.blend_pixel(x + i, y + j, px | 0xff00_0000, a);
+            }
+        }
+    }
+}
+
+/// Pictures from files (icons of installed Linux apps): path -> pixels.
+static FILES: Spin<BTreeMap<(alloc::string::String, i32), Option<alloc::sync::Arc<Vec<u32>>>>> = Spin::new(BTreeMap::new());
+
+/// Draw an icon file; falls back to `fallback` when it cannot be read.
+pub fn draw_file(c: &mut Canvas, path: &str, fallback: Icon, x: i32, y: i32, s: i32) {
+    let key = (alloc::string::String::from(path), s);
+    let cached = FILES.lock().get(&key).cloned();
+    let p = match cached {
+        Some(p) => p,
+        None => {
+            let made = if path.is_empty() { None } else { crate::fs::read_file(path).ok().and_then(|d| resize(&d, s)).map(alloc::sync::Arc::new) };
+            FILES.lock().insert(key, made.clone());
+            made
+        }
+    };
+    let Some(p) = p else { return draw(c, fallback, x, y, s) };
     for j in 0..s {
         for i in 0..s {
             let px = p[(j * s + i) as usize];

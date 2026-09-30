@@ -37,6 +37,7 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_EP: u32 = 12;
+const TRB_EVALUATE_CTX: u32 = 13;
 const EV_TRANSFER: u32 = 32;
 const EV_COMMAND: u32 = 33;
 const EV_PORT: u32 = 34;
@@ -670,6 +671,23 @@ impl Xhci {
         self.devices.push(Device { slot, port, ep0, _out: out, hids: Vec::new(), nets: Vec::new() });
         let dev = self.devices.len() - 1;
         let Some(mut buf) = DmaBuf::try_new(4096) else { return };
+        // Full-speed devices have 8, 16, 32 or 64 byte control packets:
+        // read the real size first (8 bytes always fit), then tell the
+        // controller, or longer replies fail (many gaming mice use 64).
+        if speed == 1 && self.control(dev, 0x80, 6, 0x0100, 0, Some((&mut buf, 8))) {
+            let real = buf.as_slice()[7] as u32;
+            if matches!(real, 16 | 32 | 64) && real != mps {
+                unsafe {
+                    core::ptr::write_bytes(inctx.virt() as *mut u8, 0, 4096);
+                    write_volatile((self.ctx(&inctx, 0) + 4) as *mut u32, 2); // ep0
+                    let e0 = self.ctx(&inctx, 2);
+                    write_volatile((e0 + 4) as *mut u32, 3 << 1 | 4 << 3 | real << 16);
+                }
+                if self.command(Trb { param: inctx.phys, status: 0, control: TRB_EVALUATE_CTX << 10 | (slot as u32) << 24 }).is_none() {
+                    crate::kprintln!("usb: port {}: evaluate context failed", port);
+                }
+            }
+        }
         if !self.control(dev, 0x80, 6, 0x0100, 0, Some((&mut buf, 18))) {
             crate::kprintln!("usb: port {}: no device descriptor", port);
             return;
