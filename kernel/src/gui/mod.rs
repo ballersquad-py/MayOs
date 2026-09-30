@@ -137,6 +137,7 @@ pub fn open_path(path: &str, ctx: &mut Ctx) -> Result<(), crate::fs::FsError> {
 
 /// Desktop thread entry point.
 pub extern "C" fn desktop_main(_: usize) {
+    crate::log::stop_screen();
     let Some(display) = DISPLAY.lock().take() else {
         crate::kprintln!("gui: no display available, desktop not started");
         return;

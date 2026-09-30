@@ -68,19 +68,25 @@ extern "C" fn kmain() -> ! {
     kprintln!("ps2: keyboard + mouse{}", if wheel { " (wheel)" } else { "" });
 
     gui::theme::init();
+    kprintln!("boot: PCI devices");
     init_devices();
 
+    kprintln!("boot: scheduler");
     proc::sched::init();
     proc::sched::start_reaper();
     if drivers::vmware_svga::fake_gpu() {
         drivers::vmware_svga::install_fake_gpu();
     }
     // The other CPUs join the scheduler once it exists.
+    kprintln!("boot: starting the other CPUs");
     smp::start();
+    kprintln!("boot: drivers");
     // Drivers that start their own threads come after the scheduler.
     init_threaded_devices();
+    kprintln!("boot: looking for disks");
     storage::init();
     settings::load();
+    proc::sched::spawn_kernel("logsave", save_log, 0);
     let selftest = boot::cmdline().contains("selftest");
     if selftest {
         proc::sched::spawn_kernel("selftest", selftest::run, 0);
@@ -155,6 +161,9 @@ fn init_devices() {
     pci::scan();
     let devices = pci::devices();
     kprintln!("pci: {} devices", devices.len());
+    for d in devices.iter() {
+        kprintln!("pci: {:02x}:{:02x}.{} {:04x}:{:04x} {}", d.bus, d.slot, d.func, d.vendor, d.device, d.class_name());
+    }
     let io = time::measure_io_cost();
     kprintln!("cpu: device access costs {}.{} us{}", io / 1000, io / 100 % 10, if io > 8000 { " (slow virtualisation)" } else { "" });
     if let Some(d) = devices.iter().find(|d| d.vendor == 0x80ee && d.device == 0xcafe) {
@@ -190,6 +199,7 @@ fn init_devices() {
             _ => {}
         }
     }
+    kprintln!("boot: RAM disk");
     if !fs::is_mounted()
         && let Some(ram) = drivers::ramdisk::RamDisk::from_boot_module()
     {
@@ -248,6 +258,25 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         power::qemu_exit(false);
     }
     cpu::halt_forever();
+}
+
+/// Keep a copy of the kernel log next to MayOS on the boot partition
+/// (the `mayos` folder the Windows installer made), so a PC that has
+/// trouble can be diagnosed from Windows.
+extern "C" fn save_log(_: usize) {
+    let dir = (1..10).map(|i| alloc::format!("/disk{}/mayos", i)).find(|d| fs::exists(&alloc::format!("{}/kernel", d)));
+    let Some(dir) = dir else { return };
+    kprintln!("log: saving the kernel log to {}/log.txt", dir);
+    let path = alloc::format!("{}/log.txt", dir);
+    let mut last = 0;
+    loop {
+        let text = log::contents();
+        if text.len() != last {
+            last = text.len();
+            let _ = fs::write_file(&path, text.as_bytes());
+        }
+        proc::sched::sleep_ms(3000);
+    }
 }
 
 /// Draw the panic message on the boot framebuffer (visible when the
