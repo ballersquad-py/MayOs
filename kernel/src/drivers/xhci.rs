@@ -129,6 +129,157 @@ struct Hid {
     len: usize,
     last: [u8; 8],
     buttons: u8,
+    /// Report-protocol mouse layout (None: boot protocol).
+    layout: Option<MouseLayout>,
+    reports: u32,
+}
+
+/// Where a mouse's buttons and axes are in its reports (from its HID
+/// report descriptor): bit offsets and sizes.
+#[derive(Clone, Copy, Debug, Default)]
+struct MouseLayout {
+    id: u8,
+    buttons: (u32, u32),
+    x: (u32, u32),
+    y: (u32, u32),
+    wheel: (u32, u32),
+    /// Absolute X/Y (tablets, touch screens) with their largest value.
+    absolute: bool,
+    max: u32,
+}
+
+/// Parse a HID report descriptor for a mouse (X, Y, buttons, wheel).
+fn parse_mouse(desc: &[u8]) -> Option<MouseLayout> {
+    let (mut page, mut size, mut count, mut id, mut lmax) = (0u32, 0u32, 0u32, 0u8, 0u32);
+    let mut usages: Vec<u32> = Vec::new();
+    let (mut umin, mut umax) = (0u32, 0u32);
+    let mut bits: alloc::collections::BTreeMap<u8, u32> = alloc::collections::BTreeMap::new();
+    let mut found: Vec<MouseLayout> = Vec::new();
+    let mut cur = MouseLayout::default();
+    let mut i = 0;
+    while i < desc.len() {
+        let b = desc[i];
+        if b == 0xfe {
+            i += 3 + *desc.get(i + 1)? as usize;
+            continue;
+        }
+        let n = [0, 1, 2, 4][(b & 3) as usize];
+        let mut v = 0u32;
+        for k in 0..n {
+            v |= (*desc.get(i + 1 + k)? as u32) << (8 * k);
+        }
+        let (kind, tag) = ((b >> 2) & 3, b >> 4);
+        match (kind, tag) {
+            (1, 0) => page = v,
+            (1, 7) => size = v,
+            (1, 2) => lmax = v,
+            (1, 9) => count = v,
+            (1, 8) => {
+                if cur.x.1 != 0 && cur.y.1 != 0 {
+                    found.push(cur);
+                }
+                id = v as u8;
+                cur = MouseLayout { id, ..Default::default() };
+            }
+            (2, 0) => usages.push(if n == 4 { v } else { page << 16 | v }),
+            (2, 1) => umin = if n == 4 { v } else { page << 16 | v },
+            (2, 2) => umax = if n == 4 { v } else { page << 16 | v },
+            (0, 8) => {
+                // Input: `count` fields of `size` bits.
+                let at = *bits.get(&id).unwrap_or(&0);
+                let constant = v & 1 != 0;
+                if !constant {
+                    for f in 0..count {
+                        let usage = if !usages.is_empty() { usages[(f as usize).min(usages.len() - 1)] } else { umin + f };
+                        let off = at + f * size;
+                        match usage {
+                            0x0001_0030 => {
+                                cur.x = (off, size);
+                                cur.absolute = v & 4 == 0;
+                                cur.max = lmax.max(1);
+                            }
+                            0x0001_0031 => cur.y = (off, size),
+                            0x0001_0038 => cur.wheel = (off, size),
+                            u if u >> 16 == 9 && cur.buttons.1 == 0 => cur.buttons = (off, count.min(8)),
+                            _ => {}
+                        }
+                    }
+                    let _ = umax;
+                }
+                bits.insert(id, at + size * count);
+                usages.clear();
+                umin = 0;
+                umax = 0;
+            }
+            (0, _) => {
+                usages.clear();
+                umin = 0;
+                umax = 0;
+            }
+            _ => {}
+        }
+        i += 1 + n;
+    }
+    if cur.x.1 != 0 && cur.y.1 != 0 {
+        found.push(cur);
+    }
+    found.into_iter().next()
+}
+
+/// A signed field of a report.
+fn field(r: &[u8], (off, size): (u32, u32)) -> i32 {
+    if size == 0 || size > 32 {
+        return 0;
+    }
+    let mut v: u64 = 0;
+    for k in 0..size {
+        let bit = off + k;
+        let byte = (bit / 8) as usize;
+        if byte < r.len() && r[byte] >> (bit % 8) & 1 != 0 {
+            v |= 1 << k;
+        }
+    }
+    if size < 32 && v >> (size - 1) & 1 != 0 {
+        v |= !0u64 << size;
+    }
+    v as i64 as i32
+}
+
+fn mouse_layout_report(l: &MouseLayout, prev: &mut u8, r: &[u8]) {
+    let r = if l.id != 0 {
+        if r.first() != Some(&l.id) {
+            return;
+        }
+        &r[1..]
+    } else {
+        r
+    };
+    if l.absolute {
+        let get = |f: (u32, u32)| field(r, (f.0, f.1.min(31))) as u32 & ((1u64 << f.1.min(31)) - 1) as u32;
+        let (x, y) = (get(l.x), get(l.y));
+        let scale = |v: u32| (v.min(l.max) as u64 * 65535 / l.max as u64) as u32;
+        input::push(InputEvent::MouseAbsolute { x: Some(scale(x)), y: Some(scale(y)) });
+    }
+    let (dx, dy) = if l.absolute { (0, 0) } else { (field(r, l.x), field(r, l.y)) };
+    if dx != 0 || dy != 0 {
+        input::push(InputEvent::MouseMove { dx, dy });
+    }
+    let mut now = 0u8;
+    for b in 0..l.buttons.1.min(3) {
+        if field(r, (l.buttons.0 + b, 1)) != 0 {
+            now |= 1 << b;
+        }
+    }
+    for (bit, button) in [(1u8, 0u8), (2, 1), (4, 2)] {
+        if (now ^ *prev) & bit != 0 {
+            input::push(InputEvent::MouseButton { button, pressed: now & bit != 0 });
+        }
+    }
+    *prev = now;
+    let w = field(r, l.wheel);
+    if w != 0 {
+        input::push(InputEvent::Wheel(-w));
+    }
 }
 
 struct Device {
@@ -177,6 +328,8 @@ struct Iface {
     eps: Vec<Ep>,
     /// iMACAddress from a CDC Ethernet functional descriptor.
     mac_string: u8,
+    /// Length of the HID report descriptor (HID interfaces).
+    hid_len: u16,
 }
 
 fn parse_config(cfg: &[u8]) -> Vec<Iface> {
@@ -189,10 +342,15 @@ fn parse_config(cfg: &[u8]) -> Vec<Iface> {
         }
         let d = &cfg[i..i + len];
         match d[1] {
-            4 if len >= 9 => out.push(Iface { num: d[2], alt: d[3], class: d[5], sub: d[6], proto: d[7], eps: Vec::new(), mac_string: 0 }),
+            4 if len >= 9 => out.push(Iface { num: d[2], alt: d[3], class: d[5], sub: d[6], proto: d[7], eps: Vec::new(), mac_string: 0, hid_len: 0 }),
             5 if len >= 7 => {
                 if let Some(f) = out.last_mut() {
                     f.eps.push(Ep { addr: d[2], attr: d[3], mps: u16::from_le_bytes([d[4], d[5]]) & 0x7ff, interval: d[6] });
+                }
+            }
+            0x21 if len >= 9 => {
+                if let Some(f) = out.last_mut() {
+                    f.hid_len = u16::from_le_bytes([d[7], d[8]]);
                 }
             }
             0x24 if len >= 4 && d[2] == 0x0f => {
@@ -541,6 +699,17 @@ impl Xhci {
             return;
         }
         let parsed: Vec<Vec<Iface>> = configs.iter().map(|c| parse_config(c)).collect();
+        // Phones: list what each configuration offers (for diagnosing tethering).
+        if matches!(vid, 0x05ac | 0x18d1 | 0x04e8 | 0x22b8 | 0x2717 | 0x12d1) {
+            for (ci, ifaces) in parsed.iter().enumerate() {
+                for f in ifaces {
+                    crate::kprintln!(
+                        "usb: port {} config {} (value {}) interface {} alt {}: class {:02x}/{:02x}/{:02x}, {} endpoints",
+                        port, ci, configs[ci][5], f.num, f.alt, f.class, f.sub, f.proto, f.eps.len()
+                    );
+                }
+            }
+        }
         // A network function (phone tethering) in any configuration.
         for (ci, ifaces) in parsed.iter().enumerate() {
             if let Some(plan) = find_net(ifaces) {
@@ -578,16 +747,19 @@ impl Xhci {
                 }
             }
         }
-        // Keyboards and mice in the first configuration.
-        let mut found: Vec<(Kind, u8, Ep)> = Vec::new();
+        // Keyboards and mice in the first configuration: boot keyboards,
+        // and any HID interface whose report descriptor describes a mouse.
+        let mut found: Vec<(Kind, u8, Ep, u16)> = Vec::new();
         for i in &parsed[0] {
-            let kind = match (i.class, i.sub, i.proto) {
-                (3, 1, 1) => Kind::Keyboard,
-                (3, 1, 2) => Kind::Mouse,
-                _ => continue,
+            if i.class != 3 || i.alt != 0 {
+                continue;
+            }
+            let kind = match (i.sub, i.proto) {
+                (1, 1) => Kind::Keyboard,
+                _ => Kind::Mouse,
             };
             if let Some(ep) = i.eps.iter().find(|e| e.addr & 0x80 != 0 && e.attr & 3 == 3) {
-                found.push((kind, i.num, *ep));
+                found.push((kind, i.num, *ep, i.hid_len));
             }
         }
         if found.is_empty() {
@@ -596,11 +768,34 @@ impl Xhci {
         if !self.control(dev, 0x00, 9, configs[0][5] as u16, 0, None) {
             return;
         }
-        for (kind, ifn, ep) in found {
-            // Boot protocol, and keyboards only report changes.
-            self.control(dev, 0x21, 0x0b, 0, ifn as u16, None);
+        for (kind, ifn, ep, hid_len) in found {
+            let mut layout = None;
             if kind == Kind::Keyboard {
+                // Boot protocol, and only report changes.
+                self.control(dev, 0x21, 0x0b, 0, ifn as u16, None);
                 self.control(dev, 0x21, 0x0a, 0, ifn as u16, None);
+            } else {
+                // Mice: read the report layout (gaming and wireless mice
+                // often have no boot mode, or 16-bit movement).
+                let n = (hid_len as usize).clamp(1, 4096);
+                let mut desc = DmaBuf::try_new(4096);
+                if let Some(d) = desc.as_mut()
+                    && self.control(dev, 0x81, 6, 0x2200, ifn as u16, Some((d, n)))
+                {
+                    layout = parse_mouse(&d.as_slice()[..n]);
+                }
+                match layout {
+                    Some(l) => crate::kprintln!("usb: port {} interface {}: mouse layout {:?}", port, ifn, l),
+                    None => {
+                        // Not a mouse (media keys, a second keyboard part...):
+                        // only real boot mice are used without a layout.
+                        let boot = parsed[0].iter().any(|i| i.num == ifn && i.sub == 1 && i.proto == 2);
+                        if !boot {
+                            continue;
+                        }
+                        self.control(dev, 0x21, 0x0b, 0, ifn as u16, None);
+                    }
+                }
             }
             let dci = (ep.addr & 0xf) * 2 + 1;
             let (Some(ring), Some(buf)) = (Ring::new(), DmaBuf::try_new(64)) else { return };
@@ -616,7 +811,7 @@ impl Xhci {
                 continue;
             }
             let len = (ep.mps as usize).min(64);
-            let mut h = Hid { kind, dci, ring, buf, len, last: [0; 8], buttons: 0 };
+            let mut h = Hid { kind, dci, ring, buf, len, last: [0; 8], buttons: 0, layout, reports: 0 };
             h.ring.push(Trb { param: h.buf.phys, status: len as u32, control: TRB_NORMAL << 10 | 1 << 5 | 1 << 2 });
             w32(self.db + slot as usize * 4, dci as u32);
             crate::kprintln!("usb: port {}: {}", port, if kind == Kind::Keyboard { "keyboard" } else { "mouse" });
@@ -842,9 +1037,27 @@ impl Xhci {
                     let mut rep = [0u8; 8];
                     let n = got.min(8);
                     rep[..n].copy_from_slice(&h.buf.as_slice()[..n]);
-                    match h.kind {
-                        Kind::Keyboard => keyboard_report(&h.last, &rep),
-                        Kind::Mouse => mouse_report(&mut h.buttons, &rep[..n]),
+                    h.reports += 1;
+                    if h.reports <= 3 {
+                        crate::kprintln!("usb: report {:02x?}", &h.buf.as_slice()[..got.min(16)]);
+                    }
+                    match (h.kind, &h.layout) {
+                        (Kind::Keyboard, _) => {
+                            keyboard_report(&h.last, &rep);
+                            let now = uptime_ms();
+                            let held = rep[2..].iter().rev().find(|&&k| k > 3).copied();
+                            let mut r = REPEAT.lock();
+                            match held {
+                                Some(k) if !h.last[2..].contains(&k) => *r = Some((k, now + 500)),
+                                Some(_) => {}
+                                None => *r = None,
+                            }
+                        }
+                        (Kind::Mouse, Some(l)) => {
+                            let l = *l;
+                            mouse_layout_report(&l, &mut h.buttons, &h.buf.as_slice()[..got]);
+                        }
+                        (Kind::Mouse, None) => mouse_report(&mut h.buttons, &rep[..n]),
                     }
                     h.last = rep;
                 }
@@ -873,6 +1086,18 @@ impl Xhci {
     }
 
     pub fn poll(&mut self) {
+        // Held key: repeat it (USB keyboards do not; PS/2 ones do).
+        {
+            let mut r = REPEAT.lock();
+            if let Some((k, at)) = *r
+                && uptime_ms() >= at
+            {
+                if let Some((c, e)) = usage_to_set1(k) {
+                    super::ps2::scancode(c, e, true);
+                }
+                *r = Some((k, at + 33));
+            }
+        }
         let backlog = core::mem::take(&mut self.backlog);
         for t in backlog {
             self.handle(t);
@@ -1059,6 +1284,9 @@ fn mouse_report(prev: &mut u8, r: &[u8]) {
         input::push(InputEvent::Wheel(-(r[3] as i8 as i32)));
     }
 }
+
+/// The key being held on a USB keyboard and when it next repeats.
+static REPEAT: crate::sync::Spin<Option<(u8, u64)>> = crate::sync::Spin::new(None);
 
 static CONTROLLERS: crate::sync::Spin<Vec<PciDevice>> = crate::sync::Spin::new(Vec::new());
 
