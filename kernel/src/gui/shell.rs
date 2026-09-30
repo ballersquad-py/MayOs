@@ -64,7 +64,7 @@ const HELP: &[(&str, &str)] = &[
     ("fps", "desktop frame rate and frame time"),
     ("disks", "list disks and where they are mounted"),
     ("setupdisk <disk>", "make a disk MayOS's main disk (see 'disks')"),
-    ("dmesg", "kernel log"),
+    ("dmesg [word]", "kernel log (only lines with the word)"),
     ("uname", "system name"),
     ("history", "previous commands"),
     ("clear", "clear the screen"),
@@ -642,7 +642,16 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
                 );
             }
         }
-        "dmesg" => out.push_str(&crate::log::contents()),
+        "dmesg" => match args.first() {
+            // `dmesg usb`: only the lines that mention "usb".
+            Some(word) => {
+                for line in crate::log::contents().lines().filter(|l| l.contains(&**word)) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            None => out.push_str(&crate::log::contents()),
+        },
         "uname" => {
             let _ = writeln!(out, "MayOS {} x86_64", crate::VERSION);
         }

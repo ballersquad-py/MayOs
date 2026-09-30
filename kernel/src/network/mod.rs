@@ -143,6 +143,7 @@ struct Iface {
     udp: BTreeMap<u16, VecDeque<(Ipv4, u16, Vec<u8>)>>,
     tcp: net::tcp::Stack,
     stats: [u64; 4],
+    was_up: bool,
 }
 
 static IFACE: Spin<Option<Iface>> = Spin::new(None);
@@ -207,6 +208,7 @@ pub fn init(nic: Nic) {
         udp: BTreeMap::new(),
         tcp: net::tcp::Stack::new(seed),
         stats: [0; 4],
+        was_up: false,
     });
     sched::spawn_kernel("network", net_thread, 0);
 }
@@ -422,6 +424,14 @@ impl Iface {
         let now = uptime_ms();
         match self.dhcp {
             DhcpState::Discovering | DhcpState::Requesting if now - self.dhcp_sent > 2500 => {
+                crate::kprintln!(
+                    "net: DHCP try {} on {} (link {}): {} frames sent, {} received",
+                    self.dhcp_tries + 1,
+                    self.nic.model,
+                    if self.nic.link_up() { "up" } else { "down" },
+                    self.stats[1],
+                    self.stats[0]
+                );
                 if self.dhcp_tries >= 6 {
                     self.dhcp = DhcpState::Failed;
                     crate::kprintln!("net: no DHCP server answered");
@@ -433,8 +443,16 @@ impl Iface {
                 self.dhcp_send(dhcp::DISCOVER, None);
             }
             DhcpState::Bound if now >= self.dhcp_renew_at => self.restart_dhcp(),
+            // Keep asking now and then (a phone's hotspot may come on later).
+            DhcpState::Failed if now - self.dhcp_sent > 10_000 => self.restart_dhcp(),
             _ => {}
         }
+        // A link that just came up (cable plugged in, hotspot turned on): ask at once.
+        let up = self.nic.link_up();
+        if up && !self.was_up && self.dhcp != DhcpState::Bound {
+            self.restart_dhcp();
+        }
+        self.was_up = up;
     }
 
     /// Another network card took over: start over on it.
