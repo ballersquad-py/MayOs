@@ -227,7 +227,9 @@ impl Decoder {
     pub fn decode(&mut self, data: &[u8]) -> Result<()> {
         self.skipped_in_au = false;
         self.decoded_in_au = false;
+        let t0 = tsc();
         let r = self.decode_au(data);
+        PROF_TOTAL.fetch_add(tsc() - t0, core::sync::atomic::Ordering::Relaxed);
         if self.skipped_in_au && !self.decoded_in_au {
             self.skipped_pictures += 1;
         }
@@ -577,7 +579,9 @@ impl Decoder {
             Some(s) => s,
             None => return,
         };
+        let t0 = tsc();
         deblock::deblock_picture(&mut cur.pic);
+        PROF_DEBLOCK.fetch_add(tsc() - t0, core::sync::atomic::Ordering::Relaxed);
         let mut poc = cur.pic.poc;
         let mut top = cur.top_poc;
         if cur.has_mmco5 {
@@ -854,4 +858,21 @@ impl<'a> Iterator for AnnexB<'a> {
         }
         Some(&self.data[start..e])
     }
+}
+
+static PROF_DEBLOCK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PROF_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    0
+}
+
+/// (deblocking, all decoding) CPU cycles since the last call.
+pub fn profile() -> (u64, u64) {
+    (PROF_DEBLOCK.swap(0, core::sync::atomic::Ordering::Relaxed), PROF_TOTAL.swap(0, core::sync::atomic::Ordering::Relaxed))
 }

@@ -50,6 +50,68 @@ fn fmt_time(us: i64) -> String {
     }
 }
 
+/// Playback timing, logged every few seconds (decode and draw cost).
+struct Stats {
+    decode_us: core::sync::atomic::AtomicU64,
+    decoded: core::sync::atomic::AtomicU64,
+    render_us: core::sync::atomic::AtomicU64,
+    shown: core::sync::atomic::AtomicU64,
+    dropped: core::sync::atomic::AtomicU64,
+    since: core::sync::atomic::AtomicU64,
+    last_show: core::sync::atomic::AtomicU64,
+    gap_min: core::sync::atomic::AtomicU64,
+    gap_max: core::sync::atomic::AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    decode_us: core::sync::atomic::AtomicU64::new(0),
+    decoded: core::sync::atomic::AtomicU64::new(0),
+    render_us: core::sync::atomic::AtomicU64::new(0),
+    shown: core::sync::atomic::AtomicU64::new(0),
+    dropped: core::sync::atomic::AtomicU64::new(0),
+    since: core::sync::atomic::AtomicU64::new(0),
+    last_show: core::sync::atomic::AtomicU64::new(0),
+    gap_min: core::sync::atomic::AtomicU64::new(u64::MAX),
+    gap_max: core::sync::atomic::AtomicU64::new(0),
+};
+
+impl Stats {
+    fn report(&self, w: usize, h: usize, dw: i32, dh: i32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let now = uptime_ms();
+        let last = self.last_show.swap(now, Relaxed);
+        if last != 0 && now - last < 1000 {
+            self.gap_min.fetch_min(now - last, Relaxed);
+            self.gap_max.fetch_max(now - last, Relaxed);
+        }
+        let since = self.since.load(Relaxed);
+        if since == 0 {
+            self.since.store(now, Relaxed);
+            return;
+        }
+        if now - since < 5000 {
+            return;
+        }
+        self.since.store(now, Relaxed);
+        let (d, dn, r, rn, dr) = (self.decode_us.swap(0, Relaxed), self.decoded.swap(0, Relaxed), self.render_us.swap(0, Relaxed), self.shown.swap(0, Relaxed), self.dropped.swap(0, Relaxed));
+        let (db, all) = media::h264::profile();
+        crate::kprintln!(
+            "player: {}x{} -> {}x{}: {:.1} fps, {} dropped, decode {} us/frame ({}% deblocking), draw {} us/frame, frames {}..{} ms apart",
+            w,
+            h,
+            dw,
+            dh,
+            rn as f32 * 1000.0 / (now - since) as f32,
+            dr,
+            d / dn.max(1),
+            db * 100 / all.max(1),
+            r / rn.max(1),
+            self.gap_min.swap(u64::MAX, Relaxed),
+            self.gap_max.swap(0, Relaxed)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // Decoding engine (runs on its own kernel thread)
 // ---------------------------------------------------------------------
@@ -163,7 +225,9 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
         }
     }
     let vtrack = vi.filter(|_| vdec.is_some());
-    let atrack = ai.filter(|_| adec.is_some());
+    // Without a sound card the video runs on the system clock (following
+    // a sound that never plays would freeze the picture).
+    let atrack = ai.filter(|_| adec.is_some() && (audio::is_present() || vdec.is_none()));
     let mut description = String::from(info.format);
     if let Some(i) = vi {
         let t = &info.tracks[i];
@@ -325,7 +389,10 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
                 true
             };
             if decode {
+                let t0 = crate::time::uptime_us();
                 v.decode(&pkt);
+                STATS.decode_us.fetch_add(crate::time::uptime_us() - t0, core::sync::atomic::Ordering::Relaxed);
+                STATS.decoded.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let mut s = shared.lock();
                 while let Some(f) = v.next_frame() {
                     if f.pts + 20_000 >= skip_until {
@@ -931,7 +998,20 @@ impl App for Player {
             match &self.current {
                 Some(frame) => {
                     if let Some((buf, stride)) = c.raw_region(vr) {
-                        frame.render(buf, vr.w as usize, vr.h as usize, stride);
+                        let t0 = crate::time::uptime_us();
+                        // In bands, on every CPU.
+                        let (dw, dh) = (vr.w as usize, vr.h as usize);
+                        let (ptr, len) = (buf.as_mut_ptr() as usize, buf.len());
+                        let parts = crate::parallel::width().min(dh.div_ceil(16)).max(1);
+                        let band = dh.div_ceil(parts);
+                        crate::parallel::run(parts, &|i| {
+                            let (r0, r1) = (i * band, ((i + 1) * band).min(dh));
+                            // SAFETY: each band writes its own rows of `buf`.
+                            unsafe { frame.render_rows(ptr as *mut u32, len, dw, dh, stride, r0, r1) };
+                        });
+                        STATS.render_us.fetch_add(crate::time::uptime_us() - t0, core::sync::atomic::Ordering::Relaxed);
+                        STATS.shown.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        STATS.report(frame.width, frame.height, vr.w, vr.h);
                     }
                 }
                 None => {
@@ -1138,10 +1218,18 @@ impl App for Player {
             let mut newest = None;
             while let Some(f) = s.frames.front() {
                 if f.pts <= clock {
+                    if newest.is_some() {
+                        STATS.dropped.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                     newest = s.frames.pop_front();
                 } else {
                     break;
                 }
+            }
+            // Wake the desktop right when the next picture is due.
+            if let Some(next) = s.frames.front() {
+                let wait_ms = ((next.pts - clock).max(0) / 1000) as u64;
+                super::wake_at(uptime_ms() + wait_ms);
             }
             let behind = newest.as_ref().map(|f| clock - f.pts > 120_000).unwrap_or(false);
             if behind {

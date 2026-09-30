@@ -47,6 +47,13 @@ static DISPLAY_DESC: Spin<Option<String>> = Spin::new(None);
 static DISPLAY_MODES: Spin<(Vec<(u32, u32)>, (u32, u32))> = Spin::new((Vec::new(), (0, 0)));
 /// Frames composited so far (used by the self-test).
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Earliest time (uptime ms) an app needs a frame (a video's next
+/// picture); 0 = none. The desktop wakes for it on time.
+static WAKE_AT: AtomicU64 = AtomicU64::new(0);
+
+pub fn wake_at(ms: u64) {
+    let _ = WAKE_AT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| if cur == 0 || ms < cur { Some(ms) } else { None });
+}
 /// Frames per second and average frame time (µs) over the last second.
 pub static FPS: AtomicU64 = AtomicU64::new(0);
 pub static FRAME_US: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +219,12 @@ pub extern "C" fn desktop_main(_: usize) {
             // Nothing happening: wake less often (easier on the host PC).
             12
         };
-        crate::proc::sched::sleep_ms(budget.saturating_sub(spent).max(1));
+        let mut nap = budget.saturating_sub(spent).max(1);
+        let due = WAKE_AT.swap(0, Ordering::AcqRel);
+        if due != 0 {
+            let now = crate::time::uptime_ms();
+            nap = nap.min(due.saturating_sub(now).max(1));
+        }
+        crate::proc::sched::sleep_ms(nap);
     }
 }

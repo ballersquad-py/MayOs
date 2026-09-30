@@ -145,6 +145,28 @@ impl VideoDecoder {
 impl VideoFrame {
     /// Scale (bilinear) and convert to 0xAARRGGBB into `dst` (dw x dh,
     /// row stride `ds`).
+    /// Destination rows `r0..r1` only (for drawing bands on several CPUs;
+    /// pictures that are not YUV are drawn whole by the band at row 0).
+    ///
+    /// # Safety
+    /// `dst` points to `len` writable pixels; bands must not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn render_rows(&self, dst: *mut u32, len: usize, dw: usize, dh: usize, ds: usize, r0: usize, r1: usize) {
+        match &self.data {
+            FrameData::Yuv(f) => {
+                let b = &f.buf;
+                unsafe {
+                    crate::yuv::scale_to_argb_rows(&b.y, &b.cb, &b.cr, b.width, b.width / 2, f.crop_x, f.crop_y, f.width, f.height, f.matrix == 1, f.full_range, dst, len, dw, dh, ds, r0, r1)
+                }
+            }
+            FrameData::Argb(img) if r0 == 0 => {
+                let d = unsafe { core::slice::from_raw_parts_mut(dst, len) };
+                crate::yuv::scale_argb(&img.pixels, img.width as usize, img.height as usize, d, dw, dh, ds);
+            }
+            FrameData::Argb(_) => {}
+        }
+    }
+
     pub fn render(&self, dst: &mut [u32], dw: usize, dh: usize, ds: usize) {
         match &self.data {
             FrameData::Yuv(f) => {

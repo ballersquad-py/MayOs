@@ -80,11 +80,18 @@ pub fn scale_to_argb(
     dh: usize,
     ds: usize,
 ) {
-    scale_to_argb_impl(y, u, v, ys, cs, cx, cy, w, h, bt709, full, dst, dw, dh, ds)
+    // SAFETY: `dst` is a live mutable slice checked by the callee.
+    unsafe { scale_to_argb_rows(y, u, v, ys, cs, cx, cy, w, h, bt709, full, dst.as_mut_ptr(), dst.len(), dw, dh, ds, 0, dh) }
 }
 
+/// Destination rows `r0..r1` only (bands can be drawn on several CPUs
+/// at once).
+///
+/// # Safety
+/// `dst` must point to `dst_len` writable pixels; bands drawn at the same
+/// time must not overlap.
 #[allow(clippy::too_many_arguments)]
-fn scale_to_argb_impl(
+pub unsafe fn scale_to_argb_rows(
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -96,12 +103,39 @@ fn scale_to_argb_impl(
     h: usize,
     bt709: bool,
     full: bool,
-    dst: &mut [u32],
+    dst: *mut u32,
+    dst_len: usize,
     dw: usize,
     dh: usize,
     ds: usize,
+    r0: usize,
+    r1: usize,
 ) {
-    if dw == 0 || dh == 0 || w == 0 || h == 0 {
+    unsafe { scale_to_argb_impl(y, u, v, ys, cs, cx, cy, w, h, bt709, full, dst, dst_len, dw, dh, ds, r0, r1.min(dh)) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn scale_to_argb_impl(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    ys: usize,
+    cs: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    bt709: bool,
+    full: bool,
+    dst: *mut u32,
+    dst_len: usize,
+    dw: usize,
+    dh: usize,
+    ds: usize,
+    r0: usize,
+    r1: usize,
+) {
+    if dw == 0 || dh == 0 || w == 0 || h == 0 || r0 >= r1 {
         return;
     }
     let (cr_r, cb_g, cr_g, cb_b) = match (bt709, full) {
@@ -126,9 +160,10 @@ fn scale_to_argb_impl(
         xfs.push(((sx >> 8) & 0xff) as i32);
         xcs.push(((sx / 2 >> 16) + cx / 2).min((cx + w) / 2 - 1) as i32);
     }
-    let (mut ry0, mut ry1, mut rfy, mut rc) = (Vec::with_capacity(dh), Vec::with_capacity(dh), Vec::with_capacity(dh), Vec::with_capacity(dh));
-    let mut accy = step_y / 2;
-    for _ in 0..dh {
+    let rows = r1 - r0;
+    let (mut ry0, mut ry1, mut rfy, mut rc) = (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    let mut accy = step_y / 2 + step_y * r0 as u64;
+    for _ in r0..r1 {
         let sy = if accy > (1 << 15) { (accy - (1 << 15)) as usize } else { 0 };
         accy += step_y;
         let y0 = (sy >> 16).min(h - 1);
@@ -141,7 +176,7 @@ fn scale_to_argb_impl(
     let (xb, xe) = (cx, cx + w);
     assert!(ry1.iter().chain(&ry0).all(|&r| r as usize + xe <= y.len()));
     assert!(rc.iter().all(|&r| r as usize + (cx + w).div_ceil(2) <= u.len().min(v.len())));
-    assert!(xe <= ys && (dh - 1) * ds + dw <= dst.len());
+    assert!(xe <= ys && (r1 - 1) * ds + dw <= dst_len);
     let coef = [cr_r, cb_g, cr_g, cb_b, ymul, yoff];
     let mut tmp = vec![0u16; xe];
     let (mut yb, mut ub, mut vb) = (vec![0i16; dw], vec![0i16; dw], vec![0i16; dw]);
@@ -149,9 +184,9 @@ fn scale_to_argb_impl(
     unsafe {
         mayos_yuv_scale(
             y.as_ptr(), u.as_ptr(), v.as_ptr(),
-            ry0.as_ptr(), ry1.as_ptr(), rfy.as_ptr(), rc.as_ptr(), dh as i32,
+            ry0.as_ptr(), ry1.as_ptr(), rfy.as_ptr(), rc.as_ptr(), rows as i32,
             x0s.as_ptr(), x1s.as_ptr(), xfs.as_ptr(), xcs.as_ptr(), dw as i32,
-            xb as i32, xe as i32, coef.as_ptr(), dst.as_mut_ptr(), ds as i32,
+            xb as i32, xe as i32, coef.as_ptr(), dst.add(r0 * ds), ds as i32,
             tmp.as_mut_ptr(), yb.as_mut_ptr(), ub.as_mut_ptr(), vb.as_mut_ptr(),
         );
     }
