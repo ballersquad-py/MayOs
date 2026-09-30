@@ -27,7 +27,7 @@ const DB_DIR: &str = "/var/lib/pkg";
 /// MayOS cannot use: programs fall back to software drawing).
 const SKIP: &[&str] = &[
     "mesa", "mesa-egl", "mesa-gbm", "mesa-gl", "mesa-gles", "mesa-dri-gallium", "mesa-glapi", "mesa-vulkan-swrast", "llvm20-libs",
-    "llvm19-libs", "spirv-tools", "vulkan-loader",
+    "llvm19-libs", "spirv-tools",
 ];
 
 struct Pkg {
@@ -88,6 +88,12 @@ pub fn firefox_setup_once() {
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if !DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         firefox_setup();
+        // Older MayOS could not replace files by renaming, so the compiled
+        // GSettings schemas could be stale (the file chooser then aborts):
+        // rebuild them once per boot, in the background.
+        if fs::exists("/usr/bin/glib-compile-schemas") {
+            let _ = crate::gui::detached::run("/", "glib-compile-schemas /usr/share/glib-2.0/schemas");
+        }
     }
 }
 

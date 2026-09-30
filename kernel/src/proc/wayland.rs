@@ -1560,12 +1560,13 @@ impl State {
 
     fn pointer_axis(&mut self, delta: i32) {
         let t = now_ms();
-        let v = -delta.signum() * 10 * 256;
+        // Wayland: positive is down, as in MayOS.
+        let v = delta.signum() * 10 * 256;
         let ps: Vec<u32> = self.pointers.clone();
         for p in ps {
             if self.version(p) >= 5 {
                 self.ev(p, 6, vec![A::U(0)]); // axis_source: wheel
-                self.ev(p, 8, vec![A::U(0), A::I(-delta.signum())]); // axis_discrete
+                self.ev(p, 8, vec![A::U(0), A::I(delta.signum())]); // axis_discrete
             }
             self.ev(p, 4, vec![A::U(t), A::U(0), A::F(v)]);
         }

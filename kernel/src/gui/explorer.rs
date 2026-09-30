@@ -65,7 +65,35 @@ enum Action {
     CopyPath,
     Properties,
     Sort(u8),
+    Extract,
+    Compress,
 }
+
+/// Archives `bsdtar` (libarchive) can open, as WinRAR/7-Zip would.
+const ARCHIVE_EXT: &[&str] = &["zip", "rar", "7z", "tar", "gz", "tgz", "xz", "txz", "bz2", "tbz2", "zst", "iso", "cab", "lzma", "cpio", "jar", "apk"];
+
+fn is_archive(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ARCHIVE_EXT.iter().any(|e| n.ends_with(&format!(".{}", e))) || n.ends_with(".part1.rar")
+}
+
+/// "photos.tar.gz" -> "photos".
+fn archive_stem(name: &str) -> String {
+    let mut n = String::from(name);
+    for _ in 0..2 {
+        if let Some(i) = n.rfind('.') {
+            let ext = n[i + 1..].to_ascii_lowercase();
+            if i > 0 && ARCHIVE_EXT.contains(&ext.as_str()) || ext == "tar" {
+                n.truncate(i);
+                continue;
+            }
+        }
+        break;
+    }
+    n
+}
+
+const BSDTAR: &str = "/usr/bin/bsdtar";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hover {
@@ -456,6 +484,9 @@ impl Explorer {
         let path = fs::join(&self.path, &e.name);
         if e.is_dir {
             self.navigate(&path, true);
+        } else if is_archive(&e.name) {
+            self.selected = Some(i);
+            self.run(Action::Extract, ctx);
         } else if let Err(err) = super::open_path(&path, ctx) {
             self.flash(format!("Cannot open {}: {}", e.name, err), true);
         }
@@ -565,6 +596,40 @@ impl Explorer {
                     ctx.open_child(Box::new(Dialog::confirm(&title, &msg, "OK", false, 0, me)));
                 }
             }
+            Action::Extract => {
+                if let Some(p) = self.selected_path() {
+                    if !fs::exists(BSDTAR) {
+                        self.flash(String::from("Installing the archive tools; choose Extract Here again when done"), false);
+                        ctx.open(Box::new(Terminal::with_command(&self.path, "pkg install libarchive-tools")));
+                    } else {
+                        let name = fs::file_name(&p).to_string();
+                        let folder = fs::unique_name(&self.path, &archive_stem(&name));
+                        let target = fs::join(&self.path, &folder);
+                        match fs::create_dir(&target) {
+                            Ok(()) => {
+                                let cmd = format!("bsdtar -xvf \"{}\" -C \"{}\"", p, target);
+                                ctx.open(Box::new(Terminal::with_command(&self.path, &cmd)));
+                                self.select_after_refresh = Some(folder);
+                            }
+                            Err(e) => self.flash(format!("Cannot create the folder: {}", e), true),
+                        }
+                    }
+                }
+            }
+            Action::Compress => {
+                if let Some(p) = self.selected_path() {
+                    if !fs::exists(BSDTAR) {
+                        self.flash(String::from("Installing the archive tools; choose Compress again when done"), false);
+                        ctx.open(Box::new(Terminal::with_command(&self.path, "pkg install libarchive-tools")));
+                    } else {
+                        let name = fs::file_name(&p).to_string();
+                        let zip = fs::unique_name(&self.path, &format!("{}.zip", name));
+                        let cmd = format!("bsdtar -a -cvf \"{}\" -C \"{}\" \"{}\"", fs::join(&self.path, &zip), self.path, name);
+                        ctx.open(Box::new(Terminal::with_command(&self.path, &cmd)));
+                        self.select_after_refresh = Some(zip);
+                    }
+                }
+            }
             Action::Sort(k) => {
                 self.sort = k;
                 self.refresh();
@@ -661,6 +726,10 @@ impl Explorer {
             items.push(None);
             items.push(Some((Action::Rename, "Rename\u{2026}")));
             items.push(Some((Action::Duplicate, "Duplicate")));
+            if self.selected_path().map(|p| is_archive(&p)).unwrap_or(false) {
+                items.push(Some((Action::Extract, "Extract Here")));
+            }
+            items.push(Some((Action::Compress, "Compress to .zip")));
             items.push(Some((Action::Copy, "Copy")));
             items.push(Some((Action::Cut, "Cut")));
             items.push(Some((Action::Delete, "Delete\u{2026}")));

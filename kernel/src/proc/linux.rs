@@ -1747,6 +1747,34 @@ fn set_cloexec(p: &Process, fd: i64, on: bool) {
     }
 }
 
+/// rename(2): an existing target is replaced, as programs expect (they
+/// save files by writing a temporary one and renaming it over the old).
+fn rename_replacing(from: &str, to: &str, noreplace: bool) -> i64 {
+    if from == to {
+        return 0;
+    }
+    let Ok(src) = fs::stat(from) else { return -ENOENT };
+    if let Ok(dst) = fs::stat(to) {
+        if noreplace {
+            return -EEXIST;
+        }
+        match (src.is_dir, dst.is_dir) {
+            (false, true) => return -EISDIR,
+            (true, false) => return -ENOTDIR,
+            (true, true) => {
+                if fs::read_dir(to).map(|v| !v.is_empty()).unwrap_or(true) {
+                    return -ENOTEMPTY;
+                }
+            }
+            _ => {}
+        }
+        if let Err(e) = fs::remove(to) {
+            return fs_err(e);
+        }
+    }
+    fs::rename(from, to).map(|_| 0).unwrap_or_else(fs_err)
+}
+
 /// Path of a `sockaddr_un` (abstract names start with '@').
 fn read_sockaddr_un(p: &Process, ptr: u64, len: u64) -> Result<String, i64> {
     let b = usermem::read_bytes(p.pml4(), ptr, len.min(110)).ok_or(-EFAULT)?;
@@ -1756,6 +1784,12 @@ fn read_sockaddr_un(p: &Process, ptr: u64, len: u64) -> Result<String, i64> {
     let raw = &b[2..];
     if raw[0] == 0 {
         return Ok(alloc::format!("@{}", String::from_utf8_lossy(&raw[1..])));
+    }
+    // "@name" also means the abstract socket (Java cannot write the
+    // leading zero byte; MayOS's launcher reaches Xwayland this way).
+    if raw[0] == b'@' {
+        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        return Ok(String::from_utf8_lossy(&raw[..end]).to_string());
     }
     let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     let path = String::from_utf8_lossy(&raw[..end]).to_string();
@@ -2832,8 +2866,8 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     if TRACE.load(Ordering::Relaxed) {
         // File calls: show the path too.
         let path_arg = match nr {
-            2 | 4 | 6 | 21 | 89 | 137 => Some(args[0]),
-            257 | 262 | 267 | 269 | 332 | 439 => Some(args[1]),
+            2 | 4 | 6 | 21 | 82 | 83 | 84 | 87 | 89 | 90 | 137 | 188 | 189 | 191 | 192 => Some(args[0]),
+            257 | 258 | 262 | 263 | 264 | 267 | 268 | 269 | 280 | 316 | 332 | 439 => Some(args[1]),
             _ => None,
         };
         let mut path = path_arg.and_then(|a| usermem::read_cstr(p.pml4(), a, 200)).unwrap_or_default();
@@ -3187,8 +3221,9 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         82 | 264 | 316 => {
             // rename / renameat / renameat2
             let (from, to) = if f.rax == 82 { (path_at(p, -100, a0), path_at(p, -100, a1)) } else { (path_at(p, a0 as i64, a1), path_at(p, a2 as i64, a3)) };
+            let noreplace = f.rax == 316 && a4 & 1 != 0; // RENAME_NOREPLACE
             match (from, to) {
-                (Ok(a), Ok(b)) => fs::rename(&a, &b).map(|_| 0).unwrap_or_else(fs_err),
+                (Ok(a), Ok(b)) => rename_replacing(&a, &b, noreplace),
                 (Err(e), _) | (_, Err(e)) => e,
             }
         }

@@ -93,11 +93,20 @@ pub fn run(parts: usize, f: &(dyn Fn(usize) + Sync + '_)) {
     }
     sched::wake(0);
     work_on();
+    // Parts a worker took but has not finished: give the CPU away while
+    // waiting (spinning here starves busy programs, and the worker itself
+    // when it shares this CPU).
+    let mut spins = 0u32;
     while DONE.load(Ordering::Acquire) < parts {
-        core::hint::spin_loop();
+        spins += 1;
+        if spins > 200 {
+            sched::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
     }
     *JOB.lock() = None;
     while ACTIVE.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
+        sched::yield_now();
     }
 }

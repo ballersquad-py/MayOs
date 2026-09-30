@@ -264,11 +264,8 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
     let mut eof = false;
     let mut pcm48: Vec<i16> = Vec::new();
     // Compressed video waiting to be decoded. Audio always comes first:
-    // video is decoded only while enough sound is queued, and when the CPU
-    // can't keep up, video skips ahead to the next keyframe instead of
-    // making the sound stutter.
+    // video is decoded only while enough sound is queued.
     let mut vq: VecDeque<demux::Packet> = VecDeque::new();
-    let mut skipping = false;
     let mut flushed = false;
     loop {
         let (stop, seek, late, frames, base) = {
@@ -294,7 +291,6 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
             eof = false;
             flushed = false;
             vq.clear();
-            skipping = false;
             let mut s = shared.lock();
             s.frames.clear();
             s.base_us = t;
@@ -303,13 +299,11 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
             s.viz_written = 0;
             continue;
         }
-        if let Some(v) = vdec.as_mut() {
-            v.set_skip_nonref(late || skipping);
-        }
+        let _ = late;
         let queued = stream.queued();
         let audio_low = atrack.is_some() && queued < 14_400; // 0.3 s
         let audio_full = atrack.is_none() || queued >= 24_000; // 0.5 s
-        let video_wanted = vtrack.is_some() && frames < 8;
+        let video_wanted = vtrack.is_some() && frames < 16;
         let mut worked = false;
 
         // 1. Read the next packet: while sound is short, or video needs one.
@@ -369,26 +363,12 @@ fn engine(args: &EngineArgs) -> Result<(), String> {
         if video_wanted && !vq.is_empty() && (!audio_low || vq.len() >= 3000) {
             worked = true;
             let pkt = vq.pop_front().unwrap();
-            // What the listener hears now (the same clock the window uses).
-            let clock = base + (stream.played().saturating_sub(audio::latency_frames()) as i64 * 1_000_000 / 48_000);
-            let behind = atrack.is_some() && pkt.pts + 250_000 < clock;
+            // Every packet is decoded, in order: no skipping ahead to the
+            // next keyframe and no dropping of frames others depend on
+            // (both made the picture jump and twitch).
+            let _ = base;
             let v = vdec.as_mut().unwrap();
-            let decode = if skipping {
-                if pkt.key {
-                    skipping = false;
-                    v.reset();
-                    true
-                } else {
-                    false
-                }
-            } else if (behind || vq.len() >= 3000) && !pkt.key && vq.iter().any(|q| q.key) {
-                // Far behind and a keyframe is waiting: jump to it.
-                skipping = true;
-                false
-            } else {
-                true
-            };
-            if decode {
+            {
                 let t0 = crate::time::uptime_us();
                 v.decode(&pkt);
                 STATS.decode_us.fetch_add(crate::time::uptime_us() - t0, core::sync::atomic::Ordering::Relaxed);

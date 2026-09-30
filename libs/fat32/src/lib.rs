@@ -655,12 +655,30 @@ impl<D: BlockDevice> FatFs<D> {
     fn chain(&mut self, first: u32) -> Result<Vec<u32>> {
         let mut out = Vec::new();
         let mut c = first;
+        // Big files span thousands of FAT sectors: read them 64 at a time
+        // (one sector per read made opening a long video take seconds).
+        // Sectors in the cache may hold unwritten changes and win.
+        const CHUNK: u64 = 64;
+        let fat_end = self.part_lba + self.reserved_sectors as u64 + self.fat_size as u64;
+        let mut chunk: (u64, Vec<u8>) = (u64::MAX, Vec::new());
         while self.valid_cluster(c) {
             out.push(c);
             if out.len() > self.total_clusters as usize {
                 return Err(FsError::Corrupt);
             }
-            let next = self.fat_get(c)?;
+            let (lba, off) = self.fat_location(c);
+            let next = if let Some(i) = self.cache.iter().position(|x| x.lba == lba) {
+                rd32(&self.cache[i].data[..], off) & FAT_MASK
+            } else {
+                if !(chunk.0 != u64::MAX && lba >= chunk.0 && lba < chunk.0 + (chunk.1.len() / SECTOR) as u64) {
+                    let n = CHUNK.min(fat_end.saturating_sub(lba)).max(1);
+                    let mut buf = vec![0u8; n as usize * SECTOR];
+                    self.dev.read(lba, &mut buf).map_err(|_| FsError::Io)?;
+                    chunk = (lba, buf);
+                }
+                let at = (lba - chunk.0) as usize * SECTOR;
+                rd32(&chunk.1[at..at + SECTOR], off) & FAT_MASK
+            };
             if next >= 0x0fff_fff8 {
                 break;
             }

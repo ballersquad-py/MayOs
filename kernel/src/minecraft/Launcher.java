@@ -48,6 +48,7 @@ public class Launcher {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
         boolean login = false, logout = false;
+        boolean art = false;
         boolean packOnly = false, forge = false, ornithe = false, software = false, forceGpu = false;
         System.out.println("MayOS Minecraft launcher, build " + BUILD);
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
@@ -74,6 +75,7 @@ public class Launcher {
             else if (args[i].equals("--fullscreen")) x11Fullscreen = true;
             else if (args[i].equals("--login")) login = true;
             else if (args[i].equals("--logout")) logout = true;
+            else if (args[i].equals("--art")) art = true;
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -83,6 +85,10 @@ public class Launcher {
         HTTP = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
         cacheDir = mc.resolve("cache");
         Path accountFile = mc.resolve("mayos-account.json");
+        if (art) {
+            extractArt(mc, null);
+            return;
+        }
         if (logout) {
             Files.deleteIfExists(accountFile);
             System.out.println("Signed out: playing offline.");
@@ -378,6 +384,7 @@ public class Launcher {
             System.out.println(String.join(" ", cmd));
             return;
         }
+        extractArt(mc, client);
         System.out.println("Starting Minecraft...");
         Files.createDirectories(gameDir);
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(gameDir.toFile()).inheritIO();
@@ -432,6 +439,7 @@ public class Launcher {
             // LWJGL 2 needs X11: a rootful Xwayland is an X server in a MayOS window.
             xserver = startXwayland(pb);
         }
+        if (forge) noPauseOnFocusLoss(gameDir);
         Process game = pb.start();
         if (forge) x11Helper(game, pb.environment().get("DISPLAY"));
         int code = game.waitFor();
@@ -489,38 +497,202 @@ public class Launcher {
     static boolean x11Fullscreen = false;
 
     // Xwayland has no window manager: nobody gives the game keyboard focus
-    // (LWJGL 2 then thinks it is in the background and Minecraft keeps
-    // opening the pause menu), and nobody resizes it with the X screen.
-    // This does both, with xdotool and xrandr.
+    // (LWJGL 2 then thinks it is in the background) and nobody resizes it
+    // when the X screen changes size with its MayOS window. This does a
+    // window manager's two jobs, speaking X11 directly (no extra programs).
     static void x11Helper(Process game, String display) {
         Thread t = new Thread(() -> {
-            String win = null;
-            String size = "";
+            int d = Integer.parseInt(display.replace(":", "").split("\\.")[0]);
+            X11 x = null;
+            long win = 0;
+            int[] size = {0, 0};
             while (game.isAlive()) {
                 try {
-                    Thread.sleep(win == null ? 500 : 700);
-                    if (win == null) {
-                        String out = runOut(display, "xdotool", "search", "--onlyvisible", "--name", "Minecraft").trim();
-                        if (out.isEmpty()) continue;
-                        win = out.split("\\s+")[0];
+                    Thread.sleep(win == 0 ? 400 : 500);
+                    if (x == null) x = X11.connect(d);
+                    int[] root = x.geometry(x.root);
+                    // The game's window: the biggest top-level window.
+                    long best = 0;
+                    int area = 0;
+                    for (long c : x.children(x.root)) {
+                        int[] g = x.geometry(c);
+                        if (g != null && g[2] * g[3] > area && g[2] > 64) { area = g[2] * g[3]; best = c; }
                     }
-                    String focus = runOut(display, "xdotool", "getwindowfocus").trim();
-                    if (!focus.equals(win)) runOut(display, "xdotool", "windowfocus", win);
-                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("current (\\d+) x (\\d+)").matcher(runOut(display, "xrandr", "--current"));
-                    if (m.find()) {
-                        String cur = m.group(1) + "x" + m.group(2);
-                        if (!cur.equals(size)) {
-                            size = cur;
-                            runOut(display, "xdotool", "windowmove", win, "0", "0", "windowsize", win, m.group(1), m.group(2));
-                        }
+                    if (best == 0) continue;
+                    if (best != win) { win = best; size[0] = 0; }
+                    if (root != null && (root[2] != size[0] || root[3] != size[1])) {
+                        size[0] = root[2];
+                        size[1] = root[3];
+                        x.configure(win, 0, 0, root[2], root[3]);
                     }
+                    x.focus(win);
                 } catch (Exception e) {
-                    // xdotool missing or the window went away: try again
+                    if (x != null) x.close();
+                    x = null;
+                    win = 0;
                 }
             }
         });
         t.setDaemon(true);
         t.start();
+    }
+
+    /** The few X11 requests a window manager needs, over Xwayland's socket. */
+    static class X11 {
+        java.nio.channels.SocketChannel ch;
+        long root;
+        int seq; // requests sent (X11 numbers them from 1)
+
+        static X11 connect(int display) throws IOException {
+            X11 x = new X11();
+            java.net.UnixDomainSocketAddress a = java.net.UnixDomainSocketAddress.of("@/tmp/.X11-unix/X" + display);
+            try {
+                x.ch = java.nio.channels.SocketChannel.open(a);
+            } catch (IOException e) {
+                x.ch = java.nio.channels.SocketChannel.open(java.net.UnixDomainSocketAddress.of("/tmp/.X11-unix/X" + display));
+            }
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(12).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            b.put((byte) 'l').put((byte) 0).putShort((short) 11).putShort((short) 0).putShort((short) 0).putShort((short) 0).putShort((short) 0);
+            x.write(b.array());
+            java.nio.ByteBuffer h = x.read(8);
+            if (h.get(0) != 1) throw new IOException("X11 connection refused");
+            java.nio.ByteBuffer body = x.read((h.getShort(6) & 0xffff) * 4);
+            int vendor = body.getShort(16) & 0xffff;
+            int formats = body.get(21) & 0xff;
+            int screen = 32 + ((vendor + 3) & ~3) + formats * 8;
+            x.root = body.getInt(screen) & 0xffffffffL;
+            return x;
+        }
+
+        void send(byte[] b) throws IOException {
+            seq++;
+            write(b);
+        }
+
+        void write(byte[] b) throws IOException {
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(b);
+            while (bb.hasRemaining()) ch.write(bb);
+        }
+
+        java.nio.ByteBuffer read(int n) throws IOException {
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(n).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            while (b.hasRemaining()) if (ch.read(b) < 0) throw new IOException("X11 connection closed");
+            b.flip();
+            return b;
+        }
+
+        /** Send a request that has a reply; skip events, stop on an error. */
+        java.nio.ByteBuffer ask(byte[] req) throws IOException {
+            send(req);
+            int want = seq & 0xffff;
+            while (true) {
+                java.nio.ByteBuffer h = read(32);
+                int type = h.get(0);
+                boolean mine = (h.getShort(2) & 0xffff) == want;
+                if (type == 0 && mine) return null; // error (e.g. the window went away)
+                if (type == 1) {
+                    int extra = h.getInt(4) * 4;
+                    java.nio.ByteBuffer all = java.nio.ByteBuffer.allocate(32 + extra).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                    all.put(h.array());
+                    if (extra > 0) all.put(read(extra));
+                    all.flip();
+                    if (mine) return all;
+                }
+            }
+        }
+
+        static byte[] req(int op, int data, int... words) {
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(4 + words.length * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            b.put((byte) op).put((byte) data).putShort((short) (1 + words.length));
+            for (int w : words) b.putInt(w);
+            return b.array();
+        }
+
+        /** {x, y, width, height}, or null. */
+        int[] geometry(long w) throws IOException {
+            java.nio.ByteBuffer r = ask(req(14, 0, (int) w));
+            if (r == null) return null;
+            return new int[] {r.getShort(12), r.getShort(14), r.getShort(16) & 0xffff, r.getShort(18) & 0xffff};
+        }
+
+        List<Long> children(long w) throws IOException {
+            java.nio.ByteBuffer r = ask(req(15, 0, (int) w));
+            List<Long> out = new ArrayList<>();
+            if (r == null) return out;
+            int n = r.getShort(16) & 0xffff;
+            for (int i = 0; i < n; i++) out.add(r.getInt(32 + i * 4) & 0xffffffffL);
+            return out;
+        }
+
+        void configure(long w, int x, int y, int width, int height) throws IOException {
+            // ConfigureWindow: x, y, width, height (value mask 0xf).
+            send(req(12, 0, (int) w, 0xf, x, y, width, height));
+        }
+
+        void focus(long w) throws IOException {
+            // SetInputFocus, reverting to PointerRoot, at CurrentTime; then
+            // a round trip so errors never pile up unread.
+            send(req(42, 1, (int) w, 0));
+            ask(req(43, 0));
+        }
+
+        void close() {
+            try { ch.close(); } catch (IOException e) { }
+        }
+    }
+
+    // The MayOS launcher app shows the game's own title-screen panorama and
+    // logo: copied out of the installed client jar (newest first).
+    static final String[][] ART = {
+        {"assets/minecraft/textures/gui/title/background/panorama_0.png", "panorama.png"},
+        {"assets/minecraft/textures/gui/title/minecraft.png", "logo.png"},
+        {"assets/minecraft/textures/gui/title/edition.png", "edition.png"},
+    };
+
+    static void extractArt(Path mc, Path jar) {
+        try {
+            Path out = mc.resolve("mayos-art");
+            List<Path> jars = new ArrayList<>();
+            if (jar != null) jars.add(jar);
+            Path versions = mc.resolve("versions");
+            if (Files.isDirectory(versions)) {
+                try (var s = Files.list(versions)) {
+                    s.map(d -> d.resolve(d.getFileName() + ".jar")).filter(Files::exists)
+                        .sorted(Comparator.comparingLong((Path p) -> p.toFile().lastModified()).reversed()).forEach(jars::add);
+                }
+            }
+            Files.createDirectories(out);
+            for (String[] a : ART) {
+                if (Files.exists(out.resolve(a[1])) && jar == null) continue;
+                for (Path j : jars) {
+                    try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(j.toFile())) {
+                        java.util.zip.ZipEntry e = z.getEntry(a[0]);
+                        if (e == null) continue;
+                        try (InputStream in = z.getInputStream(e)) {
+                            Files.copy(in, out.resolve(a[1]), StandardCopyOption.REPLACE_EXISTING);
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // only decoration
+        }
+    }
+
+    // Minecraft pauses singleplayer worlds when its window seems to lose
+    // focus; under Xwayland that can happen without a reason, so turn it off.
+    static void noPauseOnFocusLoss(Path gameDir) {
+        try {
+            Path o = gameDir.resolve("options.txt");
+            List<String> lines = Files.exists(o) ? new ArrayList<>(Files.readAllLines(o)) : new ArrayList<>();
+            lines.removeIf(l -> l.startsWith("pauseOnLostFocus:"));
+            lines.add("pauseOnLostFocus:false");
+            Files.createDirectories(gameDir);
+            Files.write(o, lines);
+        } catch (IOException e) {
+            // not important enough to stop the game
+        }
     }
 
     static String runOut(String display, String... cmd) throws Exception {

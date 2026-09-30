@@ -1090,7 +1090,7 @@ impl Wm {
     /// Show or hide an auto-hiding dock depending on the pointer.
     fn update_dock_visibility(&mut self, now: u64) {
         let hidden = self.dock_hide_distance();
-        let want_shown = if !self.cfg.dock_autohide {
+        let want_shown = if !self.cfg.dock_autohide || self.menu_open {
             true
         } else {
             let (x, y) = self.pointer;
@@ -1194,7 +1194,10 @@ impl Wm {
     // -----------------------------------------------------------------
 
     pub fn handle(&mut self, ev: InputEvent) {
-        if let Some(w) = crate::proc::wayland::pointer_lock() {
+        // The Start menu takes the mouse back from a game that captured it.
+        if !self.menu_open
+            && let Some(w) = crate::proc::wayland::pointer_lock()
+        {
             match ev {
                 InputEvent::MouseMove { dx, dy } => {
                     // A game captured the mouse: raw motion, the pointer stays put.
@@ -1516,7 +1519,7 @@ impl Wm {
         let (x, y) = self.pointer;
         if self.menu_open && self.menu_rect().contains(x, y) {
             let n = self.menu_apps().len();
-            let s = self.menu_scroll as i32 - delta.signum() * 2;
+            let s = self.menu_scroll as i32 + delta.signum() * 2;
             self.menu_scroll = s.clamp(0, n.saturating_sub(4) as i32) as usize;
             self.damage(self.menu_rect().inset(-20));
             return;

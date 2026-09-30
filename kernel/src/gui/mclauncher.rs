@@ -101,6 +101,12 @@ pub struct McLauncher {
     size: (i32, i32),
     login: Option<Login>,
     account: Option<String>,
+    panorama: Option<Art>,
+    logo: Option<Art>,
+    edition: Option<Art>,
+    /// The panorama fitted to the picture area (rebuilt on resize).
+    hero: Option<gfx::Surface>,
+    art_checked: u64,
 }
 
 fn installed() -> bool {
@@ -122,46 +128,62 @@ fn hash(mut x: u32) -> u32 {
     x ^ (x >> 16)
 }
 
-/// A blocky landscape: sky, sun, hills of grass and dirt, a few trees.
-fn scene(c: &mut Canvas, r: Rect) {
-    c.fill_gradient_v(r, rgb(0x6f, 0xa8, 0xf0), rgb(0xb9, 0xdc, 0xfb));
-    let b = 16;
-    c.fill_rect(Rect::new(r.right() - 170, r.y + 40, b * 4, b * 4), rgb(0xff, 0xf3, 0xb0));
-    // Clouds.
-    for k in 0..5u32 {
-        let cx = r.x + (hash(k + 7) % r.w.max(1) as u32) as i32;
-        let cy = r.y + 30 + (hash(k + 11) % 90) as i32;
-        let n = 3 + (hash(k) % 4) as i32;
-        c.fill_rect(Rect::new(cx, cy, b * n, b), rgba(255, 255, 255, 220));
-        c.fill_rect(Rect::new(cx + b, cy - b, b * (n - 2).max(1), b), rgba(255, 255, 255, 220));
+const ART_DIR: &str = "/home/.minecraft/mayos-art";
+
+/// A picture from the game's own files (extracted by `minecraft --art`).
+struct Art {
+    w: i32,
+    h: i32,
+    px: Vec<u32>,
+}
+
+fn load_art(name: &str) -> Option<Art> {
+    let data = fs::read_file(&format!("{}/{}", ART_DIR, name)).ok()?;
+    let img = image::decode(&data).ok()?;
+    Some(Art { w: img.width as i32, h: img.height as i32, px: img.pixels })
+}
+
+/// Box-filtered crop-and-scale of `src` (region `from`) to w x h, opaque.
+fn scale_cover(src: &Art, w: i32, h: i32) -> gfx::Surface {
+    // Crop to the destination's aspect ratio, centred.
+    let (mut fw, mut fh) = (src.w, src.w * h / w.max(1));
+    if fh > src.h {
+        fh = src.h;
+        fw = src.h * w / h.max(1);
     }
-    let cols = r.w / b + 1;
-    let base = r.y + r.h * 58 / 100;
-    for i in 0..cols {
-        let t = i as f32 * 0.21;
-        let wave = libm::sinf(t) * 1.5 + libm::sinf(t * 0.37 + 1.3) * 2.5;
-        let top = base + (wave as i32) * b;
-        let x = r.x + i * b;
-        let rows = (r.bottom() - top) / b + 1;
-        for j in 0..rows {
-            let y = top + j * b;
-            let n = hash((i as u32) << 8 ^ j as u32) % 24;
-            let col = if j == 0 {
-                rgb(0x5c + n as u8 / 2, 0x9e + n as u8 / 3, 0x31)
-            } else if j < 4 {
-                rgb(0x86 + n as u8 / 2, 0x5f + n as u8 / 3, 0x3e)
-            } else {
-                rgb(0x7a + n as u8, 0x7a + n as u8, 0x7a + n as u8)
-            };
-            c.fill_rect(Rect::new(x, y, b, b), col);
-        }
-        if hash(i as u32 * 31) % 9 == 0 && i > 1 && i < cols - 2 {
-            for j in 1..4 {
-                c.fill_rect(Rect::new(x, top - j * b, b, b), rgb(0x6b, 0x4f, 0x2c));
+    let (fx, fy) = ((src.w - fw) / 2, (src.h - fh) / 2);
+    let mut out = gfx::Surface::new(w, h, 0);
+    for oy in 0..h {
+        let y0 = fy + oy * fh / h;
+        let y1 = (fy + (oy + 1) * fh / h).max(y0 + 1).min(src.h);
+        for ox in 0..w {
+            let x0 = fx + ox * fw / w;
+            let x1 = (fx + (ox + 1) * fw / w).max(x0 + 1).min(src.w);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = src.px[(y * src.w + x) as usize];
+                    r += p >> 16 & 0xff;
+                    g += p >> 8 & 0xff;
+                    b += p & 0xff;
+                    n += 1;
+                }
             }
-            for (dx, dy) in [(-1, 4), (0, 4), (1, 4), (-1, 5), (0, 5), (1, 5), (0, 6), (-2, 4), (2, 4)] {
-                let g = 0x3a + (hash((i * 7 + dx + dy) as u32) % 20) as u8;
-                c.fill_rect(Rect::new(x + dx * b, top - dy * b, b, b), rgb(0x2d, g + 0x30, 0x1e));
+            let n = n.max(1);
+            out.data[(oy * w + ox) as usize] = 0xff00_0000 | (r / n) << 16 | (g / n) << 8 | (b / n);
+        }
+    }
+    out
+}
+
+/// Pixel art at a whole-number scale, with its transparency.
+fn draw_pixels(c: &mut Canvas, a: &Art, x: i32, y: i32, k: i32) {
+    for j in 0..a.h * k {
+        for i in 0..a.w * k {
+            let p = a.px[((j / k) * a.w + i / k) as usize];
+            let al = p >> 24;
+            if al != 0 {
+                c.blend_pixel(x + i, y + j, p | 0xff00_0000, al);
             }
         }
     }
@@ -218,7 +240,16 @@ impl McLauncher {
             size: (1000, 620),
             login: None,
             account: read_account(),
+            panorama: None,
+            logo: None,
+            edition: None,
+            hero: None,
+            art_checked: 0,
         };
+        l.reload_art();
+        if l.panorama.is_none() && installed() {
+            let _ = super::detached::run("/home", "minecraft --art");
+        }
         if let Ok(d) = fs::read_file(CONFIG) {
             for line in String::from_utf8_lossy(&d).lines() {
                 match line.split_once('=') {
@@ -231,6 +262,13 @@ impl McLauncher {
             }
         }
         l
+    }
+
+    fn reload_art(&mut self) {
+        self.panorama = load_art("panorama.png");
+        self.logo = load_art("logo.png").filter(|a| a.w > a.h * 3);
+        self.edition = load_art("edition.png");
+        self.hero = None;
     }
 
     fn save(&self) {
@@ -403,13 +441,35 @@ impl McLauncher {
     fn render_play(&mut self, c: &mut Canvas, x: i32, w: i32, h: i32) {
         let f = fonts();
         let hero = Rect::new(x, HEADER_H, w - x, h - HEADER_H - BAR_H);
-        let old = c.push_clip(hero);
-        scene(c, hero);
-        let title = Rect::new(hero.x, hero.y + hero.h / 5, hero.w, 48);
-        c.draw_text_centered(f.pixel_big, Rect::new(title.x + 4, title.y + 4, title.w, title.h), "MINECRAFT", rgba(0, 0, 0, 110));
-        c.draw_text_centered(f.pixel_big, title, "MINECRAFT", TEXT);
-        c.draw_text_centered(f.bold, Rect::new(hero.x, title.bottom() + 2, hero.w, 22), "JAVA EDITION", rgba(255, 255, 255, 230));
-        c.restore_clip(old);
+        match &self.panorama {
+            Some(p) => {
+                if self.hero.as_ref().map(|s| (s.w, s.h)) != Some((hero.w, hero.h)) {
+                    self.hero = Some(scale_cover(p, hero.w, hero.h));
+                }
+                if let Some(s) = &self.hero {
+                    c.blit(s, hero.x, hero.y);
+                }
+                c.fill_gradient_v(Rect::new(hero.x, hero.bottom() - 120, hero.w, 120), rgba(0, 0, 0, 0), rgba(0, 0, 0, 110));
+            }
+            None => c.fill_gradient_v(hero, rgb(0x2b, 0x2b, 0x2b), rgb(0x1f, 0x1f, 0x1f)),
+        }
+        match &self.logo {
+            Some(l) => {
+                let k = ((hero.w * 55 / 100) / l.w.max(1)).clamp(1, 4);
+                let (lx, ly) = (hero.x + (hero.w - l.w * k) / 2, hero.y + hero.h / 6);
+                draw_pixels(c, l, lx, ly, k);
+                if let Some(e) = &self.edition {
+                    let ke = k.max(1);
+                    draw_pixels(c, e, hero.x + (hero.w - e.w * ke) / 2, ly + l.h * k - e.h * ke / 2, ke);
+                }
+            }
+            None => {
+                let title = Rect::new(hero.x, hero.y + hero.h / 5, hero.w, 48);
+                c.draw_text_centered(f.pixel_big, Rect::new(title.x + 4, title.y + 4, title.w, title.h), "MINECRAFT", rgba(0, 0, 0, 110));
+                c.draw_text_centered(f.pixel_big, title, "MINECRAFT", TEXT);
+                c.draw_text_centered(f.bold, Rect::new(hero.x, title.bottom() + 2, hero.w, 22), "JAVA EDITION", rgba(255, 255, 255, 230));
+            }
+        }
 
         // Bottom bar.
         let bar = Rect::new(x, h - BAR_H, w - x, BAR_H);
@@ -667,6 +727,14 @@ impl App for McLauncher {
     }
 
     fn tick(&mut self, ctx: &mut Ctx) {
+        let now = crate::time::uptime_ms();
+        if self.panorama.is_none() && now - self.art_checked > 3000 {
+            self.art_checked = now;
+            if fs::exists(&format!("{}/panorama.png", ART_DIR)) {
+                self.reload_art();
+                ctx.redraw();
+            }
+        }
         if self.poll_login() {
             ctx.redraw();
         }
