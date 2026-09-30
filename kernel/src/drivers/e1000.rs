@@ -105,7 +105,8 @@ impl E1000 {
             mac: Mac::ZERO,
             model,
         };
-        if is_pch(pci.device) {
+        let pch = is_pch(pci.device);
+        if pch {
             // The PHY may be in "ultra low power" after Windows shut down:
             // ask the management engine to wake it (Linux e1000e does this).
             const FWSM: usize = 0x5b54;
@@ -121,17 +122,24 @@ impl E1000 {
                 nic.w(H2ME, nic.r(H2ME) & !(1 << 12));
             }
         }
-        // Reset and mask all interrupts (we poll).
+        // Mask all interrupts (we poll) and reset. The PCH chips are not
+        // reset: without Intel's full PHY/ME handshake that hangs some
+        // boards (an I219-V froze the PC); the firmware left them set up,
+        // so stopping receive and transmit is enough.
         nic.w(IMC, 0xffff_ffff);
-        nic.w(CTRL, nic.r(CTRL) | (1 << 26));
-        for _ in 0..100_000 {
-            if nic.r(CTRL) & (1 << 26) == 0 {
-                break;
+        if pch {
+            nic.w(RCTL, 0);
+            nic.w(TCTL, 0);
+            crate::proc::sched::sleep_ms(10);
+        } else {
+            nic.w(CTRL, nic.r(CTRL) | (1 << 26));
+            for _ in 0..100_000 {
+                if nic.r(CTRL) & (1 << 26) == 0 {
+                    break;
+                }
             }
+            nic.w(IMC, 0xffff_ffff);
         }
-        nic.w(IMC, 0xffff_ffff);
-        // The PCH chips reload their MAC address and PHY setup after a reset.
-        crate::proc::sched::sleep_ms(20);
         // Set link up, auto speed detection.
         nic.w(CTRL, (nic.r(CTRL) | (1 << 6) | (1 << 5)) & !(1 << 3) & !(1 << 31) & !(1 << 7));
 
