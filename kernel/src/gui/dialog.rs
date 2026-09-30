@@ -120,8 +120,8 @@ impl App for Dialog {
     fn render(&mut self, c: &mut Canvas, (w, h): (i32, i32), focused: bool) {
         self.size = (w, h);
         let f = fonts();
-        c.fill_rect(Rect::new(0, 0, w, h), theme::PANEL_BG);
-        c.draw_text_clipped(&f.ui, 18, 28, &self.message, w - 36, theme::TEXT);
+        c.fill_rect(Rect::new(0, 0, w, h), theme::panel_bg());
+        c.draw_text_clipped(&f.ui, 18, 28, &self.message, w - 36, theme::text());
         if let Some(input) = self.input.as_mut() {
             input.render(c, Rect::new(16, 44, w - 32, 32), focused);
         }

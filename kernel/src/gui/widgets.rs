@@ -18,14 +18,14 @@ pub enum ButtonStyle {
 pub fn button(c: &mut Canvas, r: Rect, label: &str, style: ButtonStyle, hovered: bool, enabled: bool) {
     let f = &fonts().ui;
     let (bg, fg, border) = match style {
-        ButtonStyle::Primary => (if hovered { theme::accent_dark() } else { theme::accent() }, theme::TEXT_ON_ACCENT, 0),
-        ButtonStyle::Danger => (if hovered { rgb(0xc9, 0x35, 0x3a) } else { theme::DANGER }, theme::TEXT_ON_ACCENT, 0),
+        ButtonStyle::Primary => (if hovered { theme::accent_dark() } else { theme::accent() }, theme::text_on_accent(), 0),
+        ButtonStyle::Danger => (if hovered { rgb(0xc9, 0x35, 0x3a) } else { theme::DANGER }, theme::text_on_accent(), 0),
         ButtonStyle::Normal => (
-            if hovered { rgb(0xf0, 0xf2, 0xf5) } else { rgb(0xff, 0xff, 0xff) },
-            theme::TEXT,
-            with_alpha(0x000000, 45),
+            if hovered { theme::hover() } else { theme::card_bg() },
+            theme::text(),
+            theme::shade(45),
         ),
-        ButtonStyle::Flat => (if hovered { with_alpha(0x000000, 18) } else { 0 }, theme::TEXT, 0),
+        ButtonStyle::Flat => (if hovered { theme::shade(18) } else { 0 }, theme::text(), 0),
     };
     if bg != 0 {
         c.fill_rounded_rect(r, 7, bg);
@@ -126,8 +126,8 @@ impl TextInput {
 
     pub fn render(&mut self, c: &mut Canvas, r: Rect, focused: bool) {
         let f: &Font = &fonts().ui;
-        c.fill_rounded_rect(r, 6, rgb(0xff, 0xff, 0xff));
-        let border = if focused { theme::accent() } else { with_alpha(0x000000, 50) };
+        c.fill_rounded_rect(r, 6, theme::card_bg());
+        let border = if focused { theme::accent() } else { theme::shade(50) };
         c.stroke_rounded_rect(r, 6, if focused { 2 } else { 1 }, border);
         let inner = r.inset(8);
         let carets = f.caret_positions(&self.text);
@@ -144,7 +144,7 @@ impl TextInput {
             let w = caret_x.max(4);
             c.fill_rect(Rect::new(inner.x - self.scroll, r.y + 5, w, r.h - 10), theme::selection());
         }
-        c.draw_text(f, inner.x - self.scroll, base, &self.text, theme::TEXT);
+        c.draw_text(f, inner.x - self.scroll, base, &self.text, theme::text());
         if focused && !self.all_selected {
             c.fill_rect(Rect::new(inner.x - self.scroll + caret_x, r.y + 6, 1, r.h - 12), theme::accent());
         }

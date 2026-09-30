@@ -57,6 +57,7 @@ const PAGES: &[(Page, &str, Color)] = &[
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Toggle {
     Animations,
+    DarkMode,
     Muted,
     SystemSounds,
     NaturalScroll,
@@ -102,6 +103,7 @@ enum Action {
 fn toggle_value(s: &Settings, t: Toggle) -> bool {
     match t {
         Toggle::Animations => s.animations,
+        Toggle::DarkMode => s.dark,
         Toggle::Muted => s.muted,
         Toggle::SystemSounds => s.system_sounds,
         Toggle::NaturalScroll => s.natural_scroll,
@@ -116,6 +118,7 @@ fn toggle_value(s: &Settings, t: Toggle) -> bool {
 fn set_toggle(s: &mut Settings, t: Toggle, v: bool) {
     match t {
         Toggle::Animations => s.animations = v,
+        Toggle::DarkMode => s.dark = v,
         Toggle::Muted => s.muted = v,
         Toggle::SystemSounds => s.system_sounds = v,
         Toggle::NaturalScroll => s.natural_scroll = v,
@@ -294,8 +297,8 @@ impl SettingsApp {
 
     fn card(&self, c: &mut Canvas, r: Rect) {
         self.extend(r.bottom());
-        c.fill_rounded_rect(r, 12, rgb(0xff, 0xff, 0xff));
-        c.stroke_rounded_rect(r, 12, 1, with_alpha(0x000000, 22));
+        c.fill_rounded_rect(r, 12, theme::card_bg());
+        c.stroke_rounded_rect(r, 12, 1, theme::border());
     }
 
     /// Draw a labelled row inside a card; returns the row rect.
@@ -304,16 +307,16 @@ impl SettingsApp {
         let r = Rect::new(card.x, card.y + i * ROW_H, card.w, ROW_H);
         match detail {
             Some(d) => {
-                c.draw_text(&f.ui, r.x + 18, r.y + 22, label, theme::TEXT);
-                c.draw_text_clipped(&f.ui, r.x + 18, r.y + 40, d, r.w / 2, theme::TEXT_DIM);
+                c.draw_text(&f.ui, r.x + 18, r.y + 22, label, theme::text());
+                c.draw_text_clipped(&f.ui, r.x + 18, r.y + 40, d, r.w / 2, theme::text_dim());
             }
             None => {
                 let base = r.y + (ROW_H + f.ui.ascent - f.ui.descent) / 2;
-                c.draw_text(&f.ui, r.x + 18, base, label, theme::TEXT);
+                c.draw_text(&f.ui, r.x + 18, base, label, theme::text());
             }
         }
         if !last {
-            c.hline(r.x + 18, r.bottom() - 1, r.w - 36, theme::SEPARATOR);
+            c.hline(r.x + 18, r.bottom() - 1, r.w - 36, theme::separator());
         }
         r
     }
@@ -323,7 +326,7 @@ impl SettingsApp {
         let f = &fonts().ui;
         let w = f.measure(text).min(row.w / 2);
         let base = row.y + (ROW_H + f.ascent - f.descent) / 2;
-        c.draw_text_clipped(f, row.right() - 18 - w, base, text, row.w / 2, theme::TEXT_DIM);
+        c.draw_text_clipped(f, row.right() - 18 - w, base, text, row.w / 2, theme::text_dim());
     }
 
     fn toggle(&mut self, c: &mut Canvas, row: Rect, t: Toggle) {
@@ -333,7 +336,7 @@ impl SettingsApp {
         let track = mix(off, theme::accent(), (pos * 255 / 1024) as u32);
         c.fill_rounded_rect(r, 13, track);
         let kx = r.x + 3 + ((r.w - 26) as i64 * pos / 1024) as i32;
-        c.fill_circle(kx + 10, r.y + 13, 11, with_alpha(0x000000, 35));
+        c.fill_circle(kx + 10, r.y + 13, 11, theme::shade(35));
         c.fill_circle(kx + 10, r.y + 13, 10, rgb(255, 255, 255));
         self.hits.push((row, Action::Toggle(t)));
     }
@@ -347,10 +350,10 @@ impl SettingsApp {
         c.fill_rounded_rect(track, 3, rgb(0xd5, 0xd9, 0xe0));
         c.fill_rounded_rect(Rect::new(track.x, track.y, t.max(6), track.h), 3, theme::accent());
         let active = self.dragging.map(|d| d.0) == Some(sl) || self.hovered(Action::Slider(sl));
-        c.fill_circle(track.x + t, track.y + 3, if active { 10 } else { 9 }, with_alpha(0x000000, 40));
+        c.fill_circle(track.x + t, track.y + 3, if active { 10 } else { 9 }, theme::shade(40));
         c.fill_circle(track.x + t, track.y + 3, if active { 9 } else { 8 }, rgb(255, 255, 255));
         let base = row.y + (ROW_H + f.ascent - f.descent) / 2;
-        c.draw_text(f, track.right() + 14, base, label, theme::TEXT_DIM);
+        c.draw_text(f, track.right() + 14, base, label, theme::text_dim());
         self.hits.push((Rect::new(track.x - 12, row.y, track.w + 24, ROW_H), Action::Slider(sl)));
     }
 
@@ -368,7 +371,7 @@ impl SettingsApp {
         for word in text.split(' ') {
             let candidate = if line.is_empty() { word.to_string() } else { format!("{} {}", line, word) };
             if f.measure(&candidate) > w && !line.is_empty() {
-                c.draw_text(f, x, yy, &line, theme::TEXT_DIM);
+                c.draw_text(f, x, yy, &line, theme::text_dim());
                 yy += 18;
                 line = word.to_string();
             } else {
@@ -376,62 +379,25 @@ impl SettingsApp {
             }
         }
         if !line.is_empty() {
-            c.draw_text(f, x, yy, &line, theme::TEXT_DIM);
+            c.draw_text(f, x, yy, &line, theme::text_dim());
             yy += 18;
         }
         self.extend(yy);
         yy
     }
 
-    fn sidebar_icon(c: &mut Canvas, page: Page, color: Color, x: i32, y: i32) {
-        let s = 26;
-        c.fill_rounded_rect(Rect::new(x, y, s, s), 7, color);
-        let w = rgb(255, 255, 255);
-        let cx = x + s / 2;
-        let cy = y + s / 2;
-        match page {
-            Page::Display => {
-                c.fill_rounded_rect(Rect::new(x + 5, y + 6, 16, 11), 2, w);
-                c.fill_rect(Rect::new(cx - 1, y + 17, 2, 3), w);
-                c.fill_rect(Rect::new(cx - 4, y + 20, 8, 2), w);
-            }
-            Page::Personalization => {
-                c.fill_circle(cx, cy, 8, w);
-                for (dx, dy, col) in [(-3, -3, rgb(0xe0, 0x4f, 0x92)), (3, -3, rgb(0x2f, 0x7c, 0xf6)), (-3, 3, rgb(0xf0, 0xb4, 0x24)), (3, 3, rgb(0x2f, 0xa8, 0x5a))] {
-                    c.fill_circle(cx + dx, cy + dy, 2, col);
-                }
-            }
-            Page::Sound => {
-                c.fill_rect(Rect::new(x + 6, cy - 3, 4, 6), w);
-                for k in 0..5 {
-                    c.fill_rect(Rect::new(x + 10 + k, cy - 3 - k, 1, 6 + 2 * k), w);
-                }
-                c.fill_rect(Rect::new(x + 17, cy - 3, 2, 6), w);
-                c.fill_rect(Rect::new(x + 20, cy - 6, 2, 12), w);
-            }
-            Page::Network => {
-                c.stroke_rounded_rect(Rect::new(cx - 8, cy - 8, 16, 16), 8, 2, w);
-                c.fill_rect(Rect::new(cx - 8, cy - 1, 16, 2), w);
-                c.stroke_rounded_rect(Rect::new(cx - 4, cy - 8, 8, 16), 4, 2, w);
-            }
-            Page::Input => {
-                c.fill_rounded_rect(Rect::new(cx - 6, y + 4, 12, 18), 6, w);
-                c.fill_rect(Rect::new(cx - 1, y + 6, 2, 5), color);
-            }
-            Page::DateTime => {
-                c.fill_circle(cx, cy, 9, w);
-                c.fill_rect(Rect::new(cx - 1, cy - 6, 2, 7), color);
-                c.fill_rect(Rect::new(cx - 1, cy - 1, 6, 2), color);
-            }
-            Page::Storage => {
-                c.fill_rounded_rect(Rect::new(x + 5, cy - 5, 16, 10), 3, w);
-                c.fill_circle(x + 17, cy, 1, color);
-            }
-            Page::About => {
-                c.fill_circle(cx, y + 7, 2, w);
-                c.fill_rounded_rect(Rect::new(cx - 2, y + 11, 4, 10), 2, w);
-            }
-        }
+    fn sidebar_icon(c: &mut Canvas, page: Page, _color: Color, x: i32, y: i32) {
+        let icon = match page {
+            Page::Display => Icon::SetDisplay,
+            Page::Personalization => Icon::SetTheme,
+            Page::Sound => Icon::SetSound,
+            Page::Network => Icon::SetNetwork,
+            Page::Input => Icon::SetMouse,
+            Page::DateTime => Icon::SetTime,
+            Page::Storage => Icon::Drive,
+            Page::About => Icon::MayOS,
+        };
+        super::icons::draw(c, icon, x - 1, y - 1, 28);
     }
 
     // ---------------------------------------------------------------
@@ -439,7 +405,7 @@ impl SettingsApp {
     // ---------------------------------------------------------------
 
     fn page_title(&self, c: &mut Canvas, x: i32, y: i32, title: &str) -> i32 {
-        c.draw_text(&fonts().large, x, y + 28, title, theme::TEXT);
+        c.draw_text(&fonts().large, x, y + 28, title, theme::text());
         y + 62
     }
 
@@ -454,7 +420,7 @@ impl SettingsApp {
         let r = self.row(c, card, 1, "Animations", Some("Window, dock and menu motion"), true);
         self.toggle(c, r, Toggle::Animations);
         y = card.bottom() + 24;
-        c.draw_text(&fonts().bold, x + 4, y, "Resolution", theme::TEXT);
+        c.draw_text(&fonts().bold, x + 4, y, "Resolution", theme::text());
         y += 12;
         let rows = modes.len().max(1) as i32;
         let card = Rect::new(x, y, w, ROW_H * rows);
@@ -502,7 +468,7 @@ impl SettingsApp {
     fn page_personalization(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
         let f = fonts();
         y = self.page_title(c, x, y, "Personalization");
-        c.draw_text(&f.bold, x + 4, y, "Wallpaper", theme::TEXT);
+        c.draw_text(&f.bold, x + 4, y, "Wallpaper", theme::text());
         y += 14;
         if self.thumbs.len() != WALLPAPERS.len() {
             self.thumbs = (0..WALLPAPERS.len()).map(|i| wallpaper::render(i, 160, 100)).collect();
@@ -517,17 +483,17 @@ impl SettingsApp {
             if selected {
                 c.fill_rounded_rect(r.inset(-4), 14, theme::accent());
             } else if self.hovered(Action::Wallpaper(i)) {
-                c.fill_rounded_rect(r.inset(-4), 14, with_alpha(0x000000, 30));
+                c.fill_rounded_rect(r.inset(-4), 14, theme::shade(30));
             }
             c.blit_scaled(&self.thumbs[i], r, 255, 10);
-            c.draw_text_centered(&f.ui, Rect::new(r.x, r.bottom() + 4, r.w, 20), wp.name, if selected { theme::TEXT } else { theme::TEXT_DIM });
+            c.draw_text_centered(&f.ui, Rect::new(r.x, r.bottom() + 4, r.w, 20), wp.name, if selected { theme::text() } else { theme::text_dim() });
             self.hits.push((r, Action::Wallpaper(i)));
             self.extend(r.bottom() + 24);
         }
         let rows = (WALLPAPERS.len() as i32 + cols - 1) / cols;
         y += rows * (th + 34) + 18;
         y = self.pictures_section(c, x, y, w, cols, tw, th);
-        c.draw_text(&f.bold, x + 4, y, "Accent colour", theme::TEXT);
+        c.draw_text(&f.bold, x + 4, y, "Accent colour", theme::text());
         y += 14;
         let card = Rect::new(x, y, w, 64);
         self.card(c, card);
@@ -546,27 +512,17 @@ impl SettingsApp {
             if self.cfg.accent == i {
                 let tx = x + 36 + theme::ACCENTS.len() as i32 * 44;
                 let base = card.y + (card.h + f.ui.ascent - f.ui.descent) / 2;
-                c.draw_text(&f.ui, tx, base, name, theme::TEXT_DIM);
+                c.draw_text(&f.ui, tx, base, name, theme::text_dim());
             }
         }
         y = card.bottom() + 18;
-        let card = Rect::new(x, y, w, ROW_H);
-        self.card(c, card);
-        let r = self.row(c, card, 0, "Animations", Some("Window, dock and menu motion"), true);
-        self.toggle(c, r, Toggle::Animations);
-        y = card.bottom() + 18;
-        let f = fonts();
-        c.draw_text(&f.bold, x + 4, y, "Dock", theme::TEXT);
-        y += 14;
         let card = Rect::new(x, y, w, ROW_H * 3);
         self.card(c, card);
-        let r = self.row(c, card, 0, "Position on screen", Some("Move it to a side if the bottom is cut off"), false);
-        let pos = self.cfg.dock_position;
-        self.segmented(c, r, &["Bottom", "Left", "Right"], pos, Action::DockPosition);
-        let r = self.row(c, card, 1, "Size", None, false);
-        let size = self.cfg.dock_size;
-        self.segmented(c, r, &["Small", "Medium", "Large"], size, Action::DockSize);
-        let r = self.row(c, card, 2, "Hide automatically", Some("Slides away; point at the screen edge to show it"), true);
+        let r = self.row(c, card, 0, "Dark mode", Some("Dark windows, apps and title bars (also Firefox and other Linux apps)"), false);
+        self.toggle(c, r, Toggle::DarkMode);
+        let r = self.row(c, card, 1, "Animations", Some("Window, panel and menu motion"), false);
+        self.toggle(c, r, Toggle::Animations);
+        let r = self.row(c, card, 2, "Hide the panel automatically", Some("It slides away; point at the bottom edge to show it"), true);
         self.toggle(c, r, Toggle::DockAutohide);
     }
 
@@ -576,17 +532,17 @@ impl SettingsApp {
         let seg_w = labels.iter().map(|l| f.ui.measure(l)).max().unwrap_or(40) + 24;
         let total = seg_w * labels.len() as i32 + 4;
         let outer = Rect::new(row.right() - 18 - total, row.y + (ROW_H - 32) / 2, total, 32);
-        c.fill_rounded_rect(outer, 9, rgb(0xe9, 0xeb, 0xef));
+        c.fill_rounded_rect(outer, 9, theme::separator());
         for (i, label) in labels.iter().enumerate() {
             let r = Rect::new(outer.x + 2 + i as i32 * seg_w, outer.y + 2, seg_w, 28);
             let a = action(i as u8);
             if selected == i as u8 {
                 c.draw_shadow(r, 7, 4, with_alpha(0x000000, 40));
-                c.fill_rounded_rect(r, 7, rgb(0xff, 0xff, 0xff));
+                c.fill_rounded_rect(r, 7, theme::card_bg());
             } else if self.hovered(a) {
-                c.fill_rounded_rect(r, 7, with_alpha(0x000000, 12));
+                c.fill_rounded_rect(r, 7, theme::shade(12));
             }
-            let col = if selected == i as u8 { theme::TEXT } else { theme::TEXT_DIM };
+            let col = if selected == i as u8 { theme::text() } else { theme::text_dim() };
             c.draw_text_centered(&f.ui, r, label, col);
             self.hits.push((r, a));
         }
@@ -596,7 +552,7 @@ impl SettingsApp {
     /// level (and /pictures folder) of other disks, as wallpaper choices.
     fn pictures_section(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32, cols: i32, tw: i32, th: i32) -> i32 {
         let f = fonts();
-        c.draw_text(&f.bold, x + 4, y, "Your pictures", theme::TEXT);
+        c.draw_text(&f.bold, x + 4, y, "Your pictures", theme::text());
         y += 14;
         if self.pictures.is_none() {
             self.pictures = Some(start_picture_scan());
@@ -610,18 +566,18 @@ impl SettingsApp {
             if selected {
                 c.fill_rounded_rect(r.inset(-4), 14, theme::accent());
             } else if self.hovered(Action::Picture(i)) {
-                c.fill_rounded_rect(r.inset(-4), 14, with_alpha(0x000000, 30));
+                c.fill_rounded_rect(r.inset(-4), 14, theme::shade(30));
             }
             match thumb {
                 Some(t) => c.blit_scaled(t, r, 255, 10),
                 None => {
-                    c.fill_rounded_rect(r, 10, with_alpha(0x000000, 25));
-                    c.draw_text_centered(&f.ui, r, "Can't open", theme::TEXT_DIM);
+                    c.fill_rounded_rect(r, 10, theme::shade(25));
+                    c.draw_text_centered(&f.ui, r, "Can't open", theme::text_dim());
                 }
             }
             let name = fs::file_name(path);
             let name = if name.chars().count() > 22 { format!("{}\u{2026}", name.chars().take(21).collect::<String>()) } else { String::from(name) };
-            c.draw_text_centered(&f.ui, Rect::new(r.x, r.bottom() + 4, r.w, 20), &name, if selected { theme::TEXT } else { theme::TEXT_DIM });
+            c.draw_text_centered(&f.ui, Rect::new(r.x, r.bottom() + 4, r.w, 20), &name, if selected { theme::text() } else { theme::text_dim() });
             self.hits.push((r, Action::Picture(i)));
         }
         let n = self.picture_thumbs.len() as i32;
@@ -705,9 +661,9 @@ impl SettingsApp {
                 _ => "Getting an address\u{2026}",
             }
         };
-        c.draw_text(&f.bold, x + 48, y + 28, headline, theme::TEXT);
+        c.draw_text(&f.bold, x + 48, y + 28, headline, theme::text());
         let sub = format!("{} \u{00b7} {} Mb/s", st.adapter, st.speed_mbps);
-        c.draw_text_clipped(&f.ui, x + 48, y + 46, &sub, w - 60, theme::TEXT_DIM);
+        c.draw_text_clipped(&f.ui, x + 48, y + 46, &sub, w - 60, theme::text_dim());
         y = banner.bottom() + 16;
 
         // File sharing (the built-in web server).
@@ -791,7 +747,7 @@ impl SettingsApp {
         self.action_button(c, Rect::new(bx, y, 150, 32), "Look up a name", ButtonStyle::Normal, Action::LookupName);
         y += 50;
         if self.net_test_running {
-            c.draw_text(&f.ui, x + 4, y, "Testing\u{2026}", theme::TEXT_DIM);
+            c.draw_text(&f.ui, x + 4, y, "Testing\u{2026}", theme::text_dim());
         } else if let Some((m, ok)) = NET_TEST.lock().clone() {
             c.draw_text_clipped(&f.ui, x + 4, y, &m, w - 8, if ok { rgb(0x2f, 0x8a, 0x4a) } else { theme::DANGER });
         }
@@ -828,9 +784,9 @@ impl SettingsApp {
         self.card(c, card);
         let t = settings::local_time();
         let time = super::wm::format_clock(&self.cfg);
-        c.draw_text(&f.large, x + 22, y + 44, &time, theme::TEXT);
+        c.draw_text(&f.large, x + 22, y + 44, &time, theme::text());
         let date = format!("{:04}-{:02}-{:02}", t.year, t.month, t.day);
-        c.draw_text(&f.ui, x + 24, y + 74, &date, theme::TEXT_DIM);
+        c.draw_text(&f.ui, x + 24, y + 74, &date, theme::text_dim());
         y = card.bottom() + 18;
         let card = Rect::new(x, y, w, ROW_H * 3);
         self.card(c, card);
@@ -845,7 +801,7 @@ impl SettingsApp {
         let minus = Rect::new(plus.x - 150, r.y + 10, 34, 32);
         self.action_button(c, minus, "\u{2013}", ButtonStyle::Normal, Action::TzMinus);
         self.action_button(c, plus, "+", ButtonStyle::Normal, Action::TzPlus);
-        c.draw_text_centered(&f.bold, Rect::new(minus.right(), r.y + 10, plus.x - minus.right(), 32), &label, theme::TEXT);
+        c.draw_text_centered(&f.bold, Rect::new(minus.right(), r.y + 10, plus.x - minus.right(), 32), &label, theme::text());
     }
 
     fn page_storage(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
@@ -878,17 +834,17 @@ impl SettingsApp {
             self.card(c, card);
             super::icons::draw(c, Icon::Drive, x + 16, y + 16, 40);
             let title = if m.point == "/" { String::from("MayOS Disk") } else { format!("{}  \u{2014}  {}", m.point, m.label) };
-            c.draw_text(&f.bold, x + 70, y + 30, &title, theme::TEXT);
+            c.draw_text(&f.bold, x + 70, y + 30, &title, theme::text());
             let sub = if m.persistent { String::from(m.backend) } else { format!("{} \u{2014} set up a disk below to keep your files", m.backend) };
-            c.draw_text_clipped(&f.ui, x + 70, y + 48, &sub, w - 250, if m.persistent { theme::TEXT_DIM } else { theme::DANGER });
+            c.draw_text_clipped(&f.ui, x + 70, y + 48, &sub, w - 250, if m.persistent { theme::text_dim() } else { theme::DANGER });
             let bar = Rect::new(x + 18, y + 66, w - 36, 10);
-            c.fill_rounded_rect(bar, 5, rgb(0xe4, 0xe7, 0xec));
+            c.fill_rounded_rect(bar, 5, theme::separator());
             let total = m.stats.total_bytes().max(1);
             let used = total - m.stats.free_bytes();
             let uw = ((bar.w as u64 * used / total) as i32).max(10);
             c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 5, theme::accent());
             let text = format!("{} used \u{00b7} {} free \u{00b7} {} total", crate::fs::format_size(used), crate::fs::format_size(m.stats.free_bytes()), crate::fs::format_size(total));
-            c.draw_text(&f.ui, x + 18, y + 94, &text, theme::TEXT_DIM);
+            c.draw_text(&f.ui, x + 18, y + 94, &text, theme::text_dim());
             if m.point != "/" && m.persistent && !crate::fs::root_is_persistent() {
                 let i = self.disk_targets.len();
                 self.disk_targets.push((crate::storage::Target::Mounted(m.point.clone()), format!("{} (\u{201c}{}\u{201d})", m.point, m.label), false));
@@ -900,8 +856,8 @@ impl SettingsApp {
             let card = Rect::new(x, y, w, 70);
             self.card(c, card);
             super::icons::draw(c, Icon::Drive, x + 16, y + 14, 40);
-            c.draw_text(&f.bold, x + 70, y + 30, &format!("{} \u{2014} {}", d.name, d.model), theme::TEXT);
-            c.draw_text(&f.ui, x + 70, y + 50, &format!("{} \u{00b7} not formatted", crate::fs::format_size(d.bytes)), theme::TEXT_DIM);
+            c.draw_text(&f.bold, x + 70, y + 30, &format!("{} \u{2014} {}", d.name, d.model), theme::text());
+            c.draw_text(&f.ui, x + 70, y + 50, &format!("{} \u{00b7} not formatted", crate::fs::format_size(d.bytes)), theme::text_dim());
             let i = self.disk_targets.len();
             self.disk_targets.push((crate::storage::Target::Blank(d.name.clone()), format!("{} ({}, {})", d.name, d.model, crate::fs::format_size(d.bytes)), true));
             self.action_button(c, Rect::new(card.right() - 184, y + 19, 168, 32), "Set up for MayOS", ButtonStyle::Primary, Action::SetupDisk(i));
@@ -1073,26 +1029,26 @@ impl App for SettingsApp {
         self.hits.clear();
         let f = fonts();
         // Sidebar.
-        c.fill_rect(Rect::new(0, 0, SIDEBAR_W, h), theme::SIDEBAR_BG);
-        c.vline(SIDEBAR_W - 1, 0, h, theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, 0, SIDEBAR_W, h), theme::sidebar_bg());
+        c.vline(SIDEBAR_W - 1, 0, h, theme::separator());
         let mut y = 16;
         for &(p, name, color) in PAGES {
             let r = Rect::new(10, y, SIDEBAR_W - 20, 38);
             if self.page == p {
-                c.fill_rounded_rect(r, 9, if focused { with_alpha(theme::accent(), 40) } else { with_alpha(0x000000, 22) });
+                c.fill_rounded_rect(r, 9, if focused { with_alpha(theme::accent(), 40) } else { theme::shade(22) });
             } else if self.hovered(Action::Page(p)) {
-                c.fill_rounded_rect(r, 9, with_alpha(0x000000, 12));
+                c.fill_rounded_rect(r, 9, theme::shade(12));
             }
             Self::sidebar_icon(c, p, color, r.x + 8, r.y + 6);
             let font = if self.page == p { &f.bold } else { &f.ui };
-            c.draw_text(font, r.x + 44, r.y + 24, name, theme::TEXT);
+            c.draw_text(font, r.x + 44, r.y + 24, name, theme::text());
             self.hits.push((r, Action::Page(p)));
             y += 42;
         }
 
         // Content, sliding in when the page changes.
         let area = Rect::new(SIDEBAR_W, 0, w - SIDEBAR_W, h);
-        c.fill_rect(area, theme::PANEL_BG);
+        c.fill_rect(area, theme::panel_bg());
         let slide = if self.page_since != 0 {
             let p = ((uptime_ms() - self.page_since) as i64 * 1024 / PAGE_MS as i64).min(1024);
             let e = 1024 - (1024 - p) * (1024 - p) / 1024;

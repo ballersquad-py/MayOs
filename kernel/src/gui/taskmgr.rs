@@ -141,13 +141,13 @@ fn push(h: &mut Vec<f32>, v: f32) {
 
 fn graph(c: &mut Canvas, r: Rect, hist: &[f32], color: Color, title: &str, value: &str) {
     let f = fonts();
-    c.fill_rounded_rect(r, 10, theme::PANEL_BG);
-    c.draw_text(&f.bold, r.x + 14, r.y + 22, title, theme::TEXT);
+    c.fill_rounded_rect(r, 10, theme::panel_bg());
+    c.draw_text(&f.bold, r.x + 14, r.y + 22, title, theme::text());
     c.draw_text(&f.large, r.x + 14, r.y + 56, value, color);
     let g = Rect::new(r.x + 14, r.y + 68, r.w - 28, r.h - 80);
-    c.fill_rect(g, rgb(0xff, 0xff, 0xff));
+    c.fill_rect(g, theme::card_bg());
     for i in 1..4 {
-        c.fill_rect(Rect::new(g.x, g.y + g.h * i / 4, g.w, 1), theme::SEPARATOR);
+        c.fill_rect(Rect::new(g.x, g.y + g.h * i / 4, g.w, 1), theme::separator());
     }
     let n = hist.len();
     if n >= 1 {
@@ -195,7 +195,7 @@ impl App for TaskManager {
     fn render(&mut self, c: &mut Canvas, (w, h): (i32, i32), _focused: bool) {
         self.size = (w, h);
         let f = fonts();
-        c.fill_rect(Rect::new(0, 0, w, h), theme::WINDOW_BG);
+        c.fill_rect(Rect::new(0, 0, w, h), theme::window_bg());
         let gw = (w - 48) / 2;
         let cpu = self.cpu_hist.last().copied().unwrap_or(0.0);
         let mem = self.mem_hist.last().copied().unwrap_or(0.0);
@@ -211,10 +211,10 @@ impl App for TaskManager {
         );
         // Column headers.
         let cols = [(16, "Name"), (w - 360, "PID"), (w - 290, "Threads"), (w - 210, "CPU"), (w - 120, "Memory")];
-        c.fill_rect(Rect::new(0, HEAD_H, w, 30), theme::PANEL_BG);
+        c.fill_rect(Rect::new(0, HEAD_H, w, 30), theme::panel_bg());
         for (x, t) in cols {
             let active = (t == "CPU" && !self.sort_mem) || (t == "Memory" && self.sort_mem);
-            c.draw_text(&f.bold, x, HEAD_H + 20, t, if active { theme::accent() } else { theme::TEXT_DIM });
+            c.draw_text(&f.bold, x, HEAD_H + 20, t, if active { theme::accent() } else { theme::text_dim() });
         }
         let list_h = h - LIST_TOP - 56;
         let visible = (list_h / ROW_H).max(1);
@@ -223,7 +223,7 @@ impl App for TaskManager {
         for (i, r) in self.rows.iter().enumerate().skip(self.scroll as usize).take(visible as usize + 1) {
             let y = LIST_TOP + (i as i32 - self.scroll) * ROW_H;
             if Some(r.pid) == self.selected {
-                c.fill_rect(Rect::new(0, y, w, ROW_H), theme::HOVER);
+                c.fill_rect(Rect::new(0, y, w, ROW_H), theme::hover());
             }
             // CPU heat: stronger yellow for busier processes.
             let heat = (r.cpu.min(100.0) * 2.2) as u32;
@@ -231,20 +231,20 @@ impl App for TaskManager {
                 c.fill_rect(Rect::new(w - 220, y + 1, 90, ROW_H - 2), with_alpha(0xf5b942, heat.min(200) as u8));
             }
             let ty = y + 18;
-            c.draw_text_clipped(&f.ui, 16, ty, &r.name, w - 390, if r.kernel { theme::TEXT_DIM } else { theme::TEXT });
+            c.draw_text_clipped(&f.ui, 16, ty, &r.name, w - 390, if r.kernel { theme::text_dim() } else { theme::text() });
             if !r.kernel {
-                c.draw_text(&f.ui, w - 360, ty, &format!("{}", r.pid), theme::TEXT_DIM);
+                c.draw_text(&f.ui, w - 360, ty, &format!("{}", r.pid), theme::text_dim());
             }
-            c.draw_text(&f.ui, w - 290, ty, &format!("{}", r.threads), theme::TEXT_DIM);
-            c.draw_text(&f.ui, w - 210, ty, &format!("{:.1}%", r.cpu), theme::TEXT);
-            c.draw_text(&f.ui, w - 120, ty, &fmt_mem(r.mem_kb), theme::TEXT);
-            c.fill_rect(Rect::new(0, y + ROW_H - 1, w, 1), theme::SEPARATOR);
+            c.draw_text(&f.ui, w - 290, ty, &format!("{}", r.threads), theme::text_dim());
+            c.draw_text(&f.ui, w - 210, ty, &format!("{:.1}%", r.cpu), theme::text());
+            c.draw_text(&f.ui, w - 120, ty, &fmt_mem(r.mem_kb), theme::text());
+            c.fill_rect(Rect::new(0, y + ROW_H - 1, w, 1), theme::separator());
         }
         c.restore_clip(old_clip);
         widgets::draw_scrollbar(c, Rect::new(w - 8, LIST_TOP, 6, list_h), self.rows.len() as i32 * ROW_H, list_h, self.scroll * ROW_H);
-        c.fill_rect(Rect::new(0, h - 56, w, 1), theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, h - 56, w, 1), theme::separator());
         let procs = self.rows.iter().filter(|r| !r.kernel).count();
-        c.draw_text(&f.ui, 16, h - 22, &format!("{} programs running", procs), theme::TEXT_DIM);
+        c.draw_text(&f.ui, 16, h - 22, &format!("{} programs running", procs), theme::text_dim());
         let can_end = self.selected.is_some_and(|p| p != 0);
         widgets::button(c, self.end_button(), "End task", ButtonStyle::Danger, self.hover_end && can_end, can_end);
     }

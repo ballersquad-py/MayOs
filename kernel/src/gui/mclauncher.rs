@@ -162,8 +162,8 @@ impl App for McLauncher {
 
         // Settings side.
         let x0 = 300;
-        c.fill_rect(Rect::new(x0, 0, w - x0, h), theme::WINDOW_BG);
-        let label = |c: &mut Canvas, y: i32, t: &str| c.draw_text(&f.small_bold, x0 + 20, y, t, theme::TEXT_DIM);
+        c.fill_rect(Rect::new(x0, 0, w - x0, h), theme::window_bg());
+        let label = |c: &mut Canvas, y: i32, t: &str| c.draw_text(&f.small_bold, x0 + 20, y, t, theme::text_dim());
         label(c, 50, "VERSION");
         label(c, 232, "PLAYER");
         label(c, 318, "MEMORY");
@@ -173,16 +173,16 @@ impl App for McLauncher {
             match hit {
                 Hit::Version(i) => {
                     let sel = self.version == i;
-                    c.fill_rounded_rect(r, 10, if sel { theme::selection() } else if hov { theme::HOVER } else { theme::PANEL_BG });
+                    c.fill_rounded_rect(r, 10, if sel { theme::selection() } else if hov { theme::hover() } else { theme::panel_bg() });
                     if sel {
                         c.stroke_rounded_rect(r, 10, 2, theme::accent());
                     }
-                    c.draw_text(&f.bold, r.x + 14, r.y + 25, VERSIONS[i].0, theme::TEXT);
-                    c.draw_text_clipped(&f.ui, r.x + 14, r.y + 46, VERSIONS[i].1, r.w - 24, theme::TEXT_DIM);
+                    c.draw_text(&f.bold, r.x + 14, r.y + 25, VERSIONS[i].0, theme::text());
+                    c.draw_text_clipped(&f.ui, r.x + 14, r.y + 46, VERSIONS[i].1, r.w - 24, theme::text_dim());
                 }
                 Hit::Name => {
-                    c.fill_rounded_rect(r, 8, if acct.is_some() { theme::PANEL_BG } else { rgb(255, 255, 255) });
-                    c.stroke_rounded_rect(r, 8, if self.editing { 2 } else { 1 }, if self.editing { theme::accent() } else { theme::SEPARATOR });
+                    c.fill_rounded_rect(r, 8, if acct.is_some() { theme::panel_bg() } else { rgb(255, 255, 255) });
+                    c.stroke_rounded_rect(r, 8, if self.editing { 2 } else { 1 }, if self.editing { theme::accent() } else { theme::separator() });
                     self.name.render(c, r.inset(6), self.editing && focused);
                 }
                 Hit::SignIn => widgets::button(c, r, "Sign in with Microsoft", ButtonStyle::Normal, hov, true),
@@ -202,9 +202,9 @@ impl App for McLauncher {
                             c.fill_rect(Rect::new(b.x + 7 + d, b.y + 11 - d, 2, 2), white);
                         }
                     } else {
-                        c.stroke_rounded_rect(b, 5, 2, if hov { theme::accent() } else { theme::SEPARATOR });
+                        c.stroke_rounded_rect(b, 5, 2, if hov { theme::accent() } else { theme::separator() });
                     }
-                    c.draw_text(&f.ui, r.x + 28, r.y + 21, "Fullscreen (1.8.9 and older)", theme::TEXT);
+                    c.draw_text(&f.ui, r.x + 28, r.y + 21, "Fullscreen (1.8.9 and older)", theme::text());
                 }
                 Hit::Play => {
                     let bg = if hov { rgb(0x2e, 0x8b, 0x3a) } else { rgb(0x3c, 0xa8, 0x48) };
@@ -219,7 +219,7 @@ impl App for McLauncher {
         } else {
             "Minecraft is not installed yet: Install downloads Java and the game (about 700 MB)."
         };
-        c.draw_text_clipped(&f.ui, x0 + 20, h - 40, note, w - x0 - 240, theme::TEXT_DIM);
+        c.draw_text_clipped(&f.ui, x0 + 20, h - 40, note, w - x0 - 240, theme::text_dim());
     }
 
     fn event(&mut self, ev: &AppEvent, ctx: &mut Ctx) {

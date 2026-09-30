@@ -609,8 +609,8 @@ impl Explorer {
     fn draw_toolbar(&self, c: &mut Canvas) {
         let f = fonts();
         let w = self.size.0;
-        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::PANEL_BG);
-        c.hline(0, TOOLBAR_H - 1, w, theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::panel_bg());
+        c.hline(0, TOOLBAR_H - 1, w, theme::separator());
         let tools = [
             (Tool::Back, "\u{25c0}", !self.back.is_empty()),
             (Tool::Forward, "\u{25b6}", !self.forward.is_empty()),
@@ -623,22 +623,22 @@ impl Explorer {
         }
         // Breadcrumb bar.
         let area = self.crumb_area();
-        c.fill_rounded_rect(area, 8, rgb(0xff, 0xff, 0xff));
-        c.stroke_rounded_rect(area, 8, 1, with_alpha(0x000000, 35));
+        c.fill_rounded_rect(area, 8, theme::card_bg());
+        c.stroke_rounded_rect(area, 8, 1, theme::shade(35));
         let old = c.push_clip(area.inset(2));
         let crumbs = self.crumbs();
         let n = crumbs.len();
         for (i, (name, _, r)) in crumbs.iter().enumerate() {
             if self.hover == Hover::Crumb(i) {
-                c.fill_rounded_rect(*r, 6, theme::HOVER);
+                c.fill_rounded_rect(*r, 6, theme::hover());
             }
             let last = i + 1 == n;
             let font = if last { &f.bold } else { &f.ui };
-            let col = if last { theme::TEXT } else { theme::TEXT_DIM };
+            let col = if last { theme::text() } else { theme::text_dim() };
             let base = r.y + (r.h + font.ascent - font.descent) / 2;
             c.draw_text(font, r.x + 6, base, name, col);
             if !last {
-                c.draw_text(&f.ui, r.right() + 2, base, "\u{203a}", theme::TEXT_DIM);
+                c.draw_text(&f.ui, r.right() + 2, base, "\u{203a}", theme::text_dim());
             }
         }
         c.restore_clip(old);
@@ -648,12 +648,12 @@ impl Explorer {
         let (ox, oy) = (vr.x + (vr.w - 14) / 2, vr.y + (vr.h - 14) / 2);
         if self.grid {
             for i in 0..3 {
-                c.fill_rect(Rect::new(ox, oy + i * 5 + 1, 3, 3), theme::TEXT);
-                c.fill_rect(Rect::new(ox + 5, oy + i * 5 + 1, 9, 3), theme::TEXT);
+                c.fill_rect(Rect::new(ox, oy + i * 5 + 1, 3, 3), theme::text());
+                c.fill_rect(Rect::new(ox + 5, oy + i * 5 + 1, 9, 3), theme::text());
             }
         } else {
             for (dx, dy) in [(0, 0), (8, 0), (0, 8), (8, 8)] {
-                c.fill_rounded_rect(Rect::new(ox + dx, oy + dy, 6, 6), 1, theme::TEXT);
+                c.fill_rounded_rect(Rect::new(ox + dx, oy + dy, 6, 6), 1, theme::text());
             }
         }
         button(c, self.tool_rect(Tool::NewFolder), "New Folder", ButtonStyle::Normal, self.hover == Hover::Tool(Tool::NewFolder), true);
@@ -664,34 +664,34 @@ impl Explorer {
         let f = fonts();
         let h = self.size.1;
         let side = Rect::new(0, TOOLBAR_H, SIDEBAR_W, h - TOOLBAR_H);
-        c.fill_rect(side, theme::SIDEBAR_BG);
-        c.vline(SIDEBAR_W - 1, TOOLBAR_H, h - TOOLBAR_H, theme::SEPARATOR);
-        c.draw_text(&f.small_bold, 18, TOOLBAR_H + 24, "PLACES", theme::TEXT_DIM);
+        c.fill_rect(side, theme::sidebar_bg());
+        c.vline(SIDEBAR_W - 1, TOOLBAR_H, h - TOOLBAR_H, theme::separator());
+        c.draw_text(&f.small_bold, 18, TOOLBAR_H + 24, "PLACES", theme::text_dim());
         for (i, (label, path, icon)) in self.places().iter().enumerate() {
             let r = self.place_rect(i);
             let current = self.path == *path;
             if current {
-                c.fill_rounded_rect(r, 7, with_alpha(0x000000, 22));
+                c.fill_rounded_rect(r, 7, theme::shade(22));
             } else if self.hover == Hover::Place(i) {
-                c.fill_rounded_rect(r, 7, with_alpha(0x000000, 12));
+                c.fill_rounded_rect(r, 7, theme::shade(12));
             }
             super::icons::draw(c, *icon, r.x + 8, r.y + 4, 20);
             let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
             let font = if current { &f.bold } else { &f.ui };
-            c.draw_text(font, r.x + 36, base, label, theme::TEXT);
+            c.draw_text(font, r.x + 36, base, label, theme::text());
         }
         // Disk usage.
         if let Ok(s) = fs::stats() {
             let y = h - 74;
-            c.draw_text(&f.small_bold, 18, y, "DISK", theme::TEXT_DIM);
+            c.draw_text(&f.small_bold, 18, y, "DISK", theme::text_dim());
             let bar = Rect::new(18, y + 10, SIDEBAR_W - 36, 8);
-            c.fill_rounded_rect(bar, 4, with_alpha(0x000000, 30));
+            c.fill_rounded_rect(bar, 4, theme::shade(30));
             let total = s.total_bytes().max(1);
             let used = total - s.free_bytes();
             let uw = ((bar.w as u64 * used / total) as i32).max(8);
             c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 4, theme::accent());
             let text = format!("{} free", fs::format_size(s.free_bytes()));
-            c.draw_text_clipped(&f.ui, 18, y + 38, &text, SIDEBAR_W - 30, theme::TEXT_DIM);
+            c.draw_text_clipped(&f.ui, 18, y + 38, &text, SIDEBAR_W - 30, theme::text_dim());
         }
     }
 
@@ -737,10 +737,10 @@ impl Explorer {
             let e = &self.entries[i];
             let selected = self.selected == Some(i);
             if selected {
-                c.fill_rounded_rect(r, 10, if focused { with_alpha(theme::accent(), 60) } else { with_alpha(0x000000, 26) });
-                c.stroke_rounded_rect(r, 10, 1, if focused { theme::accent() } else { with_alpha(0x000000, 40) });
+                c.fill_rounded_rect(r, 10, if focused { with_alpha(theme::accent(), 60) } else { theme::shade(26) });
+                c.stroke_rounded_rect(r, 10, 1, if focused { theme::accent() } else { theme::shade(40) });
             } else if self.hover == Hover::Row(i) {
-                c.fill_rounded_rect(r, 10, theme::HOVER);
+                c.fill_rounded_rect(r, 10, theme::hover());
             }
             let bx = Rect::new(r.x + (r.w - THUMB_BOX.0) / 2, r.y + 8, THUMB_BOX.0, THUMB_BOX.1);
             match self.thumb(e) {
@@ -763,33 +763,33 @@ impl Explorer {
                 }
                 None => {
                     let (icon, _) = kind_of(e, &self.path);
-                    super::icons::draw(c, icon, bx.x + (bx.w - 64) / 2, bx.y + (bx.h - 64) / 2, 64);
+                    super::icons::draw(c, icon, bx.x + (bx.w - 76) / 2, bx.y + bx.h - 78, 76);
                 }
             }
             // Name, centred (clipped with an ellipsis when too long).
             let max = r.w - 12;
             let tw = f.ui.measure(&e.name).min(max);
             let base = r.y + 8 + THUMB_BOX.1 + 22;
-            c.draw_text_clipped(&f.ui, r.x + (r.w - tw) / 2, base, &e.name, max, theme::TEXT);
+            c.draw_text_clipped(&f.ui, r.x + (r.w - tw) / 2, base, &e.name, max, theme::text());
             let sub = if e.is_dir { String::from("Folder") } else { fs::format_size(e.size as u64) };
-            c.draw_text_centered(&f.ui, Rect::new(r.x, base + 3, r.w, 18), &sub, theme::TEXT_DIM);
+            c.draw_text_centered(&f.ui, Rect::new(r.x, base + 3, r.w, 18), &sub, theme::text_dim());
         }
     }
 
     fn draw_list(&mut self, c: &mut Canvas, focused: bool) {
         let f = fonts();
         let l = self.list_rect();
-        c.fill_rect(Rect::new(l.x, l.y - HEADER_H, l.w, l.h + HEADER_H), theme::WINDOW_BG);
+        c.fill_rect(Rect::new(l.x, l.y - HEADER_H, l.w, l.h + HEADER_H), theme::window_bg());
         if self.grid {
             let hy = l.y - HEADER_H;
             let hb = hy + (HEADER_H + f.small_bold.ascent - f.small_bold.descent) / 2;
             let title = fs::file_name(&self.path);
             let title = if title.is_empty() { "MAYOS DISK".to_string() } else { title.to_ascii_uppercase() };
-            c.draw_text(&f.small_bold, l.x + 16, hb, &title, theme::TEXT_DIM);
-            c.hline(l.x, l.y - 1, l.w, theme::SEPARATOR);
+            c.draw_text(&f.small_bold, l.x + 16, hb, &title, theme::text_dim());
+            c.hline(l.x, l.y - 1, l.w, theme::separator());
             let old = c.push_clip(l);
             if self.entries.is_empty() {
-                c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 40, l.w, 30), "This folder is empty", theme::TEXT_DIM);
+                c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 40, l.w, 30), "This folder is empty", theme::text_dim());
             }
             self.draw_grid(c, focused);
             widgets::draw_scrollbar(c, self.scrollbar_track(), self.content_height(), l.h, self.scroll);
@@ -800,23 +800,23 @@ impl Explorer {
         let (name_x, size_x, mod_x, kind_x) = self.columns();
         let hy = l.y - HEADER_H;
         let hb = hy + (HEADER_H + f.small_bold.ascent - f.small_bold.descent) / 2;
-        c.draw_text(&f.small_bold, name_x + 28, hb, "NAME", theme::TEXT_DIM);
+        c.draw_text(&f.small_bold, name_x + 28, hb, "NAME", theme::text_dim());
         if let Some(x) = size_x {
-            c.draw_text(&f.small_bold, x, hb, "SIZE", theme::TEXT_DIM);
+            c.draw_text(&f.small_bold, x, hb, "SIZE", theme::text_dim());
         }
         if let Some(x) = mod_x {
-            c.draw_text(&f.small_bold, x, hb, "MODIFIED", theme::TEXT_DIM);
+            c.draw_text(&f.small_bold, x, hb, "MODIFIED", theme::text_dim());
         }
         if let Some(x) = kind_x {
-            c.draw_text(&f.small_bold, x, hb, "KIND", theme::TEXT_DIM);
+            c.draw_text(&f.small_bold, x, hb, "KIND", theme::text_dim());
         }
-        c.hline(l.x, l.y - 1, l.w, theme::SEPARATOR);
+        c.hline(l.x, l.y - 1, l.w, theme::separator());
 
         let old = c.push_clip(l);
         if self.entries.is_empty() {
             let msg = "This folder is empty";
-            c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 40, l.w, 30), msg, theme::TEXT_DIM);
-            c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 64, l.w, 30), "Right-click to create a file or folder", with_alpha(theme::TEXT_DIM, 160));
+            c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 40, l.w, 30), msg, theme::text_dim());
+            c.draw_text_centered(&f.ui, Rect::new(l.x, l.y + 64, l.w, 30), "Right-click to create a file or folder", with_alpha(theme::text_dim(), 160));
         }
         let first = (self.scroll / ROW_H).max(0) as usize;
         let visible = (l.h / ROW_H + 2) as usize;
@@ -825,11 +825,11 @@ impl Explorer {
             let e = &self.entries[i];
             let selected = self.selected == Some(i);
             if selected {
-                c.fill_rounded_rect(r, 7, if focused { theme::accent() } else { with_alpha(0x000000, 30) });
+                c.fill_rounded_rect(r, 7, if focused { theme::accent() } else { theme::shade(30) });
             } else if self.hover == Hover::Row(i) {
-                c.fill_rounded_rect(r, 7, theme::HOVER);
+                c.fill_rounded_rect(r, 7, theme::hover());
             } else if i % 2 == 1 {
-                c.fill_rounded_rect(r, 7, rgb(0xf8, 0xf9, 0xfb));
+                c.fill_rounded_rect(r, 7, theme::panel_bg());
             }
             let (icon, kind) = kind_of(e, &self.path);
             match self.thumb(e) {
@@ -839,8 +839,8 @@ impl Explorer {
                 }
                 None => super::icons::draw(c, icon, name_x - 4, r.y + 3, 22),
             }
-            let text = if selected && focused { theme::TEXT_ON_ACCENT } else { theme::TEXT };
-            let dim = if selected && focused { with_alpha(0xffffff, 210) } else { theme::TEXT_DIM };
+            let text = if selected && focused { theme::text_on_accent() } else { theme::text() };
+            let dim = if selected && focused { with_alpha(0xffffff, 210) } else { theme::text_dim() };
             let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
             let name_w = size_x.unwrap_or(r.right() - 10) - name_x - 40;
             c.draw_text_clipped(&f.ui, name_x + 28, base, &e.name, name_w, text);
@@ -863,8 +863,8 @@ impl Explorer {
         let f = fonts();
         let (w, h) = self.size;
         let r = Rect::new(SIDEBAR_W, h - STATUS_H, w - SIDEBAR_W, STATUS_H);
-        c.fill_rect(r, theme::PANEL_BG);
-        c.hline(r.x, r.y, r.w, theme::SEPARATOR);
+        c.fill_rect(r, theme::panel_bg());
+        c.hline(r.x, r.y, r.w, theme::separator());
         let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
         if let Some((msg, error, _)) = &self.message {
             let col = if *error { theme::DANGER } else { theme::accent_dark() };
@@ -887,7 +887,7 @@ impl Explorer {
                 format!("\u{201c}{}\u{201d} selected \u{2014} {}", e.name, fs::format_size(e.size as u64))
             };
         }
-        c.draw_text_clipped(&f.ui, r.x + 16, base, &text, r.w - 32, theme::TEXT_DIM);
+        c.draw_text_clipped(&f.ui, r.x + 16, base, &text, r.w - 32, theme::text_dim());
     }
 
     fn draw_menu(&self, c: &mut Canvas) {
@@ -895,8 +895,8 @@ impl Explorer {
         let f = fonts();
         let r = m.rect(self.size);
         c.draw_shadow(r, 9, 14, with_alpha(0x000000, 70));
-        c.fill_rounded_rect(r, 9, rgb(0xfb, 0xfb, 0xfd));
-        c.stroke_rounded_rect(r, 9, 1, with_alpha(0x000000, 40));
+        c.fill_rounded_rect(r, 9, theme::card_bg());
+        c.stroke_rounded_rect(r, 9, 1, theme::shade(40));
         let mut y = r.y + 5;
         for (i, it) in m.items.iter().enumerate() {
             match it {
@@ -911,14 +911,14 @@ impl Explorer {
                     } else if *a == Action::Delete {
                         theme::DANGER
                     } else {
-                        theme::TEXT
+                        theme::text()
                     };
                     let base = row.y + (row.h + f.ui.ascent - f.ui.descent) / 2;
                     c.draw_text(&f.ui, row.x + 12, base, label, col);
                     y += 26;
                 }
                 None => {
-                    c.hline(r.x + 10, y + 4, r.w - 20, theme::SEPARATOR);
+                    c.hline(r.x + 10, y + 4, r.w - 20, theme::separator());
                     y += 9;
                 }
             }

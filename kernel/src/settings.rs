@@ -15,6 +15,8 @@ pub struct Settings {
     /// Path of a picture used as the wallpaper; empty = built-in one.
     pub wallpaper_image: String,
     pub accent: usize,
+    /// Dark colours for the desktop, native apps and GTK apps.
+    pub dark: bool,
     pub animations: bool,
     pub volume: u8,
     pub muted: bool,
@@ -50,8 +52,9 @@ impl Default for Settings {
         Settings {
             resolution: None,
             wallpaper: 0,
-            wallpaper_image: String::new(),
-            accent: 0,
+            wallpaper_image: String::from("/pictures/MayOS Lake.jpg"),
+            accent: 1,
+            dark: false,
             animations: true,
             volume: 70,
             muted: false,
@@ -117,6 +120,7 @@ pub fn parse(text: &str) -> Settings {
             "wallpaper_image" => s.wallpaper_image = v.to_string(),
             "accent" => s.accent = num(0) as usize,
             "animations" => s.animations = parse_bool(v).unwrap_or(true),
+            "dark" => s.dark = parse_bool(v).unwrap_or(false),
             "volume" => s.volume = num(70).min(100) as u8,
             "muted" => s.muted = parse_bool(v).unwrap_or(false),
             "system_sounds" => s.system_sounds = parse_bool(v).unwrap_or(true),
@@ -152,7 +156,7 @@ pub fn serialize(s: &Settings) -> String {
     };
     format!(
         "# MayOS settings (edited by the Settings app)\n\
-         resolution = {}\nwallpaper = {}\nwallpaper_image = {}\naccent = {}\nanimations = {}\n\
+         resolution = {}\nwallpaper = {}\nwallpaper_image = {}\naccent = {}\ndark = {}\nanimations = {}\n\
          volume = {}\nmuted = {}\nsystem_sounds = {}\n\
          pointer_speed = {}\ndouble_click_ms = {}\nnatural_scroll = {}\nkey_repeat = {}\n\
          clock_24h = {}\nshow_seconds = {}\ntz_offset_min = {}\n\
@@ -162,6 +166,7 @@ pub fn serialize(s: &Settings) -> String {
         s.wallpaper,
         s.wallpaper_image,
         s.accent,
+        s.dark,
         s.animations,
         s.volume,
         s.muted,
@@ -248,6 +253,7 @@ fn network_changed(a: &Settings, b: &Settings) -> bool {
 /// Push settings into the subsystems that need them.
 pub fn apply(s: &Settings, old: Option<&Settings>) {
     crate::gui::theme::set_accent(s.accent);
+    crate::gui::theme::set_dark(s.dark);
     crate::audio::set_volume(s.volume, s.muted);
     if old.map(|o| o.key_repeat != s.key_repeat).unwrap_or(true) {
         crate::drivers::ps2::set_repeat(s.key_repeat);

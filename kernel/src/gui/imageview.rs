@@ -178,15 +178,15 @@ impl App for ImageViewer {
             }
         }
         let f = fonts();
-        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::PANEL_BG);
-        c.hline(0, TOOLBAR_H - 1, w, theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::panel_bg());
+        c.hline(0, TOOLBAR_H - 1, w, theme::separator());
         for (b, r, label) in self.buttons() {
             let style = if b == Btn::Wallpaper { ButtonStyle::Primary } else { ButtonStyle::Normal };
             button(c, r, label, style, self.hover == Some(b), self.image.is_some() || matches!(b, Btn::Prev | Btn::Next));
         }
         if let Some(img) = &self.image {
             let info = format!("{} \u{00d7} {} \u{00b7} {}%", img.width, img.height, self.effective_zoom());
-            c.draw_text(&f.ui, 214, 27, &info, theme::TEXT_DIM);
+            c.draw_text(&f.ui, 214, 27, &info, theme::text_dim());
         }
 
         let v = self.view();

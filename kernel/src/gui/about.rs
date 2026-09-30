@@ -81,15 +81,15 @@ impl App for About {
 
     fn render(&mut self, c: &mut Canvas, (w, h): (i32, i32), _focused: bool) {
         let f = fonts();
-        c.fill_rect(Rect::new(0, 0, w, h), theme::WINDOW_BG);
+        c.fill_rect(Rect::new(0, 0, w, h), theme::window_bg());
         c.fill_gradient_v(Rect::new(0, 0, w, 110), rgb(0x2f, 0x7c, 0xf6), rgb(0x7a, 0x4d, 0xe8));
         super::icons::draw(c, Icon::Info, 24, 23, 64);
         c.draw_text(&f.large, 104, 58, "MayOS", rgb(255, 255, 255));
         c.draw_text(&f.ui, 106, 82, "A from-scratch operating system", rgb(235, 238, 255));
         let mut y = 140;
         for (k, v) in system_info() {
-            c.draw_text(&f.bold, 24, y, k, theme::TEXT_DIM);
-            c.draw_text_clipped(&f.ui, 130, y, &v, w - 150, theme::TEXT);
+            c.draw_text(&f.bold, 24, y, k, theme::text_dim());
+            c.draw_text_clipped(&f.ui, 130, y, &v, w - 150, theme::text());
             y += 26;
         }
     }

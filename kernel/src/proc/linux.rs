@@ -289,6 +289,8 @@ fn base_env(cwd: &str) -> Vec<String> {
         String::from("PATH=/bin:/usr/bin:/sbin:/usr/sbin"),
         String::from("HOME=/home"),
         String::from("USER=user"),
+        // GTK apps (Firefox too) follow MayOS's light/dark setting.
+        String::from(if crate::settings::get().dark { "GTK_THEME=Adwaita:dark" } else { "GTK_THEME=Adwaita" }),
         String::from("LANG=C.UTF-8"),
         String::from("TERM=xterm"),
         String::from("XDG_RUNTIME_DIR=/run"),

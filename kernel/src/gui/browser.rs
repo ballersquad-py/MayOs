@@ -748,8 +748,8 @@ impl App for Browser {
         if let Some(e) = &self.error {
             let r = self.content_rect();
             c.fill_rect(r, rgb(0xf6, 0xf7, 0xfa));
-            c.draw_text(&f.large, r.x + 40, r.y + 80, "Can't open this page", theme::TEXT);
-            c.draw_text_clipped(&f.ui, r.x + 40, r.y + 116, e, r.w - 80, theme::TEXT_DIM);
+            c.draw_text(&f.large, r.x + 40, r.y + 80, "Can't open this page", theme::text());
+            c.draw_text_clipped(&f.ui, r.x + 40, r.y + 116, e, r.w - 80, theme::text_dim());
         }
         if self.console_open {
             let r = self.content_rect();
@@ -775,20 +775,20 @@ impl App for Browser {
             let br = Rect::new((w - bw) / 2, BAR_H + 30, bw, 96);
             c.draw_shadow(br, 10, 16, with_alpha(0x000000, 90));
             c.fill_rounded_rect(br, 10, rgb(255, 255, 255));
-            c.draw_text(&f.bold, br.x + 20, br.y + 30, &format!("{} says", self.url.as_ref().map(|u| u.host.as_str()).unwrap_or("This page")), theme::TEXT);
-            c.draw_text_clipped(&f.ui, br.x + 20, br.y + 56, m, bw - 40, theme::TEXT);
-            c.draw_text(&f.small_bold, br.x + 20, br.y + 82, "Click to close", theme::TEXT_DIM);
+            c.draw_text(&f.bold, br.x + 20, br.y + 30, &format!("{} says", self.url.as_ref().map(|u| u.host.as_str()).unwrap_or("This page")), theme::text());
+            c.draw_text_clipped(&f.ui, br.x + 20, br.y + 56, m, bw - 40, theme::text());
+            c.draw_text(&f.small_bold, br.x + 20, br.y + 82, "Click to close", theme::text_dim());
         }
         // Toolbar.
-        c.fill_rect(Rect::new(0, 0, w, BAR_H), theme::PANEL_BG);
-        c.hline(0, BAR_H - 1, w, theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, 0, w, BAR_H), theme::panel_bg());
+        c.hline(0, BAR_H - 1, w, theme::separator());
         let labels = ["\u{25c0}", "\u{25b6}", "", ""];
         let enabled = [!self.back.is_empty(), !self.forward.is_empty(), true, true];
         for i in 0..4u8 {
             button(c, self.btn_rect(i), labels[i as usize], ButtonStyle::Flat, self.hover_btn == Some(i), enabled[i as usize]);
         }
         // Reload (or stop) and home, drawn as shapes.
-        let ink = theme::TEXT;
+        let ink = theme::text();
         let r = self.btn_rect(2);
         let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
         if self.loading {
@@ -798,7 +798,7 @@ impl App for Browser {
             }
         } else {
             c.stroke_rounded_rect(Rect::new(cx - 6, cy - 6, 13, 13), 6, 2, ink);
-            c.fill_rect(Rect::new(cx + 1, cy - 8, 7, 7), theme::PANEL_BG);
+            c.fill_rect(Rect::new(cx + 1, cy - 8, 7, 7), theme::panel_bg());
             for k in 0..4 {
                 c.fill_rect(Rect::new(cx + 1 + k, cy - 7 + k, 4 - k, 1), ink);
                 c.fill_rect(Rect::new(cx + 4, cy - 7, 1, 4), ink);
@@ -810,7 +810,7 @@ impl App for Browser {
             c.fill_rect(Rect::new(cx - k, cy - 6 + k, 2 * k + 1, 1), ink);
         }
         c.fill_rect(Rect::new(cx - 5, cy, 11, 7), ink);
-        c.fill_rect(Rect::new(cx - 1, cy + 3, 3, 4), theme::PANEL_BG);
+        c.fill_rect(Rect::new(cx - 1, cy + 3, 3, 4), theme::panel_bg());
         let ar = self.address_rect();
         self.address.render(c, ar, focused && self.editing);
         if self.loading {
@@ -819,10 +819,10 @@ impl App for Browser {
         }
         // Status bar.
         let sr = Rect::new(0, h - STATUS_H, w, STATUS_H);
-        c.fill_rect(sr, theme::PANEL_BG);
-        c.hline(0, sr.y, w, theme::SEPARATOR);
+        c.fill_rect(sr, theme::panel_bg());
+        c.hline(0, sr.y, w, theme::separator());
         let msg = self.hover_link.clone().or_else(|| if self.status.is_empty() { None } else { Some(self.status.clone()) }).unwrap_or_default();
-        c.draw_text_clipped(&f.ui, 10, sr.y + 16, &msg, w - 20, theme::TEXT_DIM);
+        c.draw_text_clipped(&f.ui, 10, sr.y + 16, &msg, w - 20, theme::text_dim());
         let _ = with_alpha;
     }
 

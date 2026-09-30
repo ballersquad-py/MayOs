@@ -34,6 +34,21 @@ pub enum Icon {
     Clock,
     Software,
     Player,
+    MayOS,
+    NetWired,
+    NetOff,
+    NetPhone,
+    VolHigh,
+    VolMed,
+    VolLow,
+    VolMute,
+    SetDisplay,
+    SetTheme,
+    SetSound,
+    SetNetwork,
+    SetMouse,
+    SetTime,
+
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {

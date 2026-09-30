@@ -39,18 +39,49 @@ pub fn selection() -> Color {
     gfx::mix(rgb(0xff, 0xff, 0xff), accent(), 55)
 }
 
-pub const TEXT: Color = rgb(0x1d, 0x1f, 0x24);
-pub const TEXT_DIM: Color = rgb(0x6b, 0x71, 0x7e);
 pub const TEXT_ON_ACCENT: Color = rgb(0xff, 0xff, 0xff);
-pub const WINDOW_BG: Color = rgb(0xff, 0xff, 0xff);
-pub const PANEL_BG: Color = rgb(0xf5, 0xf6, 0xf8);
-pub const SIDEBAR_BG: Color = rgb(0xee, 0xf0, 0xf4);
-pub const SEPARATOR: Color = rgb(0xe1, 0xe4, 0xe9);
-pub const HOVER: Color = rgb(0xec, 0xf2, 0xfe);
+
+/// Dark mode (Settings > Appearance): the colours below follow it.
+static DARK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dark(on: bool) {
+    DARK.store(on, Ordering::Relaxed);
+}
+
+pub fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+macro_rules! themed {
+    ($($name:ident: $light:expr, $dark:expr;)*) => {
+        $(
+            #[inline]
+            pub fn $name() -> Color {
+                if is_dark() { $dark } else { $light }
+            }
+        )*
+    };
+}
+
+themed! {
+    text: rgb(0x1d, 0x1f, 0x24), rgb(0xe8, 0xea, 0xee);
+    text_dim: rgb(0x6b, 0x71, 0x7e), rgb(0x9a, 0xa1, 0xad);
+    window_bg: rgb(0xff, 0xff, 0xff), rgb(0x1f, 0x21, 0x26);
+    panel_bg: rgb(0xf5, 0xf6, 0xf8), rgb(0x27, 0x2a, 0x30);
+    sidebar_bg: rgb(0xee, 0xf0, 0xf4), rgb(0x23, 0x26, 0x2b);
+    separator: rgb(0xe1, 0xe4, 0xe9), rgb(0x36, 0x3a, 0x42);
+    hover: rgb(0xec, 0xf2, 0xfe), rgb(0x30, 0x36, 0x44);
+    titlebar: rgb(0xf4, 0xf5, 0xf7), rgb(0x2a, 0x2d, 0x33);
+    titlebar_inactive: rgb(0xea, 0xeb, 0xee), rgb(0x24, 0x27, 0x2c);
+    card_bg: rgb(0xff, 0xff, 0xff), rgb(0x2b, 0x2e, 0x35);
+    border: rgba(0, 0, 0, 38), rgba(255, 255, 255, 34);
+}
+
+/// Kept for the few places that need a constant.
+pub fn text_on_accent() -> Color {
+    TEXT_ON_ACCENT
+}
 pub const DANGER: Color = rgb(0xe5, 0x48, 0x4d);
-pub const TITLEBAR: Color = rgb(0xf4, 0xf5, 0xf7);
-pub const TITLEBAR_INACTIVE: Color = rgb(0xea, 0xeb, 0xee);
-pub const BORDER: Color = rgba(0, 0, 0, 38);
 pub const SHADOW: Color = rgba(6, 10, 24, 105);
 pub const SHADOW_INACTIVE: Color = rgba(6, 10, 24, 58);
 
@@ -68,17 +99,21 @@ pub struct Fonts {
     pub mono: Font,
     pub large: Font,
     pub small_bold: Font,
+    /// Medium 15 px (panel clock, headings).
+    pub medium: Font,
 }
 
 static FONTS: Once<Fonts> = Once::new();
 
 pub fn init() {
     FONTS.set(Fonts {
-        ui: Font::parse(include_bytes!("../../../assets/fonts/sans-13.mfnt")).expect("sans font"),
-        bold: Font::parse(include_bytes!("../../../assets/fonts/sans-bold-13.mfnt")).expect("bold font"),
+        // Noto Sans, and Inter for the clock (SIL Open Font License, assets/fonts/).
+        ui: Font::parse(include_bytes!("../../../assets/fonts/noto-13.mfnt")).expect("sans font"),
+        bold: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-13.mfnt")).expect("bold font"),
         mono: Font::parse(include_bytes!("../../../assets/fonts/mono-13.mfnt")).expect("mono font"),
-        large: Font::parse(include_bytes!("../../../assets/fonts/sans-24.mfnt")).expect("large font"),
-        small_bold: Font::parse(include_bytes!("../../../assets/fonts/sans-bold-11.mfnt")).expect("small font"),
+        large: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-24.mfnt")).expect("large font"),
+        small_bold: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-11.mfnt")).expect("small font"),
+        medium: Font::parse(include_bytes!("../../../assets/fonts/inter-medium-15.mfnt")).expect("medium font"),
     });
 }
 
@@ -88,4 +123,13 @@ pub fn fonts() -> &'static Fonts {
 
 pub fn try_fonts() -> Option<&'static Fonts> {
     FONTS.get()
+}
+
+/// A light overlay (hover, pressed, outlines) that shows on either theme.
+pub fn shade(a: u8) -> Color {
+    if is_dark() {
+        gfx::with_alpha(0xffffff, (a as u32 * 3 / 2).min(255) as u8)
+    } else {
+        gfx::with_alpha(0x000000, a)
+    }
 }

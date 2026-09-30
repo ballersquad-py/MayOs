@@ -462,22 +462,22 @@ impl App for Editor {
         let (w, h) = size;
         let f = fonts();
         // Toolbar.
-        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::PANEL_BG);
-        c.hline(0, TOOLBAR_H - 1, w, theme::SEPARATOR);
+        c.fill_rect(Rect::new(0, 0, w, TOOLBAR_H), theme::panel_bg());
+        c.hline(0, TOOLBAR_H - 1, w, theme::separator());
         button(c, self.save_rect(), "Save", ButtonStyle::Primary, self.hover == Hover::Save, true);
         button(c, self.save_as_rect(), "Save As\u{2026}", ButtonStyle::Normal, self.hover == Hover::SaveAs, true);
         let path = self.path.clone().unwrap_or_else(|| String::from("(not saved yet)"));
         let base = (TOOLBAR_H + f.ui.ascent - f.ui.descent) / 2;
-        c.draw_text_clipped(&f.ui, 190, base, &path, w - 320, theme::TEXT_DIM);
+        c.draw_text_clipped(&f.ui, 190, base, &path, w - 320, theme::text_dim());
         let pos = format!("Ln {}, Col {}", self.cursor.0 + 1, self.cursor.1 + 1);
         let pw = f.ui.measure(&pos);
-        c.draw_text(&f.ui, w - pw - 14, base, &pos, theme::TEXT_DIM);
+        c.draw_text(&f.ui, w - pw - 14, base, &pos, theme::text_dim());
 
         // Text area.
         let t = self.text_rect();
-        c.fill_rect(t, theme::WINDOW_BG);
-        c.fill_rect(Rect::new(0, t.y, GUTTER, t.h), rgb(0xf6, 0xf7, 0xf9));
-        c.vline(GUTTER - 1, t.y, t.h, theme::SEPARATOR);
+        c.fill_rect(t, theme::window_bg());
+        c.fill_rect(Rect::new(0, t.y, GUTTER, t.h), theme::panel_bg());
+        c.vline(GUTTER - 1, t.y, t.h, theme::separator());
         let lh = self.lh();
         let cw = self.cw();
         let vis = self.visible_lines();
@@ -490,11 +490,11 @@ impl App for Editor {
             }
             let y = t.y + PAD + row as i32 * lh;
             if li == self.cursor.0 && sel.is_none() {
-                c.fill_rect(Rect::new(GUTTER, y - 1, t.w - GUTTER, lh), rgb(0xf3, 0xf7, 0xff));
+                c.fill_rect(Rect::new(GUTTER, y - 1, t.w - GUTTER, lh), theme::hover());
             }
             let num = format!("{}", li + 1);
             let nw = f.mono.measure(&num);
-            let ncol = if li == self.cursor.0 { theme::TEXT } else { with_alpha(theme::TEXT_DIM, 170) };
+            let ncol = if li == self.cursor.0 { theme::text() } else { with_alpha(theme::text_dim(), 170) };
             c.draw_text(&f.mono, GUTTER - 10 - nw, y + f.mono.ascent, &num, ncol);
             let old = c.push_clip(Rect::new(GUTTER, t.y, t.w - GUTTER, t.h));
             let line = &self.lines[li];
@@ -504,10 +504,10 @@ impl App for Editor {
             {
                 let from = if li == s.0 { s.1 } else { 0 };
                 let to = if li == e.0 { e.1 } else { char_len(line) + 1 };
-                let sel_col = if focused { theme::selection() } else { rgb(0xe6, 0xe8, 0xec) };
+                let sel_col = if focused { theme::selection() } else { theme::separator() };
                 c.fill_rect(Rect::new(text_x + from as i32 * cw, y - 1, (to - from) as i32 * cw, lh), sel_col);
             }
-            c.draw_text(&f.mono, text_x, y + f.mono.ascent, line, theme::TEXT);
+            c.draw_text(&f.mono, text_x, y + f.mono.ascent, line, theme::text());
             if li == self.cursor.0 && focused && self.blink_on {
                 c.fill_rect(Rect::new(text_x + self.cursor.1 as i32 * cw, y - 1, 2, lh), theme::accent());
             }
@@ -518,8 +518,8 @@ impl App for Editor {
 
         // Status bar.
         let s = Rect::new(0, h - STATUS_H, w, STATUS_H);
-        c.fill_rect(s, theme::PANEL_BG);
-        c.hline(0, s.y, w, theme::SEPARATOR);
+        c.fill_rect(s, theme::panel_bg());
+        c.hline(0, s.y, w, theme::separator());
         let sb = s.y + (s.h + f.ui.ascent - f.ui.descent) / 2;
         let (msg, col) = match &self.message {
             Some((m, err, _)) => (m.clone(), if *err { theme::DANGER } else { theme::accent_dark() }),
@@ -530,7 +530,7 @@ impl App for Editor {
                     fs::format_size(self.text().len() as u64),
                     if self.modified { " \u{00b7} unsaved changes" } else { "" }
                 ),
-                theme::TEXT_DIM,
+                theme::text_dim(),
             ),
         };
         c.draw_text_clipped(&f.ui, 12, sb, &msg, w - 24, col);

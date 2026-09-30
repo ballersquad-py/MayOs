@@ -186,8 +186,14 @@ impl Window {
         (self.rect.w, self.rect.h - self.title_h())
     }
 
-    fn button_center(i: u8) -> (i32, i32) {
-        (20 + i as i32 * 20, theme::TITLEBAR_H / 2)
+    /// Title-bar buttons, right-aligned: 0 close, 1 minimise, 2 maximise.
+    fn button_center(i: u8, w: i32) -> (i32, i32) {
+        let slot = match i {
+            0 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        (w - 22 - slot * 34, theme::TITLEBAR_H / 2)
     }
 }
 
@@ -284,6 +290,9 @@ pub struct Wm {
     menu_hover: Option<usize>,
     /// Text typed into the app menu's search box.
     menu_query: String,
+    /// Thumbnail of the window whose taskbar button is hovered:
+    /// (window, since when hovered, picture, when made).
+    preview: Option<(WindowId, u64, Option<Surface>, u64)>,
     /// Apps whose program is installed (index into APPS), refreshed now and then.
     apps_ok: Vec<bool>,
     apps_checked: u64,
@@ -368,6 +377,7 @@ impl Wm {
             menu_opened_at: 0,
             menu_hover: None,
             menu_query: String::new(),
+            preview: None,
             apps_ok: APPS.iter().map(|a| !matches!(a.launch, Launch::Cmd(..))).collect(),
             apps_checked: 0,
             clock: String::new(),
@@ -466,7 +476,7 @@ impl Wm {
             restore: None,
             minimized: false,
             closing: false,
-            surface: Surface::new(w, h_total, theme::WINDOW_BG),
+            surface: Surface::new(w, h_total, theme::window_bg()),
             needs_render: true,
             render_area: None,
             hover_button: None,
@@ -671,7 +681,7 @@ impl Wm {
         let resized = r.w != w.rect.w || r.h != w.rect.h;
         w.rect = r;
         if resized {
-            w.surface = Surface::new(r.w, r.h, theme::WINDOW_BG);
+            w.surface = Surface::new(r.w, r.h, theme::window_bg());
             w.needs_render = true;
             w.render_area = None;
             let (cw, ch) = w.client_size();
@@ -877,6 +887,54 @@ impl Wm {
                 self.open(Box::new(t), None);
             }
         }
+    }
+
+    /// Taskbar hover preview: after a short pause, a live thumbnail of the
+    /// window (minimised ones too), refreshed a few times a second.
+    fn update_preview(&mut self, now: u64) {
+        let hovered = self.dock_hover.and_then(|k| self.panel_items().get(k).copied()).and_then(|(_, it)| match it {
+            PanelItem::Win(id) => Some(id),
+            _ => None,
+        });
+        let Some(id) = hovered else {
+            if self.preview.take().is_some() {
+                self.damage(self.dock_damage_rect().union(&self.preview_rect(0)));
+            }
+            return;
+        };
+        let since = match &self.preview {
+            Some((pid, since, _, _)) if *pid == id => *since,
+            _ => now,
+        };
+        let made = self.preview.as_ref().filter(|p| p.0 == id).map(|p| p.3).unwrap_or(0);
+        let mut pic = self.preview.take().filter(|p| p.0 == id).and_then(|p| p.2);
+        if now - since >= 350 && (pic.is_none() || now - made >= 400) {
+            if let Some(i) = self.index_of(id) {
+                let src = &self.windows[i].surface;
+                let (tw, th) = (220, (220 * src.h / src.w.max(1)).clamp(60, 160));
+                let mut t = Surface::new(tw, th, 0);
+                {
+                    let mut c = t.canvas();
+                    c.blit_scaled(src, Rect::new(0, 0, tw, th), 255, 0);
+                }
+                pic = Some(t);
+                self.preview = Some((id, since, pic, now));
+                self.damage(self.preview_rect(self.item_x(id)));
+                return;
+            }
+        }
+        self.preview = Some((id, since, pic, made));
+    }
+
+    fn item_x(&self, id: WindowId) -> i32 {
+        self.panel_items().iter().find(|(_, it)| *it == PanelItem::Win(id)).map(|(r, _)| r.x + r.w / 2).unwrap_or(0)
+    }
+
+    /// The preview popup above a taskbar button centred at `cx`.
+    fn preview_rect(&self, cx: i32) -> Rect {
+        let (w, h) = (240, 210);
+        let x = (cx - w / 2).clamp(6, (self.width - w - 6).max(6));
+        Rect::new(x, self.height - PANEL_H - h - 8, w, h)
     }
 
     fn refresh_apps(&mut self, now: u64) {
@@ -1114,7 +1172,7 @@ impl Wm {
                 self.damage(self.menu_rect());
             }
         }
-        let dh = if self.fullscreen_top().is_some() || !self.dock_visible() {
+        let dh = if (self.fullscreen_top().is_some() && !self.menu_open) || !self.dock_visible() {
             None
         } else {
             self.panel_items().iter().position(|(r, _)| r.contains(x, y))
@@ -1140,8 +1198,8 @@ impl Wm {
             let r = self.windows[i].rect;
             let (lx, ly) = (x - r.x, y - r.y);
             let hb = if self.windows[i].fullscreen.is_some() { None } else { (0..3u8).find(|&b| {
-                let (cx, cy) = Window::button_center(b);
-                (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 64
+                let (cx, cy) = Window::button_center(b, r.w);
+                (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 144
             }) };
             if hb != self.windows[i].hover_button {
                 self.windows[i].hover_button = hb;
@@ -1226,7 +1284,8 @@ impl Wm {
 
     fn mouse_down(&mut self, button: u8) {
         let (x, y) = self.pointer;
-        if let Some(i) = self.fullscreen_top() {
+        let over_shell = self.menu_open && (self.menu_rect().contains(x, y) || self.dock_rect().contains(x, y));
+        if let Some(i) = self.fullscreen_top().filter(|_| !over_shell) {
             let id = self.windows[i].id;
             let now = uptime_ms();
             let clicks = if self.is_double_click(now, x, y) { self.last_click.3.saturating_add(1) } else { 1 };
@@ -1301,8 +1360,8 @@ impl Wm {
                 return;
             }
             for b in 0..3u8 {
-                let (cx, cy) = Window::button_center(b);
-                if (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 64 {
+                let (cx, cy) = Window::button_center(b, r.w);
+                if (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) <= 144 {
                     match b {
                         0 => self.request_close(id),
                         1 => self.minimize(id),
@@ -1425,6 +1484,7 @@ impl Wm {
     fn close_menu(&mut self) {
         self.menu_open = false;
         self.damage(self.menu_rect().inset(-20));
+        self.damage(self.dock_damage_rect());
     }
 
     fn menu_action(&mut self, e: MenuEntry) {
@@ -1470,6 +1530,14 @@ impl Wm {
 
     fn settings_changed(&mut self) {
         let new = settings::get();
+        if new.dark != self.cfg.dark || new.accent != self.cfg.accent {
+            // Every window redraws in the new colours.
+            for w in self.windows.iter_mut() {
+                w.needs_render = true;
+                w.render_area = None;
+            }
+            self.damage_all();
+        }
         let wall_changed = new.wallpaper != self.cfg.wallpaper || new.wallpaper_image != self.cfg.wallpaper_image;
         if new.accent != self.cfg.accent {
             for w in self.windows.iter_mut() {
@@ -1563,6 +1631,7 @@ impl Wm {
         }
         let now = uptime_ms();
         self.refresh_apps(now);
+        self.update_preview(now);
         self.update_dock_visibility(now);
         // Reading the CMOS clock is slow I/O; a few times a second is plenty.
         if now - self.last_clock_check >= 250 || self.clock.is_empty() {
@@ -1738,7 +1807,7 @@ impl Wm {
                         }
                         c.blit_rounded(&win.surface, win.rect.x, win.rect.y, radius);
                         if !win.flat() {
-                            c.stroke_rounded_rect(win.rect, radius, 1, theme::BORDER);
+                            c.stroke_rounded_rect(win.rect, radius, 1, theme::border());
                         }
                     } else {
                         let radius = (theme::WINDOW_RADIUS * dest.w / win.rect.w.max(1)).max(2);
@@ -1746,7 +1815,7 @@ impl Wm {
                             c.draw_shadow_mask_scaled(m, dest, shadow, alpha);
                         }
                         c.blit_scaled(&win.surface, dest, alpha, radius);
-                        c.stroke_rounded_rect(dest, radius, 1, fade(theme::BORDER, alpha));
+                        c.stroke_rounded_rect(dest, radius, 1, fade(theme::border(), alpha));
                     }
                 }
             }
@@ -1773,7 +1842,8 @@ impl Wm {
         let (w, h) = (self.width, self.height);
         let covered = self.fullscreen_top().is_some();
         let dock_side = self.dock_side();
-        let dock_on = self.dock_visible() && !covered;
+        // In fullscreen the panel hides; the menu (Super) brings it back.
+        let dock_on = self.dock_visible() && (!covered || self.menu_open);
         let focused_title = self
             .focused
             .and_then(|id| self.windows.iter().find(|x| x.id == id))
@@ -1788,6 +1858,13 @@ impl Wm {
         let menu_rect = self.menu_rect();
         let menu_entries = if self.menu_open { self.menu_entries() } else { Vec::new() };
         let menu_query = self.menu_query.clone();
+        let preview = match &self.preview {
+            Some((id, _, Some(pic), _)) => {
+                let title = self.windows.iter().find(|w| w.id == *id).map(|w| w.app.title()).unwrap_or_default();
+                Some((self.preview_rect(self.item_x(*id)), pic.clone(), title))
+            }
+            _ => None,
+        };
         let menu_alpha = if self.menu_opened_at == 0 {
             255
         } else {
@@ -1822,9 +1899,7 @@ impl Wm {
                         if hovered || *menu_open {
                             c.fill_rounded_rect(*ir, 8, rgba(255, 255, 255, if *menu_open { 36 } else { 22 }));
                         }
-                        let (cx, cy) = (ir.x + ir.w / 2, ir.y + ir.h / 2);
-                        c.fill_circle(cx, cy, 12, accent);
-                        c.fill_circle(cx, cy, 5, white);
+                        super::icons::draw(&mut c, Icon::MayOS, ir.x + (ir.w - 28) / 2, ir.y + 4, 28);
                     }
                     PanelItem::Pin(i) => {
                         if hovered {
@@ -1848,9 +1923,16 @@ impl Wm {
                         let Some((_, title, icon, minimized)) = win_info.iter().find(|x| x.0 == id) else { continue };
                         let active = focused_id == Some(id) && !*minimized;
                         let bg = if active { 44 } else if hovered { 30 } else { 14 };
-                        c.fill_rounded_rect(*ir, 6, rgba(255, 255, 255, bg));
                         if active {
-                            c.fill_rounded_rect(Rect::new(ir.x + 6, ir.bottom() - 3, ir.w - 12, 3), 1, accent);
+                            // An accent edge that follows the rounded bottom.
+                            let old_clip = c.push_clip(Rect::new(ir.x, ir.bottom() - 3, ir.w, 3));
+                            c.fill_rounded_rect(*ir, 7, accent);
+                            c.restore_clip(old_clip);
+                            let old_clip = c.push_clip(Rect::new(ir.x, ir.y, ir.w, ir.h - 3));
+                            c.fill_rounded_rect(*ir, 7, rgba(255, 255, 255, bg));
+                            c.restore_clip(old_clip);
+                        } else {
+                            c.fill_rounded_rect(*ir, 7, rgba(255, 255, 255, bg));
                         }
                         super::icons::draw(&mut c, *icon, ir.x + 8, ir.y + 8, 20);
                         let base = ir.y + (ir.h + f.ui.ascent - f.ui.descent) / 2;
@@ -1859,44 +1941,62 @@ impl Wm {
                     }
                 }
             }
-            // Tray: network, volume, clock with the date under it.
+            // Window preview above its taskbar button.
+            if let Some((pr, pic, title)) = &preview {
+                let card = Rect::new(pr.x, pr.bottom() - pic.h - 44, pr.w, pic.h + 44);
+                c.draw_shadow(card, 12, 18, rgba(0, 0, 0, 90));
+                c.fill_rounded_rect(card, 12, rgba(34, 36, 42, 245));
+                c.stroke_rounded_rect(card, 12, 1, rgba(255, 255, 255, 30));
+                c.draw_text_clipped(&f.bold, card.x + 12, card.y + 22, title, card.w - 24, white);
+                c.blit_scaled(pic, Rect::new(card.x + 10, card.y + 34, pic.w, pic.h), 255, 6);
+            }
+            // Tray: network and volume icons, then the time over the date.
             let (time, date) = match clock.trim().rsplit_once(' ') {
                 Some((d, t)) => (t.trim(), d.trim()),
                 None => (clock.as_str(), ""),
             };
-            let tx = w - 16;
-            c.draw_text(&f.bold, tx - f.bold.measure(time), dock.y + 21, time, white);
-            c.draw_text(&f.ui, tx - f.ui.measure(date), dock.y + 37, date, rgba(255, 255, 255, 170));
-            let mut x = w - 16 - f.ui.measure(date).max(f.bold.measure(time)) - 30;
-            let base = dock.y + 29;
+            let date: String = {
+                // "Wed Sep 30" -> "Wed, 30 Sep"
+                let p: Vec<&str> = date.split_whitespace().collect();
+                if p.len() == 3 { format!("{}, {} {}", p[0], p[2], p[1]) } else { String::from(date) }
+            };
+            let tray = Rect::new(w - TRAY_W, dock.y, TRAY_W, PANEL_H);
+            let text_w = f.medium.measure(time).max(f.small_bold.measure(&date));
+            let tx = w - 14 - text_w;
+            c.draw_text(&f.medium, tx + (text_w - f.medium.measure(time)) / 2, dock.y + 22, time, white);
+            c.draw_text(&f.small_bold, tx + (text_w - f.small_bold.measure(&date)) / 2, dock.y + 38, &date, rgba(255, 255, 255, 165));
+            let mut x = tx - 16 - 20;
+            let iy = dock.y + (PANEL_H - 20) / 2;
             if let Some(st) = crate::network::status() {
                 let online = st.link_up && !st.ip.is_unspecified();
-                let col = if online { white } else { rgba(255, 255, 255, 90) };
-                for (k, bar_h) in [4, 7, 10, 13].iter().enumerate() {
-                    c.fill_rounded_rect(Rect::new(x + k as i32 * 4, base - bar_h + 1, 3, *bar_h), 1, col);
-                }
-                x -= 28;
+                let icon = if !online {
+                    Icon::NetOff
+                } else if st.adapter.contains("tethering") || st.adapter.contains("iPhone") {
+                    Icon::NetPhone
+                } else {
+                    Icon::NetWired
+                };
+                super::icons::draw(&mut c, icon, x, iy, 20);
+                x -= 30;
             }
             if crate::audio::is_present() {
                 let cfg = settings::get();
-                let col = white;
-                c.fill_rect(Rect::new(x, base - 8, 3, 6), col);
-                for k in 0..5 {
-                    c.fill_rect(Rect::new(x + 3 + k, base - 9 - k + 1, 1, 8 + k * 2 - 2), col);
-                }
-                if cfg.muted || cfg.volume == 0 {
-                    c.draw_text(&f.small_bold, x + 11, base, "\u{2715}", col);
+                let icon = if cfg.muted || cfg.volume == 0 {
+                    Icon::VolMute
+                } else if cfg.volume > 66 {
+                    Icon::VolHigh
+                } else if cfg.volume > 33 {
+                    Icon::VolMed
                 } else {
-                    let arcs = if cfg.volume > 66 { 3 } else if cfg.volume > 33 { 2 } else { 1 };
-                    for a in 0..arcs {
-                        c.fill_rect(Rect::new(x + 10 + a * 3, base - 7 - a * 2, 1, 4 + a * 4), col);
-                    }
-                }
+                    Icon::VolLow
+                };
+                super::icons::draw(&mut c, icon, x, iy, 20);
             }
+            let _ = tray;
         }
 
         // App menu: search, apps, places and power (fades up when opened).
-        if *menu_open && !covered && menu_rect.inset(-20).intersects(&r) {
+        if *menu_open && menu_rect.inset(-20).intersects(&r) {
             let a = menu_alpha;
             let m = menu_rect.offset(0, (255 - a as i32) * 10 / 255);
             c.draw_shadow(m, 12, 20, fade(rgba(0, 0, 0, 110), a));
@@ -2003,37 +2103,40 @@ fn render_window(w: &mut Window, focused: bool) {
     let rw = w.rect.w;
     let mut c = w.surface.canvas();
     let tb = Rect::new(0, 0, rw, theme::TITLEBAR_H);
-    c.fill_rect(tb, if focused { theme::TITLEBAR } else { theme::TITLEBAR_INACTIVE });
-    c.hline(0, theme::TITLEBAR_H - 1, rw, theme::SEPARATOR);
-    let colors = [rgb(0xff, 0x5f, 0x57), rgb(0xfe, 0xbc, 0x2e), rgb(0x28, 0xc8, 0x40)];
+    c.fill_rect(tb, if focused { theme::titlebar() } else { theme::titlebar_inactive() });
+    c.hline(0, theme::TITLEBAR_H - 1, rw, theme::separator());
+    // App icon and title on the left (Linux style).
+    let icon = w.app.icon();
+    let mid = theme::TITLEBAR_H / 2;
+    super::icons::draw(&mut c, icon, 12, mid - 9, 18);
+    let tcol = if focused { theme::text() } else { theme::text_dim() };
+    let base = (theme::TITLEBAR_H + f.bold.ascent - f.bold.descent) / 2;
+    c.draw_text_clipped(&f.bold, 38, base, &title, rw - 38 - 120, tcol);
+    // Minimise, maximise and close on the right: round buttons that light up.
     for b in 0..3u8 {
-        let (cx, cy) = Window::button_center(b);
-        let col = if focused || hover.is_some() { colors[b as usize] } else { rgb(0xcf, 0xd0, 0xd4) };
-        c.fill_circle(cx, cy, 6, col);
-        if hover.is_some() {
-            let g = rgba(0, 0, 0, 150);
-            match b {
-                0 => {
-                    for d in -2..=2 {
-                        c.blend_pixel(cx + d, cy + d, g, 255);
-                        c.blend_pixel(cx + d, cy - d, g, 255);
-                        c.blend_pixel(cx + d - 1, cy + d, g, 120);
-                        c.blend_pixel(cx + d - 1, cy - d, g, 120);
-                    }
-                }
-                1 => c.fill_rect(Rect::new(cx - 3, cy, 7, 1), g),
-                _ => {
-                    c.fill_rect(Rect::new(cx - 3, cy, 7, 1), g);
-                    c.fill_rect(Rect::new(cx, cy - 3, 1, 7), g);
+        let (cx, cy) = Window::button_center(b, rw);
+        let hot = hover == Some(b);
+        let (bg, fg) = match (b, hot) {
+            (0, true) => (rgb(0xe8, 0x4a, 0x4f), rgb(255, 255, 255)),
+            (_, true) => (rgba(0, 0, 0, 26), theme::text()),
+            _ => (if focused { rgba(0, 0, 0, 12) } else { 0 }, if focused { theme::text() } else { theme::text_dim() }),
+        };
+        if bg != 0 {
+            c.fill_circle(cx, cy, 11, bg);
+        }
+        match b {
+            0 => {
+                for d in -4..=4 {
+                    c.blend_pixel(cx + d, cy + d, fg, 255);
+                    c.blend_pixel(cx + d, cy - d, fg, 255);
+                    c.blend_pixel(cx + d + 1, cy + d, fg, 110);
+                    c.blend_pixel(cx + d + 1, cy - d, fg, 110);
                 }
             }
+            1 => c.fill_rect(Rect::new(cx - 5, cy + 1, 10, 2), fg),
+            _ => c.stroke_rounded_rect(Rect::new(cx - 5, cy - 5, 10, 10), 2, 2, fg),
         }
     }
-    let tcol = if focused { theme::TEXT } else { theme::TEXT_DIM };
-    let tw = f.bold.measure(&title).min(rw - 170);
-    let tx = (rw - tw) / 2;
-    let base = (theme::TITLEBAR_H + f.bold.ascent - f.bold.descent) / 2;
-    c.draw_text_clipped(&f.bold, tx.max(80), base, &title, rw - 170, tcol);
 
     c.translate(0, theme::TITLEBAR_H);
     let old = c.push_clip(Rect::new(0, 0, cw, ch));

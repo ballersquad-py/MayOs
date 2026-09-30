@@ -19,6 +19,12 @@ static PNGS: &[(&str, [&[u8]; 3])] = &[
     ("firefox", [include_bytes!("../../../assets/icons/firefox-32.png"), include_bytes!("../../../assets/icons/firefox-64.png"), include_bytes!("../../../assets/icons/firefox-128.png")]),
     ("settings", [include_bytes!("../../../assets/icons/settings-32.png"), include_bytes!("../../../assets/icons/settings-64.png"), include_bytes!("../../../assets/icons/settings-128.png")]),
     ("tasks", [include_bytes!("../../../assets/icons/tasks-32.png"), include_bytes!("../../../assets/icons/tasks-64.png"), include_bytes!("../../../assets/icons/tasks-128.png")]),
+    ("set-display", [include_bytes!("../../../assets/icons/set-display-32.png"), include_bytes!("../../../assets/icons/set-display-64.png"), include_bytes!("../../../assets/icons/set-display-128.png")]),
+    ("set-theme", [include_bytes!("../../../assets/icons/set-theme-32.png"), include_bytes!("../../../assets/icons/set-theme-64.png"), include_bytes!("../../../assets/icons/set-theme-128.png")]),
+    ("set-sound", [include_bytes!("../../../assets/icons/set-sound-32.png"), include_bytes!("../../../assets/icons/set-sound-64.png"), include_bytes!("../../../assets/icons/set-sound-128.png")]),
+    ("set-network", [include_bytes!("../../../assets/icons/set-network-32.png"), include_bytes!("../../../assets/icons/set-network-64.png"), include_bytes!("../../../assets/icons/set-network-128.png")]),
+    ("set-mouse", [include_bytes!("../../../assets/icons/set-mouse-32.png"), include_bytes!("../../../assets/icons/set-mouse-64.png"), include_bytes!("../../../assets/icons/set-mouse-128.png")]),
+    ("set-time", [include_bytes!("../../../assets/icons/set-time-32.png"), include_bytes!("../../../assets/icons/set-time-64.png"), include_bytes!("../../../assets/icons/set-time-128.png")]),
     ("about", [include_bytes!("../../../assets/icons/about-32.png"), include_bytes!("../../../assets/icons/about-64.png"), include_bytes!("../../../assets/icons/about-128.png")]),
     ("minecraft", [include_bytes!("../../../assets/icons/minecraft-32.png"), include_bytes!("../../../assets/icons/minecraft-64.png"), include_bytes!("../../../assets/icons/minecraft-128.png")]),
     ("player", [include_bytes!("../../../assets/icons/player-32.png"), include_bytes!("../../../assets/icons/player-64.png"), include_bytes!("../../../assets/icons/player-128.png")]),
@@ -41,6 +47,14 @@ static PNGS: &[(&str, [&[u8]; 3])] = &[
     ("audio", [include_bytes!("../../../assets/icons/audio-32.png"), include_bytes!("../../../assets/icons/audio-64.png"), include_bytes!("../../../assets/icons/audio-128.png")]),
     ("program", [include_bytes!("../../../assets/icons/program-32.png"), include_bytes!("../../../assets/icons/program-64.png"), include_bytes!("../../../assets/icons/program-128.png")]),
     ("html", [include_bytes!("../../../assets/icons/html-32.png"), include_bytes!("../../../assets/icons/html-64.png"), include_bytes!("../../../assets/icons/html-128.png")]),
+    ("mayos", [include_bytes!("../../../assets/icons/mayos-32.png"), include_bytes!("../../../assets/icons/mayos-64.png"), include_bytes!("../../../assets/icons/mayos-128.png")]),
+    ("net-wired", [include_bytes!("../../../assets/icons/net-wired-32.png"), include_bytes!("../../../assets/icons/net-wired-64.png"), include_bytes!("../../../assets/icons/net-wired-128.png")]),
+    ("net-off", [include_bytes!("../../../assets/icons/net-off-32.png"), include_bytes!("../../../assets/icons/net-off-64.png"), include_bytes!("../../../assets/icons/net-off-128.png")]),
+    ("net-phone", [include_bytes!("../../../assets/icons/net-phone-32.png"), include_bytes!("../../../assets/icons/net-phone-64.png"), include_bytes!("../../../assets/icons/net-phone-128.png")]),
+    ("vol-high", [include_bytes!("../../../assets/icons/vol-high-32.png"), include_bytes!("../../../assets/icons/vol-high-64.png"), include_bytes!("../../../assets/icons/vol-high-128.png")]),
+    ("vol-med", [include_bytes!("../../../assets/icons/vol-med-32.png"), include_bytes!("../../../assets/icons/vol-med-64.png"), include_bytes!("../../../assets/icons/vol-med-128.png")]),
+    ("vol-low", [include_bytes!("../../../assets/icons/vol-low-32.png"), include_bytes!("../../../assets/icons/vol-low-64.png"), include_bytes!("../../../assets/icons/vol-low-128.png")]),
+    ("vol-mute", [include_bytes!("../../../assets/icons/vol-mute-32.png"), include_bytes!("../../../assets/icons/vol-mute-64.png"), include_bytes!("../../../assets/icons/vol-mute-128.png")]),
 ];
 
 fn name(i: Icon) -> &'static str {
@@ -74,6 +88,20 @@ fn name(i: Icon) -> &'static str {
         Icon::Clock => "clock",
         Icon::Software => "software",
         Icon::Player => "player",
+        Icon::MayOS => "mayos",
+        Icon::NetWired => "net-wired",
+        Icon::NetOff => "net-off",
+        Icon::NetPhone => "net-phone",
+        Icon::VolHigh => "vol-high",
+        Icon::VolMed => "vol-med",
+        Icon::VolLow => "vol-low",
+        Icon::VolMute => "vol-mute",
+        Icon::SetDisplay => "set-display",
+        Icon::SetTheme => "set-theme",
+        Icon::SetSound => "set-sound",
+        Icon::SetNetwork => "set-network",
+        Icon::SetMouse => "set-mouse",
+        Icon::SetTime => "set-time",
     }
 }
 

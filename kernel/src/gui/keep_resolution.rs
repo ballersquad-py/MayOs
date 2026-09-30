@@ -67,10 +67,10 @@ impl App for KeepResolution {
 
     fn render(&mut self, c: &mut Canvas, (w, h): (i32, i32), _focused: bool) {
         let f = fonts();
-        c.fill_rect(Rect::new(0, 0, w, h), theme::PANEL_BG);
-        c.draw_text(&f.bold, 18, 30, &format!("Keep {} \u{00d7} {}?", self.new.0, self.new.1), theme::TEXT);
+        c.fill_rect(Rect::new(0, 0, w, h), theme::panel_bg());
+        c.draw_text(&f.bold, 18, 30, &format!("Keep {} \u{00d7} {}?", self.new.0, self.new.1), theme::text());
         let left = TIMEOUT_MS.saturating_sub(crate::time::uptime_ms() - self.started) / 1000 + 1;
-        c.draw_text(&f.ui, 18, 56, &format!("Going back to {} \u{00d7} {} in {} s.", self.old.0, self.old.1, left), theme::TEXT_DIM);
+        c.draw_text(&f.ui, 18, 56, &format!("Going back to {} \u{00d7} {} in {} s.", self.old.0, self.old.1, left), theme::text_dim());
         button(c, self.revert_rect(), "Revert", ButtonStyle::Normal, self.hover == Some(0), true);
         button(c, self.keep_rect(), "Keep", ButtonStyle::Primary, self.hover == Some(1), true);
     }
