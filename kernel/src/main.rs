@@ -14,6 +14,7 @@ mod drivers;
 mod fs;
 mod gui;
 mod input;
+mod iphone;
 mod interrupts;
 mod mem;
 mod network;

@@ -11,6 +11,7 @@
 //! "nousb" on the kernel command line leaves the controller to the
 //! firmware (its PS/2 emulation keeps the keyboard working).
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
@@ -137,7 +138,7 @@ struct Device {
     /// Output device context (kept alive for the controller).
     _out: DmaBuf,
     hids: Vec<Hid>,
-    net: Option<NetDev>,
+    nets: Vec<NetDev>,
 }
 
 /// A USB network function (phone tethering).
@@ -156,6 +157,7 @@ struct NetDev {
     inflight: usize,
     seq: u16,
     carrier_at: u64,
+    out_mps: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -219,6 +221,13 @@ fn bulk(f: &Iface) -> Option<(Ep, Ep)> {
     let i = f.eps.iter().find(|e| e.attr & 3 == 2 && e.addr & 0x80 != 0)?;
     let o = f.eps.iter().find(|e| e.attr & 3 == 2 && e.addr & 0x80 == 0)?;
     Some((*i, *o))
+}
+
+/// The iPhone's usbmux interface (255/254/2).
+fn find_mux(ifaces: &[Iface]) -> Option<NetPlan> {
+    let f = ifaces.iter().find(|f| (f.class, f.sub, f.proto) == (0xff, 0xfe, 2) && bulk(f).is_some())?;
+    let (i, o) = bulk(f)?;
+    Some(NetPlan { proto: Proto::Raw, ctrl_if: f.num, data_if: f.num, alt: f.alt, bulk_in: i, bulk_out: o, mac_string: 0 })
 }
 
 /// The best network function among the interfaces of one configuration.
@@ -500,7 +509,7 @@ impl Xhci {
             let _ = self.command(Trb { param: 0, status: 0, control: TRB_DISABLE_SLOT << 10 | (slot as u32) << 24 });
             return;
         }
-        self.devices.push(Device { slot, port, ep0, _out: out, hids: Vec::new(), net: None });
+        self.devices.push(Device { slot, port, ep0, _out: out, hids: Vec::new(), nets: Vec::new() });
         let dev = self.devices.len() - 1;
         let Some(mut buf) = DmaBuf::try_new(4096) else { return };
         if !self.control(dev, 0x80, 6, 0x0100, 0, Some((&mut buf, 18))) {
@@ -510,6 +519,7 @@ impl Xhci {
         let d = buf.as_slice();
         let (class, vid, pid) = (d[4], u16::from_le_bytes([d[8], d[9]]), u16::from_le_bytes([d[10], d[11]]));
         let nconf = d[17].max(1);
+        let serial_idx = d[16];
         crate::kprintln!("usb: port {} device {:04x}:{:04x} class {:#x} ({})", port, vid, pid, class, speed_name(speed));
         if class == 9 {
             crate::kprintln!("usb: hubs are not supported yet: plug devices straight into the PC");
@@ -538,8 +548,34 @@ impl Xhci {
                 if !self.control(dev, 0x00, 9, value as u16, 0, None) {
                     return;
                 }
+                let iphone = plan.proto == Proto::Ipheth;
                 self.setup_net(dev, speed, plan, vid, pid);
+                // iPhone: also the "Apple Mobile Device" interface, to pair.
+                if iphone && let Some(mux) = find_mux(ifaces) {
+                    let udid = self.string(dev, serial_idx).unwrap_or_default();
+                    self.setup_net(dev, speed, mux, vid, pid);
+                    if let Some(n) = self.devices[dev].nets.iter().find(|n| n.proto == Proto::Raw) {
+                        crate::iphone::start(n.usb.clone(), udid);
+                    }
+                }
                 return;
+            }
+        }
+        // An iPhone without Personal Hotspot: pair now (the hotspot works
+        // once it is turned on and the phone is plugged in again).
+        if vid == 0x05ac {
+            for (ci, ifaces) in parsed.iter().enumerate().rev() {
+                if let Some(mux) = find_mux(ifaces) {
+                    if !self.control(dev, 0x00, 9, configs[ci][5] as u16, 0, None) {
+                        return;
+                    }
+                    let udid = self.string(dev, serial_idx).unwrap_or_default();
+                    self.setup_net(dev, speed, mux, vid, pid);
+                    if let Some(n) = self.devices[dev].nets.iter().find(|n| n.proto == Proto::Raw) {
+                        crate::iphone::start(n.usb.clone(), udid);
+                    }
+                    return;
+                }
             }
         }
         // Keyboards and mice in the first configuration.
@@ -614,6 +650,20 @@ impl Xhci {
         self.command(Trb { param: inctx.phys, status: 0, control: TRB_CONFIGURE_EP << 10 | (slot as u32) << 24 }).is_some()
     }
 
+    /// A string descriptor (US English) as text.
+    fn string(&mut self, dev: usize, idx: u8) -> Option<String> {
+        if idx == 0 {
+            return None;
+        }
+        let mut buf = DmaBuf::try_new(256)?;
+        if !self.control(dev, 0x80, 6, 0x0300 | idx as u16, 0x0409, Some((&mut buf, 255))) {
+            return None;
+        }
+        let n = (buf.as_slice()[0] as usize).min(255);
+        let s: String = buf.as_slice()[2..n].chunks(2).map(|c| c[0] as char).filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        Some(s)
+    }
+
     fn setup_net(&mut self, dev: usize, speed: u32, plan: NetPlan, vid: u16, pid: u16) {
         let port = self.devices[dev].port;
         let slot = self.devices[dev].slot;
@@ -626,6 +676,34 @@ impl Xhci {
         let _ = speed;
         if !self.configure_ep(dev, in_dci, 6, plan.bulk_in.mps, 0, &in_ring) || !self.configure_ep(dev, out_dci, 2, plan.bulk_out.mps, 0, &out_ring) {
             crate::kprintln!("usb: port {}: network endpoints failed", port);
+            return;
+        }
+        if plan.proto == Proto::Raw {
+            let mut n = NetDev {
+                proto: Proto::Raw,
+                usb: Arc::new(UsbNet::new(Mac::ZERO, "Apple Mobile Device")),
+                in_dci,
+                out_dci,
+                in_ring,
+                out_ring,
+                in_bufs: Vec::new(),
+                in_next: 0,
+                in_len: 16384,
+                out_bufs: Vec::new(),
+                out_next: 0,
+                inflight: 0,
+                seq: 0,
+                carrier_at: 0,
+                out_mps: plan.bulk_out.mps,
+            };
+            for _ in 0..4 {
+                let (Some(b), Some(o)) = (DmaBuf::try_new(16384), DmaBuf::try_new(16384 + 64)) else { return };
+                n.in_ring.push(Trb { param: b.phys, status: 16384, control: TRB_NORMAL << 10 | 1 << 5 | 1 << 2 });
+                n.in_bufs.push(b);
+                n.out_bufs.push(o);
+            }
+            w32(self.db + slot as usize * 4, in_dci as u32);
+            self.devices[dev].nets.push(n);
             return;
         }
         // The adapter's MAC address.
@@ -667,6 +745,7 @@ impl Xhci {
                 id += 1;
                 ask(self, usbnet::rndis_msg(usbnet::RNDIS_SET, id, usbnet::OID_PACKET_FILTER, Some(0x0000_000f)), &mut buf);
             }
+            Proto::Raw => {}
             Proto::Ecm | Proto::Ncm => {
                 if plan.mac_string != 0 && self.control(dev, 0x80, 6, 0x0300 | plan.mac_string as u16, 0x0409, Some((&mut buf, 64))) {
                     let n = (buf.as_slice()[0] as usize).min(64);
@@ -682,6 +761,7 @@ impl Xhci {
             Proto::Rndis => "Android phone (USB tethering)",
             Proto::Ncm => "USB tethering (NCM)",
             Proto::Ecm => "USB Ethernet",
+            Proto::Raw => "USB device",
         };
         let big = matches!(plan.proto, Proto::Rndis | Proto::Ncm);
         let in_len = if big { 16384 } else { 2048 };
@@ -700,6 +780,7 @@ impl Xhci {
             inflight: 0,
             seq: 0,
             carrier_at: 0,
+            out_mps: plan.bulk_out.mps,
         };
         for _ in 0..8 {
             let (Some(b), Some(o)) = (DmaBuf::try_new(in_len), DmaBuf::try_new(16384)) else { return };
@@ -710,13 +791,13 @@ impl Xhci {
         w32(self.db + slot as usize * 4, in_dci as u32);
         crate::kprintln!("usb: port {}: {} mac {}", port, model, mac);
         crate::network::add_usb(n.usb.clone());
-        self.devices[dev].net = Some(n);
+        self.devices[dev].nets.push(n);
     }
 
     fn detach(&mut self, port: u8) {
         if let Some(i) = self.devices.iter().position(|d| d.port == port) {
             let d = self.devices.remove(i);
-            if let Some(n) = &d.net {
+            for n in &d.nets {
                 n.usb.gone.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             let _ = self.command(Trb { param: 0, status: 0, control: TRB_DISABLE_SLOT << 10 | (d.slot as u32) << 24 });
@@ -733,7 +814,7 @@ impl Xhci {
                 let code = t.status >> 24;
                 let db = self.db;
                 let Some(d) = self.devices.iter_mut().find(|d| d.slot == slot) else { return };
-                if let Some(n) = d.net.as_mut() {
+                if let Some(n) = d.nets.iter_mut().find(|n| n.in_dci == dci || n.out_dci == dci) {
                     if dci == n.in_dci {
                         let i = n.in_next;
                         n.in_next = (n.in_next + 1) % n.in_bufs.len();
@@ -804,7 +885,7 @@ impl Xhci {
         let now = uptime_ms();
         for (k, d) in self.devices.iter_mut().enumerate() {
             let slot = d.slot;
-            let Some(n) = d.net.as_mut() else { continue };
+            for n in d.nets.iter_mut() {
             let mut sent = false;
             while n.inflight < n.out_bufs.len() {
                 let Some(frame) = n.usb.tx.lock().pop_front() else { break };
@@ -816,6 +897,12 @@ impl Xhci {
                 n.out_next = (n.out_next + 1) % n.out_bufs.len();
                 n.out_ring.push(Trb { param: phys, status: len as u32, control: TRB_NORMAL << 10 | 1 << 5 });
                 n.inflight += 1;
+                // A stream ends a transfer that fills whole packets with an
+                // empty one (the iPhone waits for it).
+                if n.proto == Proto::Raw && len % n.out_mps.max(1) as usize == 0 {
+                    n.out_ring.push(Trb { param: phys, status: 0, control: TRB_NORMAL << 10 | 1 << 5 });
+                    n.inflight += 1;
+                }
                 sent = true;
             }
             if sent {
@@ -825,12 +912,13 @@ impl Xhci {
                 n.carrier_at = now;
                 carrier.push(k);
             }
+            }
         }
         // iPhone: is Personal Hotspot on?
         for k in carrier {
             let Some(mut b) = DmaBuf::try_new(64) else { break };
             let on = self.control(k, 0xc0, 0x45, 0, 2, Some((&mut b, 1))) && b.as_slice()[0] == 4;
-            if let Some(n) = self.devices[k].net.as_ref() {
+            if let Some(n) = self.devices[k].nets.iter().find(|n| n.proto == Proto::Ipheth) {
                 n.usb.link.store(on, core::sync::atomic::Ordering::Relaxed);
             }
         }

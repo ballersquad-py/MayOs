@@ -673,14 +673,19 @@ impl SettingsApp {
     fn page_network(&mut self, c: &mut Canvas, x: i32, mut y: i32, w: i32) {
         let f = fonts();
         y = self.page_title(c, x, y, "Network & Internet");
+        let iphone = crate::iphone::status();
+        if !iphone.is_empty() {
+            y = self.note(c, x + 4, y + 4, w - 8, &format!("iPhone: {}", iphone)) + 12;
+        }
         let Some(st) = crate::network::status() else {
             self.note(
                 c,
                 x + 4,
                 y + 4,
                 w - 8,
-                "No supported network adapter was found. MayOS drives Intel e1000-family adapters: in VirtualBox \
-                 choose \"Intel PRO/1000 MT Desktop\" (attached to NAT); with QEMU add -device e1000.",
+                "No supported network adapter was found. MayOS drives Intel (e1000, I210/I211, I217-I219, I225/I226) and \
+                 Realtek (RTL8111/8168, RTL8125) wired adapters, and phones plugged in over USB with USB tethering or \
+                 Personal Hotspot on. In VirtualBox choose \"Intel PRO/1000 MT Desktop\".",
             );
             return;
         };

@@ -364,6 +364,7 @@ name = "mayos-kernel"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "crypto-bigint",
  "embedded-io",
  "embedded-tls",
  "fat32",
@@ -375,6 +376,7 @@ dependencies = [
  "net",
  "rand_chacha",
  "rand_core",
+ "sha2",
  "web",
 ]
 

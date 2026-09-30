@@ -24,6 +24,8 @@ pub enum Proto {
     Rndis,
     Ecm,
     Ncm,
+    /// A byte stream (the iPhone's usbmux interface), not a network.
+    Raw,
 }
 
 pub const IPHETH_FRAME: usize = 1514;
@@ -92,6 +94,11 @@ pub fn unwrap(proto: Proto, data: &[u8], out: &mut Vec<Vec<u8>>) {
                 out.push(data[2..].to_vec());
             }
         }
+        Proto::Raw => {
+            if !data.is_empty() {
+                out.push(data.to_vec());
+            }
+        }
         Proto::Ecm => {
             if data.len() >= 14 {
                 out.push(data.to_vec());
@@ -151,7 +158,7 @@ pub fn wrap(proto: Proto, frame: &[u8], seq: &mut u16) -> Vec<u8> {
             v.resize(IPHETH_FRAME.max(frame.len()), 0);
             v
         }
-        Proto::Ecm => frame.to_vec(),
+        Proto::Ecm | Proto::Raw => frame.to_vec(),
         Proto::Rndis => {
             let mut v = alloc::vec![0u8; 44];
             let total = (44 + frame.len()) as u32;
