@@ -146,5 +146,6 @@ pub enum AppKind {
     About,
     Browser,
     TaskManager,
+    Minecraft,
     Other,
 }

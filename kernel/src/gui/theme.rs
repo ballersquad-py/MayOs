@@ -8,6 +8,7 @@ use crate::sync::Once;
 
 /// Accent colours offered in Settings: (name, colour).
 pub const ACCENTS: &[(&str, Color)] = &[
+    ("Mint", rgb(0x35, 0xa8, 0x54)),
     ("Blue", rgb(0x2f, 0x7c, 0xf6)),
     ("Purple", rgb(0x8e, 0x5c, 0xe6)),
     ("Pink", rgb(0xe0, 0x4f, 0x92)),

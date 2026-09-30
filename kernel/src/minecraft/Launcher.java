@@ -15,7 +15,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Launcher {
-    static final String BUILD = "2026-09-29";
+    static final String BUILD = "2026-10-01";
     static final String MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     static HttpClient HTTP;
     static final String CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
@@ -47,6 +47,7 @@ public class Launcher {
     public static void main(String[] args) throws Exception {
         String version = null, user = "Player";
         boolean dry = false, debug = false;
+        boolean login = false, logout = false;
         boolean packOnly = false, forge = false, ornithe = false, software = false, forceGpu = false;
         System.out.println("MayOS Minecraft launcher, build " + BUILD);
         Boolean mods = null; // --mods / --vanilla; default: mods only where needed (1.8.9 & co)
@@ -71,6 +72,8 @@ public class Launcher {
             else if (args[i].equals("--gpu")) forceGpu = true;
             else if (args[i].equals("--size") && i + 1 < args.length) x11Size = args[++i];
             else if (args[i].equals("--fullscreen")) x11Fullscreen = true;
+            else if (args[i].equals("--login")) login = true;
+            else if (args[i].equals("--logout")) logout = true;
             else version = args[i];
         }
         Path home = Paths.get(System.getProperty("user.home", "/home"));
@@ -79,6 +82,35 @@ public class Launcher {
         Path store = trustStore(mc);
         HTTP = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
         cacheDir = mc.resolve("cache");
+        Path accountFile = mc.resolve("mayos-account.json");
+        if (logout) {
+            Files.deleteIfExists(accountFile);
+            System.out.println("Signed out: playing offline.");
+            return;
+        }
+        if (login) {
+            try {
+                Account.login(accountFile);
+            } catch (Exception e) {
+                System.out.println("Microsoft sign-in: " + e.getMessage());
+                System.exit(1);
+            }
+            return;
+        }
+        // No --user given: /etc/minecraft-user (set by the MayOS launcher app).
+        if (user.equals("Player")) {
+            try {
+                String u = Files.readString(Paths.get("/etc/minecraft-user")).trim();
+                if (u.matches("[A-Za-z0-9_]{3,16}")) user = u;
+            } catch (IOException e) {
+                // default name
+            }
+        }
+        Account account = Files.exists(accountFile) ? Account.load(accountFile) : null;
+        if (account != null) {
+            user = account.name;
+            System.out.println("Account: " + account.name + " (Microsoft)");
+        }
 
         Map<String, Object> manifest = obj(Json.parse(fetchString(MANIFEST)));
         String versionUrl = null;
@@ -264,10 +296,16 @@ public class Launcher {
         vars.put("assets_index_name", assetsId);
         vars.put("auth_uuid", UUID.nameUUIDFromBytes(("OfflinePlayer:" + user).getBytes()).toString().replace("-", ""));
         vars.put("auth_access_token", "0");
+        if (account != null) {
+            vars.put("auth_uuid", account.uuid);
+            vars.put("auth_access_token", account.token);
+            vars.put("auth_session", account.token);
+            vars.put("user_type", "msa");
+        }
         vars.put("auth_session", "0");
         vars.put("clientid", "0");
         vars.put("auth_xuid", "0");
-        vars.put("user_type", "legacy");
+        vars.putIfAbsent("user_type", "legacy");
         vars.put("user_properties", "{}");
         vars.put("version_type", str(v.get("type")));
         vars.put("natives_directory", natives.toString());
@@ -700,6 +738,139 @@ public class Launcher {
                     }
                 } else b.append(c);
             }
+        }
+    }
+}
+
+/**
+ * Microsoft account sign-in (device code) and the Xbox Live / Minecraft
+ * services token exchange. Needs an Azure app ID in /etc/minecraft-client-id
+ * that Microsoft has approved for Minecraft.
+ */
+class Account {
+    String name, uuid, token, refresh;
+    long expires;
+
+    static String clientId() throws IOException {
+        Path p = Paths.get("/etc/minecraft-client-id");
+        if (!Files.exists(p)) {
+            throw new IOException("no Microsoft app ID: put one in /etc/minecraft-client-id (see the MayOS launcher's help)");
+        }
+        return Files.readString(p).trim();
+    }
+
+    static String form(Map<String, String> m) {
+        StringBuilder b = new StringBuilder();
+        for (var e : m.entrySet()) {
+            if (b.length() > 0) b.append('&');
+            b.append(java.net.URLEncoder.encode(e.getKey(), java.nio.charset.StandardCharsets.UTF_8)).append('=')
+                .append(java.net.URLEncoder.encode(e.getValue(), java.nio.charset.StandardCharsets.UTF_8));
+        }
+        return b.toString();
+    }
+
+    static Map<String, Object> post(String url, String body, String type) throws Exception {
+        HttpRequest.Builder r = HttpRequest.newBuilder(URI.create(url)).header("Content-Type", type).header("Accept", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body));
+        HttpResponse<String> res = Launcher.HTTP.send(r.build(), HttpResponse.BodyHandlers.ofString());
+        Object j = Launcher.Json.parse(res.body().isEmpty() ? "{}" : res.body());
+        @SuppressWarnings("unchecked") Map<String, Object> m = (Map<String, Object>) j;
+        if (res.statusCode() >= 400 && m.get("error") == null) m.put("error", "HTTP " + res.statusCode() + " " + res.body());
+        return m;
+    }
+
+    static String esc(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /** Microsoft token -> Xbox Live -> XSTS -> Minecraft token and profile. */
+    static Account finish(String msToken, String refresh, long msExpires) throws Exception {
+        Map<String, Object> xbl = post("https://user.auth.xboxlive.com/user/authenticate",
+            "{\"Properties\":{\"AuthMethod\":\"RPS\",\"SiteName\":\"user.auth.xboxlive.com\",\"RpsTicket\":\"d=" + esc(msToken)
+                + "\"},\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}", "application/json");
+        String xblToken = (String) xbl.get("Token");
+        if (xblToken == null) throw new IOException("Xbox Live sign-in failed: " + xbl);
+        Map<String, Object> xsts = post("https://xsts.auth.xboxlive.com/xsts/authorize",
+            "{\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" + esc(xblToken)
+                + "\"]},\"RelyingParty\":\"rp://api.minecraftservices.com/\",\"TokenType\":\"JWT\"}", "application/json");
+        String xstsToken = (String) xsts.get("Token");
+        if (xstsToken == null) throw new IOException("Xbox sign-in refused (no Xbox profile, or a child account?): " + xsts);
+        @SuppressWarnings("unchecked") Map<String, Object> claims = (Map<String, Object>) xsts.get("DisplayClaims");
+        @SuppressWarnings("unchecked") Map<String, Object> xui = (Map<String, Object>) ((List<Object>) claims.get("xui")).get(0);
+        String uhs = (String) xui.get("uhs");
+        Map<String, Object> mc = post("https://api.minecraftservices.com/authentication/login_with_xbox",
+            "{\"identityToken\":\"XBL3.0 x=" + uhs + ";" + esc(xstsToken) + "\"}", "application/json");
+        String mcToken = (String) mc.get("access_token");
+        if (mcToken == null) throw new IOException("Minecraft sign-in failed (is the app ID approved for Minecraft?): " + mc);
+        HttpResponse<String> prof = Launcher.HTTP.send(HttpRequest.newBuilder(URI.create("https://api.minecraftservices.com/minecraft/profile"))
+            .header("Authorization", "Bearer " + mcToken).build(), HttpResponse.BodyHandlers.ofString());
+        @SuppressWarnings("unchecked") Map<String, Object> p = (Map<String, Object>) Launcher.Json.parse(prof.body());
+        if (p.get("id") == null) throw new IOException("this Microsoft account does not own Minecraft Java Edition");
+        Account a = new Account();
+        a.name = (String) p.get("name");
+        a.uuid = (String) p.get("id");
+        a.token = mcToken;
+        a.refresh = refresh;
+        a.expires = msExpires;
+        return a;
+    }
+
+    void save(Path f) throws IOException {
+        Files.writeString(f, "{\"name\":\"" + esc(name) + "\",\"uuid\":\"" + uuid + "\",\"token\":\"" + esc(token)
+            + "\",\"refresh\":\"" + esc(refresh) + "\",\"expires\":" + expires + "}");
+    }
+
+    static void login(Path f) throws Exception {
+        String id = clientId();
+        Map<String, Object> dc = post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
+            form(Map.of("client_id", id, "scope", "XboxLive.signin offline_access")), "application/x-www-form-urlencoded");
+        if (dc.get("user_code") == null) throw new IOException("Microsoft sign-in could not start: " + dc);
+        System.out.println();
+        System.out.println("  On your phone or another computer, open:  " + dc.get("verification_uri"));
+        System.out.println("  and enter the code:  " + dc.get("user_code"));
+        System.out.println();
+        long interval = Math.max(5, ((Number) dc.get("interval")).longValue());
+        long deadline = System.currentTimeMillis() + ((Number) dc.get("expires_in")).longValue() * 1000;
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(interval * 1000);
+            Map<String, Object> t = post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                form(Map.of("grant_type", "urn:ietf:params:oauth:grant-type:device_code", "client_id", id, "device_code", (String) dc.get("device_code"))),
+                "application/x-www-form-urlencoded");
+            Object err = t.get("error");
+            if ("authorization_pending".equals(err)) continue;
+            if ("slow_down".equals(err)) { interval += 5; continue; }
+            if (err != null) throw new IOException("Microsoft sign-in failed: " + t.get("error_description"));
+            long exp = System.currentTimeMillis() + ((Number) t.get("expires_in")).longValue() * 1000;
+            Account a = finish((String) t.get("access_token"), (String) t.get("refresh_token"), exp);
+            a.save(f);
+            System.out.println("Signed in as " + a.name + ". Play from the Minecraft launcher.");
+            return;
+        }
+        throw new IOException("the code expired: try again");
+    }
+
+    /** The saved account, refreshed when its token is old. */
+    static Account load(Path f) {
+        try {
+            @SuppressWarnings("unchecked") Map<String, Object> m = (Map<String, Object>) Launcher.Json.parse(Files.readString(f));
+            Account a = new Account();
+            a.name = (String) m.get("name");
+            a.uuid = (String) m.get("uuid");
+            a.token = (String) m.get("token");
+            a.refresh = (String) m.get("refresh");
+            a.expires = ((Number) m.get("expires")).longValue();
+            if (System.currentTimeMillis() < a.expires - 60_000) return a;
+            Map<String, Object> t = post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                form(Map.of("grant_type", "refresh_token", "client_id", clientId(), "refresh_token", a.refresh, "scope", "XboxLive.signin offline_access")),
+                "application/x-www-form-urlencoded");
+            if (t.get("access_token") == null) throw new IOException("sign in again (" + t.get("error") + ")");
+            long exp = System.currentTimeMillis() + ((Number) t.get("expires_in")).longValue() * 1000;
+            Account n = finish((String) t.get("access_token"), (String) t.getOrDefault("refresh_token", a.refresh), exp);
+            n.save(f);
+            return n;
+        } catch (Exception e) {
+            System.out.println("Microsoft account: " + e.getMessage() + "; playing offline.");
+            return null;
         }
     }
 }

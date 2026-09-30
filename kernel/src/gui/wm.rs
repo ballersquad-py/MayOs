@@ -197,38 +197,64 @@ enum Drag {
     Resize { id: WindowId, right: bool, bottom: bool, left: bool, start: Rect, px: i32, py: i32 },
 }
 
+/// How an app starts: a MayOS app, or a Linux program (run in a terminal
+/// that shows its output) when it is installed.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuItem {
-    About,
-    Settings,
-    Explorer,
-    Terminal,
-    Editor,
+enum Launch {
+    Kind(AppKind),
+    Cmd(&'static str, &'static str),
+}
+
+struct AppEntry {
+    name: &'static str,
+    icon: Icon,
+    launch: Launch,
+    pinned: bool,
+}
+
+const APPS: &[AppEntry] = &[
+    AppEntry { name: "Files", icon: Icon::Explorer, launch: Launch::Kind(AppKind::Explorer), pinned: true },
+    AppEntry { name: "Terminal", icon: Icon::Terminal, launch: Launch::Kind(AppKind::Terminal), pinned: true },
+    AppEntry { name: "Firefox", icon: Icon::Firefox, launch: Launch::Cmd("firefox", "/usr/bin/firefox"), pinned: true },
+    AppEntry { name: "Minecraft", icon: Icon::Minecraft, launch: Launch::Kind(AppKind::Minecraft), pinned: true },
+    AppEntry { name: "Web Browser", icon: Icon::Browser, launch: Launch::Kind(AppKind::Browser), pinned: false },
+    AppEntry { name: "Text Editor", icon: Icon::Editor, launch: Launch::Kind(AppKind::Editor), pinned: false },
+    AppEntry { name: "Settings", icon: Icon::Settings, launch: Launch::Kind(AppKind::Settings), pinned: true },
+    AppEntry { name: "Task Manager", icon: Icon::Tasks, launch: Launch::Kind(AppKind::TaskManager), pinned: true },
+    AppEntry { name: "About MayOS", icon: Icon::Info, launch: Launch::Kind(AppKind::About), pinned: false },
+];
+
+const PLACES: &[(&str, &str, Icon)] = &[
+    ("Home", "/home", Icon::Home),
+    ("Documents", "/docs", Icon::Documents),
+    ("Downloads", "/home/Downloads", Icon::Downloads),
+    ("Pictures", "/pictures", Icon::Pictures),
+    ("Videos", "/videos", Icon::Video),
+    ("Music", "/music", Icon::Music),
+    ("Computer", "/", Icon::Computer),
+];
+
+/// Height of the bottom panel.
+const PANEL_H: i32 = 46;
+/// Width of the clock and status area at the right of the panel.
+const TRAY_W: i32 = 190;
+
+/// Something on the panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelItem {
+    Menu,
+    Pin(usize),
+    Win(WindowId),
+}
+
+/// Something in the app menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuEntry {
+    App(usize),
+    Place(usize),
     Restart,
     ShutDown,
 }
-
-const MENU: &[Option<(MenuItem, &str)>] = &[
-    Some((MenuItem::About, "About MayOS")),
-    Some((MenuItem::Settings, "Settings\u{2026}")),
-    None,
-    Some((MenuItem::Explorer, "New Explorer Window")),
-    Some((MenuItem::Terminal, "New Terminal")),
-    Some((MenuItem::Editor, "Text Editor")),
-    None,
-    Some((MenuItem::Restart, "Restart")),
-    Some((MenuItem::ShutDown, "Shut Down")),
-];
-
-const DOCK: &[(AppKind, Icon, &str)] = &[
-    (AppKind::Explorer, Icon::Explorer, "Files"),
-    (AppKind::Terminal, Icon::Terminal, "Terminal"),
-    (AppKind::Editor, Icon::Editor, "Text Editor"),
-    (AppKind::Browser, Icon::Browser, "Browser"),
-    (AppKind::Settings, Icon::Settings, "Settings"),
-    (AppKind::TaskManager, Icon::Tasks, "Task Manager"),
-    (AppKind::About, Icon::Info, "About MayOS"),
-];
 
 pub struct Wm {
     display: Display,
@@ -256,6 +282,11 @@ pub struct Wm {
     menu_open: bool,
     menu_opened_at: u64,
     menu_hover: Option<usize>,
+    /// Text typed into the app menu's search box.
+    menu_query: String,
+    /// Apps whose program is installed (index into APPS), refreshed now and then.
+    apps_ok: Vec<bool>,
+    apps_checked: u64,
     clock: String,
     cascade: i32,
     boot_at: u64,
@@ -336,6 +367,9 @@ impl Wm {
             menu_open: false,
             menu_opened_at: 0,
             menu_hover: None,
+            menu_query: String::new(),
+            apps_ok: APPS.iter().map(|a| !matches!(a.launch, Launch::Cmd(..))).collect(),
+            apps_checked: 0,
             clock: String::new(),
             cascade: 0,
             boot_at: uptime_ms(),
@@ -458,7 +492,7 @@ impl Wm {
     }
 
     pub fn open_kind(&mut self, kind: AppKind) {
-        let origin = DOCK.iter().position(|d| d.0 == kind).map(|i| self.dock_icon_rect(i));
+        let origin = self.pin_rect(kind);
         if let Some(app) = (self.launcher)(kind) {
             self.open_from(app, None, origin);
             if self.cfg.animations {
@@ -548,8 +582,8 @@ impl Wm {
     }
 
     fn dock_target(&self, kind: AppKind) -> Rect {
-        match DOCK.iter().position(|d| d.0 == kind) {
-            Some(i) => self.dock_icon_rect(i),
+        match self.pin_rect(kind) {
+            Some(r) => r,
             None => {
                 let d = self.dock_rect();
                 Rect::new(d.x + d.w / 2 - 24, d.y, 48, 48)
@@ -759,21 +793,12 @@ impl Wm {
     }
 
     fn dock_side(&self) -> u8 {
-        self.cfg.dock_position.min(2)
+        0
     }
 
-    /// The dock when fully shown.
+    /// The panel along the bottom of the screen.
     fn dock_base(&self) -> Rect {
-        let n = DOCK.len() as i32;
-        let (ic, pad) = (self.dock_icon(), self.dock_pad());
-        let long = n * ic + (n + 1) * pad + 8;
-        let short = ic + pad * 2;
-        let top = theme::TOPBAR_H;
-        match self.dock_side() {
-            0 => Rect::new((self.width - long) / 2, self.height - short - 10, long, short),
-            1 => Rect::new(10, top + (self.height - top - long) / 2, short, long),
-            _ => Rect::new(self.width - short - 10, top + (self.height - top - long) / 2, short, long),
-        }
+        Rect::new(0, self.height - PANEL_H, self.width, PANEL_H)
     }
 
     /// How far the dock slides to be out of sight.
@@ -805,21 +830,77 @@ impl Wm {
         }
     }
 
-    fn dock_icon_rect(&self, i: usize) -> Rect {
+    /// Pinned apps that are installed (index into APPS).
+    fn pins(&self) -> Vec<usize> {
+        (0..APPS.len()).filter(|&i| APPS[i].pinned && self.apps_ok.get(i).copied().unwrap_or(false)).collect()
+    }
+
+    /// Everything on the panel, left to right, with its rectangle.
+    fn panel_items(&self) -> Vec<(Rect, PanelItem)> {
         let d = self.dock_rect();
-        let (ic, pad) = (self.dock_icon(), self.dock_pad());
-        let along = 4 + pad + i as i32 * (ic + pad);
-        if self.dock_side() == 0 {
-            Rect::new(d.x + along, d.y + pad, ic, ic)
-        } else {
-            Rect::new(d.x + pad, d.y + along, ic, ic)
+        let y = d.y + 5;
+        let mut out = alloc::vec![(Rect::new(6, y, 40, 36), PanelItem::Menu)];
+        let mut x = 54;
+        for i in self.pins() {
+            out.push((Rect::new(x, y, 36, 36), PanelItem::Pin(i)));
+            x += 40;
+        }
+        x += 12;
+        let wins: Vec<WindowId> = self.windows.iter().filter(|w| !w.closing).map(|w| w.id).collect();
+        if !wins.is_empty() {
+            let room = self.width - TRAY_W - x - 8;
+            let bw = (room / wins.len() as i32 - 4).clamp(44, 210);
+            for id in wins {
+                if x + bw > self.width - TRAY_W {
+                    break;
+                }
+                out.push((Rect::new(x, y, bw, 36), PanelItem::Win(id)));
+                x += bw + 4;
+            }
+        }
+        out
+    }
+
+    /// Where a pinned app sits on the panel (window open/close animations).
+    fn pin_rect(&self, kind: AppKind) -> Option<Rect> {
+        self.panel_items().into_iter().find_map(|(r, it)| match it {
+            PanelItem::Pin(i) if APPS[i].launch == Launch::Kind(kind) => Some(r),
+            _ => None,
+        })
+    }
+
+    fn launch(&mut self, i: usize) {
+        match APPS[i].launch {
+            Launch::Kind(k) => self.dock_click(k, false),
+            Launch::Cmd(cmd, _) => {
+                let t = super::terminal::Terminal::with_command("/home", cmd);
+                self.open(Box::new(t), None);
+            }
+        }
+    }
+
+    fn refresh_apps(&mut self, now: u64) {
+        if now - self.apps_checked < 3000 && self.apps_checked != 0 {
+            return;
+        }
+        self.apps_checked = now;
+        let ok: Vec<bool> = APPS
+            .iter()
+            .map(|a| match a.launch {
+                Launch::Cmd(_, path) => crate::fs::exists(path),
+                Launch::Kind(_) => true,
+            })
+            .collect();
+        if ok != self.apps_ok {
+            self.apps_ok = ok;
+            self.damage(self.dock_damage_rect());
         }
     }
 
     fn dock_damage_rect(&self) -> Rect {
         let b = self.dock_base();
         let r = match self.dock_side() {
-            0 => Rect::new(b.x - 60, b.y - 60, b.w + 120, self.height - b.y + 60),
+            0 => Rect::new(0, b.y - 50, self.width, self.height - b.y + 50),
             1 => Rect::new(0, b.y - 40, b.right() + 220, b.h + 80),
             _ => Rect::new(b.x - 220, b.y - 40, self.width - b.x + 220, b.h + 80),
         };
@@ -829,7 +910,7 @@ impl Wm {
     /// Screen area for windows: below the top bar and clear of the dock
     /// (unless it hides itself).
     pub fn work_area(&self) -> Rect {
-        let full = Rect::new(0, theme::TOPBAR_H, self.width, self.height - theme::TOPBAR_H);
+        let full = Rect::new(0, 0, self.width, self.height);
         if self.cfg.dock_autohide {
             return full;
         }
@@ -879,28 +960,56 @@ impl Wm {
     }
 
     fn menu_rect(&self) -> Rect {
-        let h: i32 = MENU.iter().map(|m| if m.is_some() { 28 } else { 9 }).sum();
-        Rect::new(6, theme::TOPBAR_H + 4, 220, h + 12)
+        let (w, h) = (580, 520.min(self.height - PANEL_H - 20));
+        Rect::new(6, self.height - PANEL_H - 6 - h, w, h)
+    }
+
+    /// Apps matching the search text (index into APPS).
+    fn menu_apps(&self) -> Vec<usize> {
+        let q = self.menu_query.to_lowercase();
+        (0..APPS.len())
+            .filter(|&i| self.apps_ok.get(i).copied().unwrap_or(false))
+            .filter(|&i| q.is_empty() || APPS[i].name.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Everything clickable in the app menu, with its rectangle.
+    fn menu_entries(&self) -> Vec<(Rect, MenuEntry)> {
+        let m = self.menu_rect();
+        let mut out = Vec::new();
+        let mut y = m.y + 94;
+        for i in self.menu_apps() {
+            if y + 40 > m.bottom() - 10 {
+                break;
+            }
+            out.push((Rect::new(m.x + 12, y, 350, 40), MenuEntry::App(i)));
+            y += 42;
+        }
+        let px = m.x + 378;
+        for (k, _) in PLACES.iter().enumerate() {
+            out.push((Rect::new(px, m.y + 94 + k as i32 * 36, m.w - 390, 34), MenuEntry::Place(k)));
+        }
+        let by = m.bottom() - 48;
+        out.push((Rect::new(px, by, (m.w - 396) / 2, 36), MenuEntry::Restart));
+        out.push((Rect::new(px + (m.w - 396) / 2 + 6, by, (m.w - 396) / 2, 36), MenuEntry::ShutDown));
+        out
     }
 
     fn menu_item_at(&self, x: i32, y: i32) -> Option<usize> {
-        let r = self.menu_rect();
-        if !r.contains(x, y) {
-            return None;
-        }
-        let mut yy = r.y + 6;
-        for (i, m) in MENU.iter().enumerate() {
-            let h = if m.is_some() { 28 } else { 9 };
-            if y >= yy && y < yy + h {
-                return if m.is_some() { Some(i) } else { None };
-            }
-            yy += h;
-        }
-        None
+        self.menu_entries().iter().position(|(r, _)| r.contains(x, y))
     }
 
     fn logo_rect(&self) -> Rect {
-        Rect::new(4, 2, 84, theme::TOPBAR_H - 4)
+        Rect::new(6, self.height - PANEL_H + 5, 40, 36)
+    }
+
+    fn open_menu(&mut self) {
+        self.menu_open = true;
+        self.menu_opened_at = if self.cfg.animations { uptime_ms() } else { 0 };
+        self.menu_hover = None;
+        self.menu_query.clear();
+        self.damage(self.menu_rect().inset(-20));
+        self.damage(self.dock_damage_rect());
     }
 
     fn update_clock(&mut self) -> bool {
@@ -1008,7 +1117,7 @@ impl Wm {
         let dh = if self.fullscreen_top().is_some() || !self.dock_visible() {
             None
         } else {
-            (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y))
+            self.panel_items().iter().position(|(r, _)| r.contains(x, y))
         };
         if dh != self.dock_hover {
             self.dock_hover = dh;
@@ -1050,7 +1159,7 @@ impl Wm {
         if let Some(i) = self.fullscreen_top() {
             return Some(self.windows[i].id);
         }
-        if y < theme::TOPBAR_H || (self.dock_visible() && self.dock_rect().contains(x, y)) {
+        if self.dock_visible() && self.dock_rect().contains(x, y) {
             return None;
         }
         self.windows
@@ -1083,7 +1192,7 @@ impl Wm {
                         return;
                     }
                     r.x = x - dx;
-                    r.y = (y - dy).clamp(theme::TOPBAR_H, self.height - 40);
+                    r.y = (y - dy).clamp(0, self.height - PANEL_H - 30);
                     self.set_rect(i, r);
                 }
             }
@@ -1129,36 +1238,42 @@ impl Wm {
 
         if self.menu_open {
             if let Some(i) = self.menu_item_at(x, y) {
-                if let Some((item, _)) = MENU[i] {
-                    self.close_menu();
-                    self.menu_action(item);
-                }
+                let e = self.menu_entries()[i].1;
+                self.close_menu();
+                self.menu_action(e);
                 return;
             }
-            self.close_menu();
-            if self.logo_rect().contains(x, y) {
+            let on_button = self.logo_rect().contains(x, y);
+            if !self.menu_rect().contains(x, y) || on_button {
+                self.close_menu();
+            }
+            if on_button || self.menu_rect().contains(x, y) {
                 return;
             }
         }
 
-        if y < theme::TOPBAR_H {
-            if self.logo_rect().contains(x, y) && button == 0 {
-                self.menu_open = true;
-                self.menu_opened_at = if self.cfg.animations { uptime_ms() } else { 0 };
-                self.menu_hover = None;
-                self.damage(self.menu_rect());
+        if self.dock_visible() && self.dock_rect().contains(x, y) {
+            let hit = self.panel_items().into_iter().find(|(r, _)| r.contains(x, y));
+            match hit {
+                Some((_, PanelItem::Menu)) if button == 0 => self.open_menu(),
+                Some((_, PanelItem::Pin(i))) => match APPS[i].launch {
+                    Launch::Kind(k) => self.dock_click(k, button == 1),
+                    _ => self.launch(i),
+                },
+                Some((_, PanelItem::Win(id))) => {
+                    // Like a taskbar: minimise the active window, bring others up.
+                    if let Some(i) = self.index_of(id) {
+                        if self.focused == Some(id) && !self.windows[i].minimized {
+                            self.minimize(id);
+                        } else {
+                            self.unminimize(i);
+                            self.focus(Some(id));
+                        }
+                    }
+                }
+                _ => {}
             }
             return;
-        }
-
-        if self.dock_visible() {
-            if let Some(i) = (0..DOCK.len()).find(|&i| self.dock_icon_rect(i).contains(x, y)) {
-                self.dock_click(DOCK[i].0, button == 1);
-                return;
-            }
-            if self.dock_rect().contains(x, y) {
-                return;
-            }
         }
 
         let Some(id) = self.window_at(x, y) else { return };
@@ -1241,8 +1356,33 @@ impl Wm {
 
     fn key(&mut self, k: KeyEvent) {
         if k.pressed {
-            if self.menu_open && k.key == Key::Escape {
-                self.close_menu();
+            if k.key == Key::Super {
+                if self.menu_open {
+                    self.close_menu();
+                } else {
+                    self.open_menu();
+                }
+                return;
+            }
+            if self.menu_open {
+                match k.key {
+                    Key::Escape => self.close_menu(),
+                    Key::Enter => {
+                        if let Some(&i) = self.menu_apps().first() {
+                            self.close_menu();
+                            self.launch(i);
+                        }
+                    }
+                    Key::Backspace => {
+                        self.menu_query.pop();
+                        self.damage(self.menu_rect());
+                    }
+                    Key::Char(ch) if !k.ctrl && !k.alt => {
+                        self.menu_query.push(ch);
+                        self.damage(self.menu_rect());
+                    }
+                    _ => {}
+                }
                 return;
             }
             if k.ctrl && k.alt && k.key == Key::Char('t') {
@@ -1287,15 +1427,18 @@ impl Wm {
         self.damage(self.menu_rect().inset(-20));
     }
 
-    fn menu_action(&mut self, item: MenuItem) {
-        match item {
-            MenuItem::About => self.dock_click(AppKind::About, false),
-            MenuItem::Settings => self.dock_click(AppKind::Settings, false),
-            MenuItem::Explorer => self.open_kind(AppKind::Explorer),
-            MenuItem::Terminal => self.open_kind(AppKind::Terminal),
-            MenuItem::Editor => self.open_kind(AppKind::Editor),
-            MenuItem::Restart => crate::power::reboot(),
-            MenuItem::ShutDown => crate::power::shutdown(),
+    fn menu_action(&mut self, e: MenuEntry) {
+        match e {
+            MenuEntry::App(i) => self.launch(i),
+            MenuEntry::Place(k) => {
+                let path = PLACES[k].1;
+                if path == "/home/Downloads" {
+                    let _ = crate::fs::create_dir(path);
+                }
+                self.open(Box::new(super::explorer::Explorer::new(path)), None);
+            }
+            MenuEntry::Restart => crate::power::reboot(),
+            MenuEntry::ShutDown => crate::power::shutdown(),
         }
     }
 
@@ -1419,12 +1562,13 @@ impl Wm {
             self.apply(ctx);
         }
         let now = uptime_ms();
+        self.refresh_apps(now);
         self.update_dock_visibility(now);
         // Reading the CMOS clock is slow I/O; a few times a second is plenty.
         if now - self.last_clock_check >= 250 || self.clock.is_empty() {
             self.last_clock_check = now;
             if self.update_clock() {
-                self.damage(Rect::new(self.width - 300, 0, 300, theme::TOPBAR_H));
+                self.damage(Rect::new(self.width - TRAY_W, self.height - PANEL_H, TRAY_W, PANEL_H));
             }
         }
 
@@ -1637,9 +1781,13 @@ impl Wm {
             .unwrap_or_default();
         let running: Vec<AppKind> = self.windows.iter().filter(|w| !w.closing).map(|w| w.app.kind()).collect();
         let dock = self.dock_rect();
-        let icon_rects: Vec<Rect> = (0..DOCK.len()).map(|i| self.dock_icon_rect(i)).collect();
-        let bounces: Vec<i32> = DOCK.iter().map(|d| self.bounce_offset(d.0, now)).collect();
+        let items = self.panel_items();
+        let win_info: Vec<(WindowId, String, Icon, bool)> =
+            self.windows.iter().filter(|w| !w.closing).map(|w| (w.id, w.app.title(), w.app.icon(), w.minimized)).collect();
+        let focused_id = self.focused;
         let menu_rect = self.menu_rect();
+        let menu_entries = if self.menu_open { self.menu_entries() } else { Vec::new() };
+        let menu_query = self.menu_query.clone();
         let menu_alpha = if self.menu_opened_at == 0 {
             255
         } else {
@@ -1655,42 +1803,83 @@ impl Wm {
         let dock_area = self.dock_damage_rect();
         let f = fonts();
         let accent = theme::accent();
-        let Wm { display, clock, dock_hover, menu_open, menu_hover, pointer, cursor, cursor_hot, dock_shadow, .. } = self;
+        let Wm { display, clock, dock_hover, menu_open, menu_hover, pointer, cursor, cursor_hot, .. } = self;
         let hw_cursor = display.has_hw_cursor();
         let buf = display.buffer();
         let mut c = Canvas::new(buf, w, h, w as usize);
         c.push_clip(r);
+        let _ = (&focused_title, dock_side, logo);
+        let white = rgb(255, 255, 255);
 
-        // Top bar.
-        let bar = Rect::new(0, 0, w, theme::TOPBAR_H);
-        if bar.intersects(&r) && !covered {
-            c.fill_rect(bar, rgba(255, 255, 255, 190));
-            c.hline(0, theme::TOPBAR_H - 1, w, rgba(0, 0, 0, 30));
-            if *menu_open {
-                c.fill_rounded_rect(logo, 6, with_alpha(0x000000, 30));
+        // Panel (Cinnamon-style, dark glass).
+        if dock_area.intersects(&r) && dock_on {
+            c.fill_rect(dock, rgba(24, 26, 31, 232));
+            c.hline(0, dock.y, w, rgba(255, 255, 255, 22));
+            for (k, (ir, item)) in items.iter().enumerate() {
+                let hovered = *dock_hover == Some(k);
+                match *item {
+                    PanelItem::Menu => {
+                        if hovered || *menu_open {
+                            c.fill_rounded_rect(*ir, 8, rgba(255, 255, 255, if *menu_open { 36 } else { 22 }));
+                        }
+                        let (cx, cy) = (ir.x + ir.w / 2, ir.y + ir.h / 2);
+                        c.fill_circle(cx, cy, 12, accent);
+                        c.fill_circle(cx, cy, 5, white);
+                    }
+                    PanelItem::Pin(i) => {
+                        if hovered {
+                            c.fill_rounded_rect(*ir, 8, rgba(255, 255, 255, 22));
+                        }
+                        super::icons::draw(&mut c, APPS[i].icon, ir.x + 4, ir.y + 4, 28);
+                        if let Launch::Kind(k2) = APPS[i].launch
+                            && running.contains(&k2)
+                        {
+                            c.fill_rounded_rect(Rect::new(ir.x + 12, ir.bottom() - 3, 12, 3), 1, accent);
+                        }
+                        if hovered {
+                            let name = APPS[i].name;
+                            let tw = f.ui.measure(name) + 20;
+                            let tip = Rect::new(ir.x + ir.w / 2 - tw / 2, dock.y - 34, tw, 26);
+                            c.fill_rounded_rect(tip, 8, rgba(30, 32, 40, 235));
+                            c.draw_text_centered(&f.ui, tip, name, white);
+                        }
+                    }
+                    PanelItem::Win(id) => {
+                        let Some((_, title, icon, minimized)) = win_info.iter().find(|x| x.0 == id) else { continue };
+                        let active = focused_id == Some(id) && !*minimized;
+                        let bg = if active { 44 } else if hovered { 30 } else { 14 };
+                        c.fill_rounded_rect(*ir, 6, rgba(255, 255, 255, bg));
+                        if active {
+                            c.fill_rounded_rect(Rect::new(ir.x + 6, ir.bottom() - 3, ir.w - 12, 3), 1, accent);
+                        }
+                        super::icons::draw(&mut c, *icon, ir.x + 8, ir.y + 8, 20);
+                        let base = ir.y + (ir.h + f.ui.ascent - f.ui.descent) / 2;
+                        let col = if *minimized { rgba(255, 255, 255, 140) } else { white };
+                        c.draw_text_clipped(&f.ui, ir.x + 34, base, title, ir.w - 42, col);
+                    }
+                }
             }
-            c.fill_circle(logo.x + 14, logo.y + logo.h / 2, 7, accent);
-            c.fill_circle(logo.x + 14, logo.y + logo.h / 2, 3, rgb(255, 255, 255));
-            let base = (theme::TOPBAR_H + f.bold.ascent - f.bold.descent) / 2;
-            c.draw_text(&f.bold, logo.x + 28, base, "MayOS", theme::TEXT);
-            if !focused_title.is_empty() {
-                c.draw_text_clipped(&f.ui, logo.right() + 16, base, &focused_title, w / 2 - logo.right(), theme::TEXT);
-            }
-            let cw = f.ui.measure(clock);
-            c.draw_text(&f.ui, w - cw - 16, base, clock, theme::TEXT);
-            // Status indicators: network and volume.
-            let mut x = w - cw - 40;
-            if let Some(s) = crate::network::status() {
-                let online = s.link_up && !s.ip.is_unspecified();
-                let col = if online { theme::TEXT } else { with_alpha(theme::TEXT, 90) };
+            // Tray: network, volume, clock with the date under it.
+            let (time, date) = match clock.trim().rsplit_once(' ') {
+                Some((d, t)) => (t.trim(), d.trim()),
+                None => (clock.as_str(), ""),
+            };
+            let tx = w - 16;
+            c.draw_text(&f.bold, tx - f.bold.measure(time), dock.y + 21, time, white);
+            c.draw_text(&f.ui, tx - f.ui.measure(date), dock.y + 37, date, rgba(255, 255, 255, 170));
+            let mut x = w - 16 - f.ui.measure(date).max(f.bold.measure(time)) - 30;
+            let base = dock.y + 29;
+            if let Some(st) = crate::network::status() {
+                let online = st.link_up && !st.ip.is_unspecified();
+                let col = if online { white } else { rgba(255, 255, 255, 90) };
                 for (k, bar_h) in [4, 7, 10, 13].iter().enumerate() {
                     c.fill_rounded_rect(Rect::new(x + k as i32 * 4, base - bar_h + 1, 3, *bar_h), 1, col);
                 }
-                x -= 26;
+                x -= 28;
             }
             if crate::audio::is_present() {
                 let cfg = settings::get();
-                let col = theme::TEXT;
+                let col = white;
                 c.fill_rect(Rect::new(x, base - 8, 3, 6), col);
                 for k in 0..5 {
                     c.fill_rect(Rect::new(x + 3 + k, base - 9 - k + 1, 1, 8 + k * 2 - 2), col);
@@ -1706,68 +1895,53 @@ impl Wm {
             }
         }
 
-        // Dock.
-        if dock_area.intersects(&r) && dock_on {
-            let radius = (dock.w.min(dock.h) * 20 / 68).max(10);
-            if let Some(m) = dock_shadow.as_ref() {
-                c.draw_shadow_mask(m, dock, rgba(0, 0, 0, 70), 255);
-            }
-            c.fill_rounded_rect(dock, radius, rgba(255, 255, 255, 165));
-            c.stroke_rounded_rect(dock, radius, 1, rgba(255, 255, 255, 200));
-            for (i, (kind, icon, name)) in DOCK.iter().enumerate() {
-                let ir = icon_rects[i];
-                let lift = if *dock_hover == Some(i) { 4 } else { 0 } + bounces[i];
-                let (dx, dy) = match dock_side {
-                    0 => (0, -lift),
-                    1 => (lift, 0),
-                    _ => (-lift, 0),
-                };
-                icons::draw(&mut c, *icon, ir.x + dx, ir.y + dy, ir.w);
-                if running.contains(kind) {
-                    let (px, py) = match dock_side {
-                        0 => (ir.x + ir.w / 2, dock.bottom() - 5),
-                        1 => (dock.x + 5, ir.y + ir.h / 2),
-                        _ => (dock.right() - 5, ir.y + ir.h / 2),
-                    };
-                    c.fill_circle(px, py, 2, rgba(30, 30, 40, 200));
-                }
-                if *dock_hover == Some(i) {
-                    let tw = f.ui.measure(name) + 20;
-                    let tip = match dock_side {
-                        0 => Rect::new(ir.x + ir.w / 2 - tw / 2, dock.y - 34, tw, 26),
-                        1 => Rect::new(dock.right() + 10, ir.y + ir.h / 2 - 13, tw, 26),
-                        _ => Rect::new(dock.x - 10 - tw, ir.y + ir.h / 2 - 13, tw, 26),
-                    };
-                    c.fill_rounded_rect(tip, 8, rgba(30, 32, 40, 225));
-                    c.draw_text_centered(&f.ui, tip, name, rgb(255, 255, 255));
-                }
-            }
-        }
-
-        // Menu (fades and drops in when opened).
+        // App menu: search, apps, places and power (fades up when opened).
         if *menu_open && !covered && menu_rect.inset(-20).intersects(&r) {
             let a = menu_alpha;
-            let m = menu_rect.offset(0, -((255 - a as i32) * 8 / 255));
-            c.draw_shadow(m, 10, 16, fade(rgba(0, 0, 0, 80), a));
-            c.fill_rounded_rect(m, 10, fade(rgba(250, 251, 253, 245), a));
-            c.stroke_rounded_rect(m, 10, 1, fade(rgba(0, 0, 0, 40), a));
-            let mut y = m.y + 6;
-            for (i, item) in MENU.iter().enumerate() {
-                match item {
-                    Some((_, label)) => {
-                        let row = Rect::new(m.x + 6, y, m.w - 12, 28);
-                        let hovered = *menu_hover == Some(i);
+            let m = menu_rect.offset(0, (255 - a as i32) * 10 / 255);
+            c.draw_shadow(m, 12, 20, fade(rgba(0, 0, 0, 110), a));
+            c.fill_rounded_rect(m, 12, fade(rgba(30, 32, 38, 246), a));
+            c.stroke_rounded_rect(m, 12, 1, fade(rgba(255, 255, 255, 30), a));
+            // Search box.
+            let sb = Rect::new(m.x + 12, m.y + 14, m.w - 24, 38);
+            c.fill_rounded_rect(sb, 10, fade(rgba(255, 255, 255, 20), a));
+            let sbase = sb.y + (sb.h + f.ui.ascent - f.ui.descent) / 2;
+            c.fill_circle(sb.x + 20, sb.y + 17, 6, fade(rgba(255, 255, 255, 150), a));
+            c.fill_circle(sb.x + 20, sb.y + 17, 4, fade(rgba(30, 32, 38, 255), a));
+            c.fill_rect(Rect::new(sb.x + 24, sb.y + 21, 2, 6), fade(rgba(255, 255, 255, 150), a));
+            if menu_query.is_empty() {
+                c.draw_text(&f.ui, sb.x + 38, sbase, "Type to search apps\u{2026}", fade(rgba(255, 255, 255, 110), a));
+            } else {
+                let end = c.draw_text(&f.ui, sb.x + 38, sbase, &menu_query, fade(white, a));
+                c.fill_rect(Rect::new(end + 1, sb.y + 10, 2, sb.h - 20), fade(accent, a));
+            }
+            c.draw_text(&f.small_bold, m.x + 20, m.y + 82, "APPLICATIONS", fade(rgba(255, 255, 255, 120), a));
+            c.draw_text(&f.small_bold, m.x + 386, m.y + 82, "PLACES", fade(rgba(255, 255, 255, 120), a));
+            c.fill_rect(Rect::new(m.x + 368, m.y + 70, 1, m.h - 84), fade(rgba(255, 255, 255, 20), a));
+            for (k, (er, e)) in menu_entries.iter().enumerate() {
+                let hovered = *menu_hover == Some(k);
+                let base = er.y + (er.h + f.ui.ascent - f.ui.descent) / 2;
+                match *e {
+                    MenuEntry::App(i) => {
                         if hovered {
-                            c.fill_rounded_rect(row, 6, fade(accent, a));
+                            c.fill_rounded_rect(*er, 8, fade(accent, a));
                         }
-                        let col = if hovered { rgb(255, 255, 255) } else { theme::TEXT };
-                        let base = row.y + (row.h + f.ui.ascent - f.ui.descent) / 2;
-                        c.draw_text(&f.ui, row.x + 12, base, label, fade(col, a));
-                        y += 28;
+                        super::icons::draw(&mut c, APPS[i].icon, er.x + 8, er.y + 4, 32);
+                        c.draw_text(&f.ui, er.x + 50, base, APPS[i].name, fade(white, a));
                     }
-                    None => {
-                        c.hline(m.x + 12, y + 4, m.w - 24, fade(theme::SEPARATOR, a));
-                        y += 9;
+                    MenuEntry::Place(p) => {
+                        if hovered {
+                            c.fill_rounded_rect(*er, 8, fade(rgba(255, 255, 255, 26), a));
+                        }
+                        super::icons::draw(&mut c, PLACES[p].2, er.x + 6, er.y + 5, 24);
+                        c.draw_text(&f.ui, er.x + 38, base, PLACES[p].0, fade(rgba(255, 255, 255, 220), a));
+                    }
+                    MenuEntry::Restart | MenuEntry::ShutDown => {
+                        let danger = *e == MenuEntry::ShutDown;
+                        let bg = if hovered { if danger { theme::DANGER } else { rgba(255, 255, 255, 40) } } else { rgba(255, 255, 255, 18) };
+                        c.fill_rounded_rect(*er, 8, fade(bg, a));
+                        let label = if danger { "Shut down" } else { "Restart" };
+                        c.draw_text_centered(&f.ui, *er, label, fade(white, a));
                     }
                 }
             }

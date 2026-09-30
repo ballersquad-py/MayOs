@@ -21,6 +21,19 @@ pub enum Icon {
     Music,
     Browser,
     Tasks,
+    Firefox,
+    Minecraft,
+    Trash,
+    Documents,
+    Downloads,
+    Pictures,
+    Computer,
+    Audio,
+    Html,
+    Weather,
+    Clock,
+    Software,
+    Player,
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
@@ -37,6 +50,7 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
         Icon::Program => program(c, x, y, s),
         Icon::Terminal => terminal(c, x, y, s),
         Icon::Tasks => tasks(c, x, y, s),
+        _ => program(c, x, y, s),
         Icon::Explorer => {
             app_tile(c, x, y, s, rgb(0x3d, 0x8b, 0xfd), rgb(0x1f, 0x5f, 0xd6));
             folder(c, x + s / 5, y + s / 5, s * 3 / 5);

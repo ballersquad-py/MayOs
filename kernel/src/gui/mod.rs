@@ -5,6 +5,8 @@
 
 pub mod about;
 pub mod taskmgr;
+pub mod icons;
+pub mod mclauncher;
 pub mod app;
 pub mod browser;
 pub mod canvas2d;
@@ -94,6 +96,7 @@ pub fn launch(kind: AppKind) -> Option<Box<dyn App>> {
         AppKind::Settings => settings_app::boxed(),
         AppKind::About => Box::new(about::About::new()),
         AppKind::TaskManager => Box::new(taskmgr::TaskManager::new()),
+        AppKind::Minecraft => Box::new(mclauncher::McLauncher::new()),
         AppKind::Browser => Box::new(browser::Browser::new(None)),
         AppKind::Other => return None,
     })

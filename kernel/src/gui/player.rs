@@ -859,7 +859,7 @@ impl Player {
             None => {
                 c.fill_rounded_rect(ar, 16, mix(accent, rgb(255, 255, 255), 60));
                 let iz = art / 2;
-                gfx::icons::draw(c, Icon::Music, ar.x + (art - iz) / 2, ar.y + (art - iz) / 2, iz);
+                super::icons::draw(c, Icon::Music, ar.x + (art - iz) / 2, ar.y + (art - iz) / 2, iz);
             }
         }
         let tx = ar.right() + 36;

@@ -876,7 +876,7 @@ impl SettingsApp {
         for m in crate::fs::mounts() {
             let card = Rect::new(x, y, w, 104);
             self.card(c, card);
-            icons::draw(c, Icon::Drive, x + 16, y + 16, 40);
+            super::icons::draw(c, Icon::Drive, x + 16, y + 16, 40);
             let title = if m.point == "/" { String::from("MayOS Disk") } else { format!("{}  \u{2014}  {}", m.point, m.label) };
             c.draw_text(&f.bold, x + 70, y + 30, &title, theme::TEXT);
             let sub = if m.persistent { String::from(m.backend) } else { format!("{} \u{2014} set up a disk below to keep your files", m.backend) };
@@ -899,7 +899,7 @@ impl SettingsApp {
         for d in crate::storage::blank_disks() {
             let card = Rect::new(x, y, w, 70);
             self.card(c, card);
-            icons::draw(c, Icon::Drive, x + 16, y + 14, 40);
+            super::icons::draw(c, Icon::Drive, x + 16, y + 14, 40);
             c.draw_text(&f.bold, x + 70, y + 30, &format!("{} \u{2014} {}", d.name, d.model), theme::TEXT);
             c.draw_text(&f.ui, x + 70, y + 50, &format!("{} \u{00b7} not formatted", crate::fs::format_size(d.bytes)), theme::TEXT_DIM);
             let i = self.disk_targets.len();

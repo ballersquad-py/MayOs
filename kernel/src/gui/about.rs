@@ -83,7 +83,7 @@ impl App for About {
         let f = fonts();
         c.fill_rect(Rect::new(0, 0, w, h), theme::WINDOW_BG);
         c.fill_gradient_v(Rect::new(0, 0, w, 110), rgb(0x2f, 0x7c, 0xf6), rgb(0x7a, 0x4d, 0xe8));
-        gfx::icons::draw(c, Icon::Info, 24, 23, 64);
+        super::icons::draw(c, Icon::Info, 24, 23, 64);
         c.draw_text(&f.large, 104, 58, "MayOS", rgb(255, 255, 255));
         c.draw_text(&f.ui, 106, 82, "A from-scratch operating system", rgb(235, 238, 255));
         let mut y = 140;

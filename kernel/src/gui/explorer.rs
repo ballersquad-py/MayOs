@@ -675,7 +675,7 @@ impl Explorer {
             } else if self.hover == Hover::Place(i) {
                 c.fill_rounded_rect(r, 7, with_alpha(0x000000, 12));
             }
-            icons::draw(c, *icon, r.x + 8, r.y + 4, 20);
+            super::icons::draw(c, *icon, r.x + 8, r.y + 4, 20);
             let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
             let font = if current { &f.bold } else { &f.ui };
             c.draw_text(font, r.x + 36, base, label, theme::TEXT);
@@ -763,7 +763,7 @@ impl Explorer {
                 }
                 None => {
                     let (icon, _) = kind_of(e, &self.path);
-                    icons::draw(c, icon, bx.x + (bx.w - 64) / 2, bx.y + (bx.h - 64) / 2, 64);
+                    super::icons::draw(c, icon, bx.x + (bx.w - 64) / 2, bx.y + (bx.h - 64) / 2, 64);
                 }
             }
             // Name, centred (clipped with an ellipsis when too long).
@@ -837,7 +837,7 @@ impl Explorer {
                     let t = &t.small;
                     c.blit_rounded(t, name_x - 4 + (22 - t.w) / 2, r.y + 3 + (22 - t.h) / 2, 2);
                 }
-                None => icons::draw(c, icon, name_x - 4, r.y + 3, 22),
+                None => super::icons::draw(c, icon, name_x - 4, r.y + 3, 22),
             }
             let text = if selected && focused { theme::TEXT_ON_ACCENT } else { theme::TEXT };
             let dim = if selected && focused { with_alpha(0xffffff, 210) } else { theme::TEXT_DIM };
