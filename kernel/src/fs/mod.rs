@@ -14,6 +14,7 @@ pub use fat32::{DirEntry, FsError, FsStats, Timestamp};
 
 use crate::drivers::ahci::AhciDisk;
 use crate::drivers::ide::IdeDisk;
+use crate::drivers::nvme::NvmeDisk;
 use crate::drivers::ramdisk::RamDisk;
 use crate::drivers::virtio_blk::VirtioBlk;
 use crate::sync::Mutex;
@@ -24,6 +25,9 @@ pub enum Disk {
     Ram(RamDisk),
     Ahci(AhciDisk),
     Ide(IdeDisk),
+    Nvme(NvmeDisk),
+    /// One partition of a disk (GPT or MBR): `start` and `len` in sectors.
+    Part(alloc::sync::Arc<Mutex<Disk>>, u64, u64),
 }
 
 impl Disk {
@@ -37,6 +41,8 @@ impl Disk {
             Disk::Ram(_) => "RAM disk (changes are lost at power off)",
             Disk::Ahci(_) => "SATA disk",
             Disk::Ide(_) => "IDE disk",
+            Disk::Nvme(_) => "NVMe SSD",
+            Disk::Part(..) => "disk partition",
         }
     }
 
@@ -46,6 +52,8 @@ impl Disk {
             Disk::Ram(d) => d.sectors,
             Disk::Ahci(d) => d.sectors,
             Disk::Ide(d) => d.sectors,
+            Disk::Nvme(d) => d.sectors,
+            Disk::Part(_, _, len) => *len,
         }
     }
 }
@@ -57,6 +65,13 @@ impl fat32::BlockDevice for Disk {
             Disk::Ram(d) => d.read(lba, buf),
             Disk::Ahci(d) => d.read(lba, buf),
             Disk::Ide(d) => d.read(lba, buf),
+            Disk::Nvme(d) => d.read(lba, buf),
+            Disk::Part(d, start, len) => {
+                if lba + (buf.len() / 512) as u64 > *len {
+                    return Err(());
+                }
+                d.lock().read(*start + lba, buf)
+            }
         }
     }
     fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), ()> {
@@ -65,6 +80,13 @@ impl fat32::BlockDevice for Disk {
             Disk::Ram(d) => d.write(lba, buf),
             Disk::Ahci(d) => d.write(lba, buf),
             Disk::Ide(d) => d.write(lba, buf),
+            Disk::Nvme(d) => d.write(lba, buf),
+            Disk::Part(d, start, len) => {
+                if lba + (buf.len() / 512) as u64 > *len {
+                    return Err(());
+                }
+                d.lock().write(*start + lba, buf)
+            }
         }
     }
     fn flush(&mut self) -> core::result::Result<(), ()> {
@@ -73,6 +95,8 @@ impl fat32::BlockDevice for Disk {
             Disk::Ram(d) => d.flush(),
             Disk::Ahci(d) => d.flush(),
             Disk::Ide(d) => d.flush(),
+            Disk::Nvme(d) => d.flush(),
+            Disk::Part(d, ..) => d.lock().flush(),
         }
     }
 }

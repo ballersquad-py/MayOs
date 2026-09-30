@@ -13,3 +13,4 @@ pub mod svga3d_formats;
 pub mod ahci;
 pub mod ide;
 pub mod vmmdev;
+pub mod nvme;

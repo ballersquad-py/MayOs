@@ -13,7 +13,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::drivers::{ahci, ide, pci};
+use crate::drivers::{ahci, ide, nvme, pci};
+use fat32::BlockDevice;
 use crate::fs::{self, Disk};
 use crate::sync::{Mutex, Spin};
 
@@ -68,14 +69,42 @@ pub fn init() {
             }
         }
     }
+    let mut nvme_index = 0;
+    for d in pci::devices() {
+        if d.class == 0x01 && d.subclass == 0x08 {
+            for disk in nvme::probe(&d, nvme_index) {
+                crate::kprintln!("disk: {} \"{}\" {} MiB", disk.name, disk.model, disk.sectors / 2048);
+                found.push((disk.name.clone(), disk.model.clone(), Disk::Nvme(disk)));
+            }
+            nvme_index += 1;
+        }
+    }
     for disk in ide::probe() {
         crate::kprintln!("disk: {} \"{}\" {} MiB", disk.name, disk.model, disk.sectors / 2048);
         found.push((disk.name.clone(), disk.model.clone(), Disk::Ide(disk)));
     }
 
+    // Disks with a partition table (GPT/MBR, e.g. a Windows SSD): their
+    // FAT32 partitions are volumes of their own; the rest (NTFS, ...) is
+    // left alone, and such disks are never offered for formatting.
+    let mut volumes: Vec<(String, String, Disk)> = Vec::new();
+    for (name, model, mut dev) in found {
+        let parts = partitions(&mut dev);
+        if parts.is_empty() {
+            volumes.push((name, model, dev));
+            continue;
+        }
+        crate::kprintln!("disk: {} has {} partition(s)", name, parts.len());
+        let shared = alloc::sync::Arc::new(crate::sync::Mutex::new(dev));
+        for (i, (start, len)) in parts.into_iter().enumerate() {
+            volumes.push((format!("{}p{}", name, i + 1), model.clone(), Disk::Part(shared.clone(), start, len)));
+        }
+    }
+
     let root_persistent = fs::root_is_persistent();
     let mut next = 1;
-    for (name, model, dev) in found {
+    for (name, model, dev) in volumes {
+        let partition = matches!(dev, Disk::Part(..));
         let bytes = dev.sectors() * 512;
         match fs::open_volume(dev) {
             Ok(mut vol) => {
@@ -95,12 +124,67 @@ pub fn init() {
                     crate::kprintln!("disk: {} ({}) mounted at {}", name, model, point);
                 }
             }
+            Err((_, _)) if partition => {
+                crate::kprintln!("disk: {} is not FAT32; left alone", name);
+            }
             Err((e, dev)) => {
                 crate::kprintln!("disk: {} has no FAT32 volume ({}); available for setup", name, e);
                 BLANK.lock().push(BlankDisk { name, model, bytes, dev: Some(dev) });
             }
         }
     }
+}
+
+/// Partitions (start, length in sectors) from a GPT or MBR partition
+/// table; empty when the disk has none (or is a FAT32 "superfloppy").
+fn partitions(dev: &mut Disk) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut s0 = [0u8; 512];
+    if dev.read(0, &mut s0).is_err() || s0[510] != 0x55 || s0[511] != 0xaa {
+        return out;
+    }
+    // A FAT boot sector also ends in 55 AA: it has "FAT" in its header.
+    if &s0[82..85] == b"FAT" || &s0[54..57] == b"FAT" {
+        return out;
+    }
+    let total = dev.sectors();
+    if s0[450] == 0xee {
+        let mut h = [0u8; 512];
+        if dev.read(1, &mut h).is_err() || &h[0..8] != b"EFI PART" {
+            return out;
+        }
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let (first, count, size) = (u64_at(&h, 72), u32_at(&h, 80).min(256) as usize, u32_at(&h, 84) as usize);
+        if !(128..=512).contains(&size) {
+            return out;
+        }
+        let mut t = alloc::vec![0u8; (count * size).div_ceil(512) * 512];
+        if dev.read(first, &mut t).is_err() {
+            return out;
+        }
+        for i in 0..count {
+            let e = &t[i * size..(i + 1) * size];
+            if e[0..16].iter().all(|&b| b == 0) {
+                continue;
+            }
+            let (a, b) = (u64_at(e, 32), u64_at(e, 40));
+            if a > 0 && b >= a && b < total {
+                out.push((a, b - a + 1));
+            }
+        }
+        return out;
+    }
+    for i in 0..4 {
+        let e = &s0[446 + i * 16..462 + i * 16];
+        let kind = e[4];
+        let start = u32::from_le_bytes(e[8..12].try_into().unwrap()) as u64;
+        let len = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
+        if kind != 0 && kind != 0x05 && kind != 0x0f && start > 0 && len > 0 && start + len <= total {
+            out.push((start, len));
+        }
+    }
+    out
 }
 
 const UPDATE_POINT: &str = "/mayos-update";
