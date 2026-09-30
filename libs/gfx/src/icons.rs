@@ -50,6 +50,8 @@ pub enum Icon {
     SymTime,
     SymStorage,
     SymAbout,
+    SymList,
+    SymPerf,
 
 }
 

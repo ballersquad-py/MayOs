@@ -797,12 +797,13 @@ class Account {
     String name, uuid, token, refresh;
     long expires;
 
+    // MayOS's default Microsoft app ID; /etc/minecraft-client-id overrides it.
+    static final String DEFAULT_CLIENT_ID = "4828c89c-ee13-40fa-aa8a-36fb6ad65f60";
+
     static String clientId() throws IOException {
         Path p = Paths.get("/etc/minecraft-client-id");
-        if (!Files.exists(p)) {
-            throw new IOException("no Microsoft app ID: put one in /etc/minecraft-client-id (see the MayOS launcher's help)");
-        }
-        return Files.readString(p).trim();
+        String id = Files.exists(p) ? Files.readString(p).trim() : "";
+        return id.isEmpty() ? DEFAULT_CLIENT_ID : id;
     }
 
     static String form(Map<String, String> m) {

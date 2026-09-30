@@ -14,7 +14,7 @@ use gfx::icons::Icon;
 use gfx::{rgb, rgba, with_alpha, Canvas, Color, Rect};
 
 use super::app::{App, AppEvent, AppKind, Ctx};
-use super::theme::fonts;
+use super::theme;
 use super::widgets::TextInput;
 use crate::fs;
 use crate::input::Key;
@@ -22,6 +22,8 @@ use crate::proc::process::{self, Console, Process};
 
 const CONFIG: &str = "/config/minecraft.cfg";
 const CLIENT_ID: &str = "/etc/minecraft-client-id";
+/// Used when /etc/minecraft-client-id is empty (same as Launcher.java).
+const DEFAULT_CLIENT_ID: &str = "4828c89c-ee13-40fa-aa8a-36fb6ad65f60";
 const ACCOUNT: &str = "/home/.minecraft/mayos-account.json";
 
 /// (name, detail, arguments for `minecraft`).
@@ -165,9 +167,43 @@ fn scene(c: &mut Canvas, r: Rect) {
     }
 }
 
+/// Mojang's launcher uses Noto Sans throughout.
+struct LFonts {
+    ui: &'static gfx::Font,
+    bold: &'static gfx::Font,
+    heavy: &'static gfx::Font,
+    small_bold: &'static gfx::Font,
+    large: &'static gfx::Font,
+    pixel: &'static gfx::Font,
+    pixel_big: &'static gfx::Font,
+}
+
+fn fonts() -> LFonts {
+    let f = theme::fonts();
+    LFonts { ui: &f.mc_ui, bold: &f.mc_bold, heavy: &f.mc_bold, small_bold: &f.mc_small, large: &f.mc_title, pixel: &f.mc_pixel, pixel_big: &f.mc_pixel_big }
+}
+
+/// A square text field (dark, 1 px border, green when editing).
+fn text_field(c: &mut Canvas, r: Rect, text: &str, editing: bool) {
+    let f = fonts();
+    c.fill_rect(r, rgb(0x1b, 0x1b, 0x1b));
+    let b = if editing { GREEN } else { LINE };
+    c.fill_rect(Rect::new(r.x, r.y, r.w, 1), b);
+    c.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), b);
+    c.fill_rect(Rect::new(r.x, r.y, 1, r.h), b);
+    c.fill_rect(Rect::new(r.right() - 1, r.y, 1, r.h), b);
+    let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
+    c.draw_text_clipped(f.ui, r.x + 10, base, text, r.w - 20, TEXT);
+    if editing {
+        let x = r.x + 10 + f.ui.measure(text).min(r.w - 22);
+        c.fill_rect(Rect::new(x + 1, r.y + 8, 1, r.h - 16), TEXT);
+    }
+}
+
 impl McLauncher {
     pub fn new() -> McLauncher {
         let id = fs::read_file(CLIENT_ID).map(|d| String::from(String::from_utf8_lossy(&d).trim())).unwrap_or_default();
+        let id = if id.is_empty() { String::from(DEFAULT_CLIENT_ID) } else { id };
         let mut l = McLauncher {
             tab: Tab::Play,
             version: 0,
@@ -204,7 +240,7 @@ impl McLauncher {
         let _ = fs::create_dir("/etc");
         let _ = fs::write_file("/etc/minecraft-user", self.name.text.as_bytes());
         let id = self.client_id.text.trim();
-        if id.is_empty() {
+        if id.is_empty() || id == DEFAULT_CLIENT_ID {
             let _ = fs::remove(CLIENT_ID);
         } else {
             let _ = fs::write_file(CLIENT_ID, id.as_bytes());
@@ -241,9 +277,6 @@ impl McLauncher {
         };
         if !installed() {
             l.status = String::from("Install Minecraft first (Play \u{2192} Install).");
-            l.failed = true;
-        } else if self.client_id.text.trim().is_empty() {
-            l.status = String::from("Add a Microsoft app ID in Settings first.");
             l.failed = true;
         } else {
             match super::shell::find_program("/home", "minecraft").ok_or(String::from("minecraft is not installed")).and_then(|p| process::spawn(&p, "--login", "/home", console)) {
@@ -325,42 +358,42 @@ impl McLauncher {
             Some(n) => (n.clone(), "Microsoft account"),
             None => (self.name.text.clone(), "Offline"),
         };
-        c.draw_text_clipped(&f.heavy, acct.x + 52, acct.y + 26, &who, acct.w - 56, TEXT);
-        c.draw_text(&f.ui, acct.x + 52, acct.y + 45, kind, DIM);
+        c.draw_text_clipped(f.heavy, acct.x + 52, acct.y + 26, &who, acct.w - 56, TEXT);
+        c.draw_text(f.ui, acct.x + 52, acct.y + 45, kind, DIM);
         c.fill_rect(Rect::new(12, 82, SIDEBAR_W - 24, 1), LINE);
         // The game.
         let g = Rect::new(8, 94, SIDEBAR_W - 16, 52);
-        c.fill_rounded_rect(g, 8, rgb(0x33, 0x33, 0x33));
-        c.fill_rounded_rect(Rect::new(g.x + 2, g.y + 12, 4, g.h - 24), 2, GREEN);
+        c.fill_rect(g, rgb(0x33, 0x33, 0x33));
+        c.fill_rect(Rect::new(g.x, g.y, 3, g.h), GREEN);
         super::icons::draw(c, Icon::Minecraft, g.x + 12, g.y + 10, 32);
-        c.draw_text(&f.small_bold, g.x + 54, g.y + 22, "MINECRAFT:", TEXT);
-        c.draw_text(&f.small_bold, g.x + 54, g.y + 38, "JAVA EDITION", TEXT);
+        c.draw_text(f.small_bold, g.x + 54, g.y + 22, "MINECRAFT:", TEXT);
+        c.draw_text(f.small_bold, g.x + 54, g.y + 38, "JAVA EDITION", TEXT);
         // Sign in / out at the bottom.
         let b = Rect::new(12, h - 56, SIDEBAR_W - 24, 40);
         if self.account.is_some() {
             let hov = self.push(b, Hit::SignOut);
-            c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { CARD });
-            c.draw_text_centered(&f.bold, b, "Sign out", TEXT);
+            c.fill_rect(b, if hov { CARD_HOVER } else { CARD });
+            c.draw_text_centered(f.bold, b, "Sign out", TEXT);
         } else {
             let hov = self.push(b, Hit::SignIn);
-            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
-            c.draw_text_centered(&f.bold, b, "Sign in with Microsoft", TEXT);
+            c.fill_rect(b, if hov { GREEN_HOVER } else { GREEN });
+            c.draw_text_centered(f.bold, b, "Sign in with Microsoft", TEXT);
         }
     }
 
     fn render_header(&mut self, c: &mut Canvas, x: i32, w: i32) {
         let f = fonts();
         c.fill_rect(Rect::new(x, 0, w - x, HEADER_H), BG);
-        c.draw_text(&f.large, x + 28, 38, "MINECRAFT: JAVA EDITION", TEXT);
+        c.draw_text(f.large, x + 28, 38, "MINECRAFT: JAVA EDITION", TEXT);
         let mut tx = x + 28;
         for (t, label) in [(Tab::Play, "Play"), (Tab::Installations, "Installations"), (Tab::Settings, "Settings")] {
             let tw = f.bold.measure(label);
             let r = Rect::new(tx - 4, 52, tw + 8, 34);
             let hov = self.push(r, Hit::Tab(t));
             let sel = self.tab == t;
-            c.draw_text(&f.bold, tx, 74, label, if sel || hov { TEXT } else { DIM });
+            c.draw_text(f.bold, tx, 74, label, if sel || hov { TEXT } else { DIM });
             if sel {
-                c.fill_rounded_rect(Rect::new(tx, HEADER_H - 4, tw, 4), 2, GREEN);
+                c.fill_rect(Rect::new(tx, HEADER_H - 4, tw, 4), GREEN);
             }
             tx += tw + 32;
         }
@@ -373,9 +406,9 @@ impl McLauncher {
         let old = c.push_clip(hero);
         scene(c, hero);
         let title = Rect::new(hero.x, hero.y + hero.h / 5, hero.w, 48);
-        c.draw_text_centered(&f.large, Rect::new(title.x + 3, title.y + 3, title.w, title.h), "MINECRAFT", rgba(0, 0, 0, 120));
-        c.draw_text_centered(&f.large, title, "MINECRAFT", TEXT);
-        c.draw_text_centered(&f.bold, Rect::new(hero.x, title.bottom() + 2, hero.w, 22), "JAVA EDITION", rgba(255, 255, 255, 230));
+        c.draw_text_centered(f.pixel_big, Rect::new(title.x + 4, title.y + 4, title.w, title.h), "MINECRAFT", rgba(0, 0, 0, 110));
+        c.draw_text_centered(f.pixel_big, title, "MINECRAFT", TEXT);
+        c.draw_text_centered(f.bold, Rect::new(hero.x, title.bottom() + 2, hero.w, 22), "JAVA EDITION", rgba(255, 255, 255, 230));
         c.restore_clip(old);
 
         // Bottom bar.
@@ -383,10 +416,10 @@ impl McLauncher {
         c.fill_rect(bar, BAR);
         let picker = Rect::new(x + 24, bar.y + 18, 260, 56);
         let hov = self.push(picker, Hit::Picker);
-        c.fill_rounded_rect(picker, 8, if hov || self.picker_open { CARD_HOVER } else { rgb(0x2a, 0x2a, 0x2a) });
+        c.fill_rect(picker, if hov || self.picker_open { CARD_HOVER } else { rgb(0x2a, 0x2a, 0x2a) });
         super::icons::draw(c, Icon::Minecraft, picker.x + 12, picker.y + 12, 32);
-        c.draw_text_clipped(&f.bold, picker.x + 56, picker.y + 25, VERSIONS[self.version].0, picker.w - 90, TEXT);
-        c.draw_text_clipped(&f.ui, picker.x + 56, picker.y + 44, VERSIONS[self.version].1, picker.w - 90, DIM);
+        c.draw_text_clipped(f.bold, picker.x + 56, picker.y + 25, VERSIONS[self.version].0, picker.w - 90, TEXT);
+        c.draw_text_clipped(f.ui, picker.x + 56, picker.y + 44, VERSIONS[self.version].1, picker.w - 90, DIM);
         let (cx, cy) = (picker.right() - 22, picker.y + 26);
         for k in 0..5 {
             c.fill_rect(Rect::new(cx - 5 + k, cy + 4 - k, 11 - 2 * k, 1), DIM);
@@ -394,30 +427,31 @@ impl McLauncher {
         let pw = 260.min((bar.w - 600).max(200));
         let play = Rect::new((bar.x + (bar.w - pw) / 2).max(picker.right() + 24), bar.y + 16, pw, 60);
         let hov = self.push(play, Hit::Play);
-        c.fill_rounded_rect(play, 8, if hov { GREEN_HOVER } else { GREEN });
-        c.draw_text_centered(&f.large, play, if installed() { "PLAY" } else { "INSTALL" }, TEXT);
+        c.fill_rect(play, if hov { GREEN_HOVER } else { GREEN });
+        c.fill_rect(Rect::new(play.x, play.bottom() - 4, play.w, 4), rgb(0x27, 0x59, 0x1a));
+        c.draw_text_centered(f.pixel, play, if installed() { "PLAY" } else { "INSTALL" }, TEXT);
         let who = match &self.account {
             Some(n) => format!("{}", n),
             None => format!("{} (offline)", self.name.text),
         };
         let ww = f.ui.measure(&who).min(220);
-        c.draw_text(&f.ui, bar.right() - 24 - ww, bar.y + 42, "Playing as", DIM);
-        c.draw_text_clipped(&f.heavy, bar.right() - 24 - ww, bar.y + 62, &who, 220, TEXT);
+        c.draw_text(f.ui, bar.right() - 24 - ww, bar.y + 42, "Playing as", DIM);
+        c.draw_text_clipped(f.heavy, bar.right() - 24 - ww, bar.y + 62, &who, 220, TEXT);
 
         if self.picker_open {
             let ih = 56;
             let list = Rect::new(picker.x, picker.y - 8 - ih * VERSIONS.len() as i32 - 8, 320, ih * VERSIONS.len() as i32 + 8);
             self.hits.push((Rect::new(0, 0, self.size.0, self.size.1), Hit::Backdrop));
-            c.draw_shadow(list, 10, 16, with_alpha(0x000000, 120));
-            c.fill_rounded_rect(list, 10, rgb(0x2a, 0x2a, 0x2a));
+            c.draw_shadow(list, 0, 16, with_alpha(0x000000, 120));
+            c.fill_rect(list, rgb(0x2a, 0x2a, 0x2a));
             for i in 0..VERSIONS.len() {
                 let r = Rect::new(list.x + 4, list.y + 4 + i as i32 * ih, list.w - 8, ih);
                 let hov = self.push(r, Hit::PickVersion(i));
                 if hov || i == self.version {
-                    c.fill_rounded_rect(r, 8, if hov { CARD_HOVER } else { rgb(0x35, 0x35, 0x35) });
+                    c.fill_rect(r, if hov { CARD_HOVER } else { rgb(0x35, 0x35, 0x35) });
                 }
-                c.draw_text(&f.bold, r.x + 14, r.y + 24, VERSIONS[i].0, TEXT);
-                c.draw_text(&f.ui, r.x + 14, r.y + 43, VERSIONS[i].1, DIM);
+                c.draw_text(f.bold, r.x + 14, r.y + 24, VERSIONS[i].0, TEXT);
+                c.draw_text(f.ui, r.x + 14, r.y + 43, VERSIONS[i].1, DIM);
             }
         }
     }
@@ -430,18 +464,18 @@ impl McLauncher {
             let r = Rect::new(x + 28, y, w - x - 56, 64);
             c.fill_rect(Rect::new(r.x, r.bottom(), r.w, 1), LINE);
             super::icons::draw(c, Icon::Minecraft, r.x + 8, r.y + 16, 32);
-            c.draw_text(&f.bold, r.x + 56, r.y + 28, VERSIONS[i].0, TEXT);
-            c.draw_text(&f.ui, r.x + 56, r.y + 48, VERSIONS[i].1, DIM);
+            c.draw_text(f.bold, r.x + 56, r.y + 28, VERSIONS[i].0, TEXT);
+            c.draw_text(f.ui, r.x + 56, r.y + 48, VERSIONS[i].1, DIM);
             let b = Rect::new(r.right() - 110, r.y + 14, 100, 36);
             let hov = self.push(b, Hit::InstallPlay(i));
-            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
-            c.draw_text_centered(&f.bold, b, if installed() { "Play" } else { "Install" }, TEXT);
+            c.fill_rect(b, if hov { GREEN_HOVER } else { GREEN });
+            c.draw_text_centered(f.bold, b, if installed() { "Play" } else { "Install" }, TEXT);
             y += 72;
         }
         let b = Rect::new(x + 28, y + 16, 220, 36);
         let hov = self.push(b, Hit::Folder);
-        c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { CARD });
-        c.draw_text_centered(&f.bold, b, "Open game folder", TEXT);
+        c.fill_rect(b, if hov { CARD_HOVER } else { CARD });
+        c.draw_text_centered(f.bold, b, "Open game folder", TEXT);
     }
 
     fn render_settings(&mut self, c: &mut Canvas, x: i32, w: i32, h: i32) {
@@ -450,41 +484,46 @@ impl McLauncher {
         let lx = x + 28;
         let mut y = HEADER_H + 30;
         let label = |c: &mut Canvas, y: i32, t: &str, d: &str| {
-            c.draw_text(&f.bold, lx, y, t, TEXT);
-            c.draw_text(&f.ui, lx, y + 20, d, DIM);
+            c.draw_text(f.bold, lx, y, t, TEXT);
+            c.draw_text(f.ui, lx, y + 20, d, DIM);
         };
         label(c, y, "Player name", "Used when you play offline");
         let r = Rect::new(w - 28 - 300, y - 18, 300, 36);
         self.push(r, Hit::Name);
-        self.name.render(c, r, self.editing == Some(Hit::Name));
+        text_field(c, r, &self.name.text.clone(), self.editing == Some(Hit::Name));
         y += 64;
         label(c, y, "Memory", "How much RAM the game may use");
         for i in 0..MEMORY.len() {
             let r = Rect::new(w - 28 - 300 + i as i32 * 76, y - 18, 72, 36);
             let hov = self.push(r, Hit::Memory(i));
             let sel = self.memory == i;
-            c.fill_rounded_rect(r, 8, if sel { GREEN } else if hov { CARD_HOVER } else { CARD });
-            c.draw_text_centered(&f.bold, r, MEMORY[i], TEXT);
+            c.fill_rect(r, if sel { GREEN } else if hov { CARD_HOVER } else { CARD });
+            c.draw_text_centered(f.bold, r, MEMORY[i], TEXT);
         }
         y += 64;
         label(c, y, "Fullscreen", "Start 1.8.9 and older versions fullscreen");
-        let t = Rect::new(w - 28 - 52, y - 14, 52, 28);
-        let hov = self.push(t, Hit::Fullscreen);
-        c.fill_rounded_rect(t, 14, if self.fullscreen { GREEN } else if hov { rgb(0x55, 0x55, 0x55) } else { rgb(0x48, 0x48, 0x48) });
-        c.fill_circle(if self.fullscreen { t.right() - 14 } else { t.x + 14 }, t.y + 14, 10, TEXT);
+        let t = Rect::new(w - 28 - 24, y - 12, 24, 24);
+        let hov = self.push(t.inset(-6), Hit::Fullscreen);
+        c.fill_rect(t, if self.fullscreen { GREEN } else if hov { rgb(0x55, 0x55, 0x55) } else { rgb(0x1b, 0x1b, 0x1b) });
+        if !self.fullscreen {
+            for (rx, ry, rw, rh) in [(0, 0, 24, 1), (0, 23, 24, 1), (0, 0, 1, 24), (23, 0, 1, 24)] {
+                c.fill_rect(Rect::new(t.x + rx, t.y + ry, rw, rh), LINE);
+            }
+        } else {
+            for d in 0..5 {
+                c.fill_rect(Rect::new(t.x + 5 + d, t.y + 11 + d, 2, 2), TEXT);
+            }
+            for d in 0..9 {
+                c.fill_rect(Rect::new(t.x + 9 + d, t.y + 15 - d, 2, 2), TEXT);
+            }
+        }
         y += 64;
-        label(c, y, "Microsoft app ID", "Needed to sign in: an Azure app approved for Minecraft");
+        label(c, y, "Microsoft app ID", "The app used to sign in (leave as is unless you have your own)");
         let r = Rect::new(w - 28 - 300, y - 18, 300, 36);
         self.push(r, Hit::ClientId);
-        self.client_id.render(c, r, self.editing == Some(Hit::ClientId));
+        text_field(c, r, &self.client_id.text.clone(), self.editing == Some(Hit::ClientId));
         y += 60;
-        for line in [
-            "Microsoft only lets approved apps sign in to Minecraft. Put your app's ID here (it is saved in",
-            "/etc/minecraft-client-id). Without one you can still play offline worlds with the player name.",
-        ] {
-            c.draw_text(&f.ui, lx, y, line, DIM);
-            y += 20;
-        }
+        let _ = y;
     }
 
     fn render_login(&mut self, c: &mut Canvas, w: i32, h: i32) {
@@ -494,27 +533,27 @@ impl McLauncher {
         self.hits.push((Rect::new(0, 0, w, h), Hit::Backdrop));
         c.fill_rect(Rect::new(0, 0, w, h), rgba(0, 0, 0, 150));
         let r = Rect::new((w - 460) / 2, (h - 300) / 2, 460, 300);
-        c.draw_shadow(r, 12, 20, with_alpha(0x000000, 140));
-        c.fill_rounded_rect(r, 12, rgb(0x2a, 0x2a, 0x2a));
-        c.draw_text_centered(&f.large, Rect::new(r.x, r.y + 20, r.w, 36), "Sign in with Microsoft", TEXT);
+        c.draw_shadow(r, 0, 20, with_alpha(0x000000, 140));
+        c.fill_rect(r, rgb(0x2a, 0x2a, 0x2a));
+        c.draw_text_centered(f.large, Rect::new(r.x, r.y + 20, r.w, 36), "Sign in with Microsoft", TEXT);
         if code.is_empty() {
-            c.draw_text_centered(&f.ui, Rect::new(r.x + 20, r.y + 110, r.w - 40, 24), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
+            c.draw_text_centered(f.ui, Rect::new(r.x + 20, r.y + 110, r.w - 40, 24), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
         } else {
-            c.draw_text_centered(&f.ui, Rect::new(r.x, r.y + 70, r.w, 20), "Firefox opened the sign-in page. If it asks, enter:", DIM);
+            c.draw_text_centered(f.ui, Rect::new(r.x, r.y + 70, r.w, 20), "Firefox opened the sign-in page. If it asks, enter:", DIM);
             let cr = Rect::new(r.x + 60, r.y + 100, r.w - 120, 60);
-            c.fill_rounded_rect(cr, 8, rgb(0x1b, 0x1b, 0x1b));
-            c.draw_text_centered(&f.large, cr, &code, TEXT);
-            c.draw_text_centered(&f.ui, Rect::new(r.x, r.y + 172, r.w, 20), &format!("at {}", url), DIM);
-            c.draw_text_centered(&f.ui, Rect::new(r.x + 20, r.y + 196, r.w - 40, 20), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
+            c.fill_rect(cr, rgb(0x1b, 0x1b, 0x1b));
+            c.draw_text_centered(f.large, cr, &code, TEXT);
+            c.draw_text_centered(f.ui, Rect::new(r.x, r.y + 172, r.w, 20), &format!("at {}", url), DIM);
+            c.draw_text_centered(f.ui, Rect::new(r.x + 20, r.y + 196, r.w - 40, 20), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
             let b = Rect::new(r.x + 30, r.bottom() - 60, 190, 40);
             let hov = self.push(b, Hit::OpenPage);
-            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
-            c.draw_text_centered(&f.bold, b, "Open page again", TEXT);
+            c.fill_rect(b, if hov { GREEN_HOVER } else { GREEN });
+            c.draw_text_centered(f.bold, b, "Open page again", TEXT);
         }
         let b = if code.is_empty() { Rect::new(r.x + (r.w - 190) / 2, r.bottom() - 60, 190, 40) } else { Rect::new(r.right() - 220, r.bottom() - 60, 190, 40) };
         let hov = self.push(b, Hit::CancelLogin);
-        c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { rgb(0x3a, 0x3a, 0x3a) });
-        c.draw_text_centered(&f.bold, b, if failed { "Close" } else { "Cancel" }, TEXT);
+        c.fill_rect(b, if hov { CARD_HOVER } else { rgb(0x3a, 0x3a, 0x3a) });
+        c.draw_text_centered(f.bold, b, if failed { "Close" } else { "Cancel" }, TEXT);
     }
 }
 

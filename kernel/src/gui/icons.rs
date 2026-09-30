@@ -27,6 +27,8 @@ static PNGS: &[(&str, [&[u8]; 3])] = &[
     ("sym-time", [include_bytes!("../../../assets/icons/sym-time-32.png"), include_bytes!("../../../assets/icons/sym-time-64.png"), include_bytes!("../../../assets/icons/sym-time-128.png")]),
     ("sym-storage", [include_bytes!("../../../assets/icons/sym-storage-32.png"), include_bytes!("../../../assets/icons/sym-storage-64.png"), include_bytes!("../../../assets/icons/sym-storage-128.png")]),
     ("sym-about", [include_bytes!("../../../assets/icons/sym-about-32.png"), include_bytes!("../../../assets/icons/sym-about-64.png"), include_bytes!("../../../assets/icons/sym-about-128.png")]),
+    ("sym-list", [include_bytes!("../../../assets/icons/sym-list-32.png"), include_bytes!("../../../assets/icons/sym-list-64.png"), include_bytes!("../../../assets/icons/sym-list-128.png")]),
+    ("sym-perf", [include_bytes!("../../../assets/icons/sym-perf-32.png"), include_bytes!("../../../assets/icons/sym-perf-64.png"), include_bytes!("../../../assets/icons/sym-perf-128.png")]),
     ("about", [include_bytes!("../../../assets/icons/about-32.png"), include_bytes!("../../../assets/icons/about-64.png"), include_bytes!("../../../assets/icons/about-128.png")]),
     ("minecraft", [include_bytes!("../../../assets/icons/minecraft-32.png"), include_bytes!("../../../assets/icons/minecraft-64.png"), include_bytes!("../../../assets/icons/minecraft-128.png")]),
     ("player", [include_bytes!("../../../assets/icons/player-32.png"), include_bytes!("../../../assets/icons/player-64.png"), include_bytes!("../../../assets/icons/player-128.png")]),
@@ -106,6 +108,8 @@ fn name(i: Icon) -> &'static str {
         Icon::SymTime => "sym-time",
         Icon::SymStorage => "sym-storage",
         Icon::SymAbout => "sym-about",
+        Icon::SymList => "sym-list",
+        Icon::SymPerf => "sym-perf",
     }
 }
 

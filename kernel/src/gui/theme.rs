@@ -103,6 +103,14 @@ pub struct Fonts {
     pub mono: Font,
     pub large: Font,
     pub small_bold: Font,
+    /// Noto Sans set for the Minecraft launcher (as Mojang's launcher).
+    pub mc_ui: Font,
+    pub mc_bold: Font,
+    pub mc_small: Font,
+    pub mc_title: Font,
+    /// Monocraft (a free Minecraft-style pixel font): Play button, title.
+    pub mc_pixel: Font,
+    pub mc_pixel_big: Font,
     /// Medium 15 px (panel clock, headings).
     pub medium: Font,
 }
@@ -118,6 +126,12 @@ pub fn init() {
         mono: Font::parse(include_bytes!("../../../assets/fonts/mono-13.mfnt")).expect("mono font"),
         large: Font::parse(include_bytes!("../../../assets/fonts/geist-bold-26.mfnt")).expect("large font"),
         small_bold: Font::parse(include_bytes!("../../../assets/fonts/geist-semibold-11.mfnt")).expect("small font"),
+        mc_ui: Font::parse(include_bytes!("../../../assets/fonts/noto-14.mfnt")).expect("noto"),
+        mc_bold: Font::parse(include_bytes!("../../../assets/fonts/noto-bold-14.mfnt")).expect("noto bold"),
+        mc_small: Font::parse(include_bytes!("../../../assets/fonts/noto-bold-12.mfnt")).expect("noto small"),
+        mc_title: Font::parse(include_bytes!("../../../assets/fonts/noto-bold-28.mfnt")).expect("noto title"),
+        mc_pixel: Font::parse(include_bytes!("../../../assets/fonts/monocraft-27.mfnt")).expect("monocraft"),
+        mc_pixel_big: Font::parse(include_bytes!("../../../assets/fonts/monocraft-36.mfnt")).expect("monocraft big"),
         medium: Font::parse(include_bytes!("../../../assets/fonts/inter-medium-16.mfnt")).expect("medium font"),
     });
 }
