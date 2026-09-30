@@ -97,6 +97,7 @@ extern "C" fn kmain() -> ! {
 }
 
 fn init_threaded_devices() {
+    drivers::xhci::init();
     for d in pci::devices() {
         if d.vendor == 0x8086 && drivers::e1000::DEVICE_IDS.contains(&d.device) && !network::is_present() {
             match drivers::e1000::E1000::new(&d) {

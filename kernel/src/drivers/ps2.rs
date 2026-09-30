@@ -189,14 +189,21 @@ pub fn on_keyboard_irq() {
     if matches!(code, 0xfa | 0xfe | 0xee) {
         return;
     }
+    let extended = {
+        let mut s = STATE.lock();
+        if code == 0xe0 {
+            s.extended = true;
+            return;
+        }
+        core::mem::replace(&mut s.extended, false)
+    };
+    scancode(code & 0x7f, extended, code & 0x80 == 0);
+}
+
+/// One key in scan code set 1 (also used by USB keyboards, whose usage
+/// codes are translated to it).
+pub fn scancode(make: u8, extended: bool, pressed: bool) {
     let mut s = STATE.lock();
-    if code == 0xe0 {
-        s.extended = true;
-        return;
-    }
-    let extended = core::mem::replace(&mut s.extended, false);
-    let pressed = code & 0x80 == 0;
-    let make = code & 0x7f;
     // Ignore fake shifts that some keyboards wrap around extended keys.
     if extended && (make == 0x2a || make == 0x36) {
         return;
