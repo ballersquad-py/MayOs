@@ -49,6 +49,69 @@ pub fn init() {
     }
 }
 
+/// Make sure all of `base..base+len` is in the direct map (write-back
+/// cached). The bootloader maps RAM, but on machines with a lot of it the
+/// top (where it also puts the boot modules) can be missing. Uses 2 MiB
+/// pages where possible.
+pub fn map_direct(base: u64, len: u64) {
+    let pml4 = kernel_pml4();
+    let mut p = base & !(PAGE_SIZE - 1);
+    let end = (base + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    const TWO_MB: u64 = 2 << 20;
+    while p < end {
+        let v = phys_to_virt(p);
+        if let Some(size) = mapped_size(pml4, v) {
+            p = (p & !(size - 1)) + size;
+            continue;
+        }
+        if p % TWO_MB == 0 && end - p >= TWO_MB && map_2m(pml4, v, p).is_ok() {
+            p += TWO_MB;
+            continue;
+        }
+        let _ = map(pml4, v, p, WRITABLE | NO_EXECUTE);
+        p += PAGE_SIZE;
+    }
+}
+
+/// Size of the page mapping `virt`, if mapped.
+fn mapped_size(pml4: u64, virt: u64) -> Option<u64> {
+    let mut t = pml4;
+    for level in (1..=4).rev() {
+        let e = table(t)[index(virt, level)];
+        if e & PRESENT == 0 {
+            return None;
+        }
+        if level == 1 || (level <= 3 && e & HUGE != 0) {
+            return Some(1u64 << (12 + 9 * (level - 1)));
+        }
+        t = e & ADDR_MASK;
+    }
+    None
+}
+
+/// A 2 MiB page, when its page-directory slot is empty.
+fn map_2m(pml4: u64, virt: u64, phys: u64) -> Result<(), MapError> {
+    let _g = LOCK.lock();
+    let mut t = pml4;
+    for level in (3..=4).rev() {
+        let e = &mut table(t)[index(virt, level)];
+        if *e & PRESENT == 0 {
+            let f = pmm::alloc_frame_zeroed().ok_or(MapError::OutOfMemory)?;
+            *e = f | PRESENT | WRITABLE;
+        } else if *e & HUGE != 0 {
+            return Err(MapError::HugePage);
+        }
+        t = *e & ADDR_MASK;
+    }
+    let e = &mut table(t)[index(virt, 2)];
+    if *e & PRESENT != 0 {
+        return Err(MapError::HugePage);
+    }
+    *e = phys | PRESENT | WRITABLE | HUGE | NO_EXECUTE;
+    cpu::invlpg(virt);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum MapError {
     OutOfMemory,

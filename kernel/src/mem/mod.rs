@@ -21,6 +21,13 @@ pub fn init() {
     let memmap = crate::boot::MEMMAP.response().expect("no memory map");
     pmm::init(memmap);
     paging::init();
+    // RAM, ACPI tables, bootloader data and the boot modules must all be
+    // reachable through the direct map (big machines: see map_direct).
+    for e in memmap.entries() {
+        if matches!(e.kind, 0 | 2 | 3 | 5 | 6) {
+            paging::map_direct(e.base, e.length);
+        }
+    }
     heap::init();
 }
 
