@@ -403,18 +403,20 @@ impl SettingsApp {
         yy
     }
 
-    fn sidebar_icon(c: &mut Canvas, page: Page, _color: Color, x: i32, y: i32) {
+    /// White symbol on the page's colour, the same shape for every page.
+    fn sidebar_icon(c: &mut Canvas, page: Page, color: Color, x: i32, y: i32) {
         let icon = match page {
-            Page::Display => Icon::SetDisplay,
-            Page::Personalization => Icon::SetTheme,
-            Page::Sound => Icon::SetSound,
-            Page::Network => Icon::SetNetwork,
-            Page::Input => Icon::SetMouse,
-            Page::DateTime => Icon::SetTime,
-            Page::Storage => Icon::Drive,
-            Page::About => Icon::MayOS,
+            Page::Display => Icon::SymDisplay,
+            Page::Personalization => Icon::SymTheme,
+            Page::Sound => Icon::SymSound,
+            Page::Network => Icon::SymNetwork,
+            Page::Input => Icon::SymMouse,
+            Page::DateTime => Icon::SymTime,
+            Page::Storage => Icon::SymStorage,
+            Page::About => Icon::SymAbout,
         };
-        super::icons::draw(c, icon, x - 1, y - 1, 28);
+        c.fill_rounded_rect(Rect::new(x, y, 26, 26), 7, color);
+        super::icons::draw(c, icon, x + 5, y + 5, 16);
     }
 
     // ---------------------------------------------------------------

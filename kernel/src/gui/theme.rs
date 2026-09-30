@@ -96,7 +96,10 @@ pub const DOCK_PAD: i32 = 10;
 
 pub struct Fonts {
     pub ui: Font,
+    /// Semibold (600): labels, selected items.
     pub bold: Font,
+    /// Bold (700): names and big buttons.
+    pub heavy: Font,
     pub mono: Font,
     pub large: Font,
     pub small_bold: Font,
@@ -109,12 +112,13 @@ static FONTS: Once<Fonts> = Once::new();
 pub fn init() {
     FONTS.set(Fonts {
         // Noto Sans, and Inter for the clock (SIL Open Font License, assets/fonts/).
-        ui: Font::parse(include_bytes!("../../../assets/fonts/noto-13.mfnt")).expect("sans font"),
-        bold: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-13.mfnt")).expect("bold font"),
+        ui: Font::parse(include_bytes!("../../../assets/fonts/geist-14.mfnt")).expect("sans font"),
+        bold: Font::parse(include_bytes!("../../../assets/fonts/geist-semibold-14.mfnt")).expect("bold font"),
+        heavy: Font::parse(include_bytes!("../../../assets/fonts/geist-bold-14.mfnt")).expect("heavy font"),
         mono: Font::parse(include_bytes!("../../../assets/fonts/mono-13.mfnt")).expect("mono font"),
-        large: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-24.mfnt")).expect("large font"),
-        small_bold: Font::parse(include_bytes!("../../../assets/fonts/noto-semibold-11.mfnt")).expect("small font"),
-        medium: Font::parse(include_bytes!("../../../assets/fonts/inter-medium-15.mfnt")).expect("medium font"),
+        large: Font::parse(include_bytes!("../../../assets/fonts/geist-bold-26.mfnt")).expect("large font"),
+        small_bold: Font::parse(include_bytes!("../../../assets/fonts/geist-semibold-11.mfnt")).expect("small font"),
+        medium: Font::parse(include_bytes!("../../../assets/fonts/inter-medium-16.mfnt")).expect("medium font"),
     });
 }
 

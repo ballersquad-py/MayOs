@@ -325,13 +325,13 @@ impl McLauncher {
             Some(n) => (n.clone(), "Microsoft account"),
             None => (self.name.text.clone(), "Offline"),
         };
-        c.draw_text_clipped(&f.bold, acct.x + 52, acct.y + 26, &who, acct.w - 56, TEXT);
+        c.draw_text_clipped(&f.heavy, acct.x + 52, acct.y + 26, &who, acct.w - 56, TEXT);
         c.draw_text(&f.ui, acct.x + 52, acct.y + 45, kind, DIM);
         c.fill_rect(Rect::new(12, 82, SIDEBAR_W - 24, 1), LINE);
         // The game.
         let g = Rect::new(8, 94, SIDEBAR_W - 16, 52);
-        c.fill_rounded_rect(g, 6, rgb(0x33, 0x33, 0x33));
-        c.fill_rect(Rect::new(g.x, g.y + 10, 3, g.h - 20), GREEN);
+        c.fill_rounded_rect(g, 8, rgb(0x33, 0x33, 0x33));
+        c.fill_rounded_rect(Rect::new(g.x + 2, g.y + 12, 4, g.h - 24), 2, GREEN);
         super::icons::draw(c, Icon::Minecraft, g.x + 12, g.y + 10, 32);
         c.draw_text(&f.small_bold, g.x + 54, g.y + 22, "MINECRAFT:", TEXT);
         c.draw_text(&f.small_bold, g.x + 54, g.y + 38, "JAVA EDITION", TEXT);
@@ -339,11 +339,11 @@ impl McLauncher {
         let b = Rect::new(12, h - 56, SIDEBAR_W - 24, 40);
         if self.account.is_some() {
             let hov = self.push(b, Hit::SignOut);
-            c.fill_rounded_rect(b, 6, if hov { CARD_HOVER } else { CARD });
+            c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { CARD });
             c.draw_text_centered(&f.bold, b, "Sign out", TEXT);
         } else {
             let hov = self.push(b, Hit::SignIn);
-            c.fill_rounded_rect(b, 6, if hov { GREEN_HOVER } else { GREEN });
+            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
             c.draw_text_centered(&f.bold, b, "Sign in with Microsoft", TEXT);
         }
     }
@@ -360,7 +360,7 @@ impl McLauncher {
             let sel = self.tab == t;
             c.draw_text(&f.bold, tx, 74, label, if sel || hov { TEXT } else { DIM });
             if sel {
-                c.fill_rect(Rect::new(tx, HEADER_H - 4, tw, 3), GREEN);
+                c.fill_rounded_rect(Rect::new(tx, HEADER_H - 4, tw, 4), 2, GREEN);
             }
             tx += tw + 32;
         }
@@ -383,9 +383,8 @@ impl McLauncher {
         c.fill_rect(bar, BAR);
         let picker = Rect::new(x + 24, bar.y + 18, 260, 56);
         let hov = self.push(picker, Hit::Picker);
-        c.fill_rounded_rect(picker, 6, if hov || self.picker_open { CARD_HOVER } else { rgb(0x2a, 0x2a, 0x2a) });
-        c.fill_rect(Rect::new(picker.x + 12, picker.y + 12, 32, 32), rgb(0x5c, 0x9e, 0x31));
-        c.fill_rect(Rect::new(picker.x + 12, picker.y + 22, 32, 22), rgb(0x86, 0x5f, 0x3e));
+        c.fill_rounded_rect(picker, 8, if hov || self.picker_open { CARD_HOVER } else { rgb(0x2a, 0x2a, 0x2a) });
+        super::icons::draw(c, Icon::Minecraft, picker.x + 12, picker.y + 12, 32);
         c.draw_text_clipped(&f.bold, picker.x + 56, picker.y + 25, VERSIONS[self.version].0, picker.w - 90, TEXT);
         c.draw_text_clipped(&f.ui, picker.x + 56, picker.y + 44, VERSIONS[self.version].1, picker.w - 90, DIM);
         let (cx, cy) = (picker.right() - 22, picker.y + 26);
@@ -395,8 +394,7 @@ impl McLauncher {
         let pw = 260.min((bar.w - 600).max(200));
         let play = Rect::new((bar.x + (bar.w - pw) / 2).max(picker.right() + 24), bar.y + 16, pw, 60);
         let hov = self.push(play, Hit::Play);
-        c.fill_rect(play, if hov { GREEN_HOVER } else { GREEN });
-        c.fill_rect(Rect::new(play.x, play.bottom() - 4, play.w, 4), rgba(0, 0, 0, 70));
+        c.fill_rounded_rect(play, 8, if hov { GREEN_HOVER } else { GREEN });
         c.draw_text_centered(&f.large, play, if installed() { "PLAY" } else { "INSTALL" }, TEXT);
         let who = match &self.account {
             Some(n) => format!("{}", n),
@@ -404,19 +402,19 @@ impl McLauncher {
         };
         let ww = f.ui.measure(&who).min(220);
         c.draw_text(&f.ui, bar.right() - 24 - ww, bar.y + 42, "Playing as", DIM);
-        c.draw_text_clipped(&f.bold, bar.right() - 24 - ww, bar.y + 62, &who, 220, TEXT);
+        c.draw_text_clipped(&f.heavy, bar.right() - 24 - ww, bar.y + 62, &who, 220, TEXT);
 
         if self.picker_open {
             let ih = 56;
             let list = Rect::new(picker.x, picker.y - 8 - ih * VERSIONS.len() as i32 - 8, 320, ih * VERSIONS.len() as i32 + 8);
             self.hits.push((Rect::new(0, 0, self.size.0, self.size.1), Hit::Backdrop));
-            c.draw_shadow(list, 6, 16, with_alpha(0x000000, 120));
-            c.fill_rounded_rect(list, 6, rgb(0x2a, 0x2a, 0x2a));
+            c.draw_shadow(list, 10, 16, with_alpha(0x000000, 120));
+            c.fill_rounded_rect(list, 10, rgb(0x2a, 0x2a, 0x2a));
             for i in 0..VERSIONS.len() {
                 let r = Rect::new(list.x + 4, list.y + 4 + i as i32 * ih, list.w - 8, ih);
                 let hov = self.push(r, Hit::PickVersion(i));
                 if hov || i == self.version {
-                    c.fill_rounded_rect(r, 5, if hov { CARD_HOVER } else { rgb(0x35, 0x35, 0x35) });
+                    c.fill_rounded_rect(r, 8, if hov { CARD_HOVER } else { rgb(0x35, 0x35, 0x35) });
                 }
                 c.draw_text(&f.bold, r.x + 14, r.y + 24, VERSIONS[i].0, TEXT);
                 c.draw_text(&f.ui, r.x + 14, r.y + 43, VERSIONS[i].1, DIM);
@@ -431,19 +429,18 @@ impl McLauncher {
         for i in 0..VERSIONS.len() {
             let r = Rect::new(x + 28, y, w - x - 56, 64);
             c.fill_rect(Rect::new(r.x, r.bottom(), r.w, 1), LINE);
-            c.fill_rect(Rect::new(r.x + 8, r.y + 16, 32, 32), rgb(0x5c, 0x9e, 0x31));
-            c.fill_rect(Rect::new(r.x + 8, r.y + 26, 32, 22), rgb(0x86, 0x5f, 0x3e));
+            super::icons::draw(c, Icon::Minecraft, r.x + 8, r.y + 16, 32);
             c.draw_text(&f.bold, r.x + 56, r.y + 28, VERSIONS[i].0, TEXT);
             c.draw_text(&f.ui, r.x + 56, r.y + 48, VERSIONS[i].1, DIM);
             let b = Rect::new(r.right() - 110, r.y + 14, 100, 36);
             let hov = self.push(b, Hit::InstallPlay(i));
-            c.fill_rect(b, if hov { GREEN_HOVER } else { GREEN });
+            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
             c.draw_text_centered(&f.bold, b, if installed() { "Play" } else { "Install" }, TEXT);
             y += 72;
         }
         let b = Rect::new(x + 28, y + 16, 220, 36);
         let hov = self.push(b, Hit::Folder);
-        c.fill_rounded_rect(b, 4, if hov { CARD_HOVER } else { CARD });
+        c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { CARD });
         c.draw_text_centered(&f.bold, b, "Open game folder", TEXT);
     }
 
@@ -466,7 +463,7 @@ impl McLauncher {
             let r = Rect::new(w - 28 - 300 + i as i32 * 76, y - 18, 72, 36);
             let hov = self.push(r, Hit::Memory(i));
             let sel = self.memory == i;
-            c.fill_rounded_rect(r, 4, if sel { GREEN } else if hov { CARD_HOVER } else { CARD });
+            c.fill_rounded_rect(r, 8, if sel { GREEN } else if hov { CARD_HOVER } else { CARD });
             c.draw_text_centered(&f.bold, r, MEMORY[i], TEXT);
         }
         y += 64;
@@ -497,26 +494,26 @@ impl McLauncher {
         self.hits.push((Rect::new(0, 0, w, h), Hit::Backdrop));
         c.fill_rect(Rect::new(0, 0, w, h), rgba(0, 0, 0, 150));
         let r = Rect::new((w - 460) / 2, (h - 300) / 2, 460, 300);
-        c.draw_shadow(r, 8, 20, with_alpha(0x000000, 140));
-        c.fill_rounded_rect(r, 8, rgb(0x2a, 0x2a, 0x2a));
+        c.draw_shadow(r, 12, 20, with_alpha(0x000000, 140));
+        c.fill_rounded_rect(r, 12, rgb(0x2a, 0x2a, 0x2a));
         c.draw_text_centered(&f.large, Rect::new(r.x, r.y + 20, r.w, 36), "Sign in with Microsoft", TEXT);
         if code.is_empty() {
             c.draw_text_centered(&f.ui, Rect::new(r.x + 20, r.y + 110, r.w - 40, 24), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
         } else {
             c.draw_text_centered(&f.ui, Rect::new(r.x, r.y + 70, r.w, 20), "Firefox opened the sign-in page. If it asks, enter:", DIM);
             let cr = Rect::new(r.x + 60, r.y + 100, r.w - 120, 60);
-            c.fill_rounded_rect(cr, 6, rgb(0x1b, 0x1b, 0x1b));
+            c.fill_rounded_rect(cr, 8, rgb(0x1b, 0x1b, 0x1b));
             c.draw_text_centered(&f.large, cr, &code, TEXT);
             c.draw_text_centered(&f.ui, Rect::new(r.x, r.y + 172, r.w, 20), &format!("at {}", url), DIM);
             c.draw_text_centered(&f.ui, Rect::new(r.x + 20, r.y + 196, r.w - 40, 20), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
             let b = Rect::new(r.x + 30, r.bottom() - 60, 190, 40);
             let hov = self.push(b, Hit::OpenPage);
-            c.fill_rect(b, if hov { GREEN_HOVER } else { GREEN });
+            c.fill_rounded_rect(b, 8, if hov { GREEN_HOVER } else { GREEN });
             c.draw_text_centered(&f.bold, b, "Open page again", TEXT);
         }
         let b = if code.is_empty() { Rect::new(r.x + (r.w - 190) / 2, r.bottom() - 60, 190, 40) } else { Rect::new(r.right() - 220, r.bottom() - 60, 190, 40) };
         let hov = self.push(b, Hit::CancelLogin);
-        c.fill_rect(b, if hov { CARD_HOVER } else { rgb(0x3a, 0x3a, 0x3a) });
+        c.fill_rounded_rect(b, 8, if hov { CARD_HOVER } else { rgb(0x3a, 0x3a, 0x3a) });
         c.draw_text_centered(&f.bold, b, if failed { "Close" } else { "Cancel" }, TEXT);
     }
 }

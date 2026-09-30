@@ -25,7 +25,7 @@ const PAD: i32 = 8;
 const TAG_SAVE_AS: u32 = 10;
 const TAG_UNSAVED: u32 = 11;
 
-static CLIPBOARD: Spin<String> = Spin::new(String::new());
+pub static CLIPBOARD: Spin<String> = Spin::new(String::new());
 
 type Pos = (usize, usize);
 

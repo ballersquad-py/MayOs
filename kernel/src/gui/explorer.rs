@@ -24,9 +24,9 @@ const HEADER_H: i32 = 28;
 const ROW_H: i32 = 28;
 const STATUS_H: i32 = 26;
 /// Grid (preview) view tile size.
-const TILE_W: i32 = 150;
-const TILE_H: i32 = 150;
-const THUMB_BOX: (i32, i32) = (128, 96);
+const TILE_W: i32 = 116;
+const TILE_H: i32 = 124;
+const THUMB_BOX: (i32, i32) = (96, 70);
 
 const TAG_NEW_FOLDER: u32 = 1;
 const TAG_NEW_FILE: u32 = 2;
@@ -60,6 +60,11 @@ enum Action {
     Refresh,
     TerminalHere,
     SetWallpaper,
+    OpenWithEditor,
+    OpenWithFirefox,
+    CopyPath,
+    Properties,
+    Sort(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,6 +123,8 @@ pub struct Explorer {
     message: Option<(String, bool, u64)>,
     pending: Option<String>,
     select_after_refresh: Option<String>,
+    /// 0 name, 1 size, 2 date (folders always first).
+    sort: u8,
     dragging_scrollbar: bool,
     focused: bool,
     /// Preview tiles instead of the detailed list.
@@ -160,6 +167,7 @@ impl Explorer {
             message: None,
             pending: None,
             select_after_refresh: None,
+            sort: 0,
             dragging_scrollbar: false,
             focused: true,
             grid: crate::settings::get().explorer_grid,
@@ -176,7 +184,20 @@ impl Explorer {
             .take()
             .or_else(|| self.selected.and_then(|i| self.entries.get(i)).map(|e| e.name.clone()));
         match fs::read_dir(&self.path) {
-            Ok(entries) => self.entries = entries,
+            Ok(mut entries) => {
+                let by = self.sort;
+                entries.sort_by(|a, b| {
+                    b.is_dir.cmp(&a.is_dir).then_with(|| match by {
+                        1 => b.size.cmp(&a.size),
+                        2 => {
+                            let t = |e: &DirEntry| (e.modified.year, e.modified.month, e.modified.day, e.modified.hour, e.modified.minute, e.modified.second);
+                            t(b).cmp(&t(a))
+                        }
+                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    })
+                });
+                self.entries = entries;
+            }
             Err(e) => {
                 self.entries.clear();
                 self.flash(format!("Cannot open {}: {}", self.path, e), true);
@@ -290,31 +311,43 @@ impl Explorer {
         out
     }
 
+    /// Sidebar entries: places, then devices (every mounted disk).
     fn places(&self) -> Vec<(String, String, Icon)> {
-        let mut v = alloc::vec![(String::from("MayOS Disk"), String::from("/"), Icon::Drive)];
+        let mut v = Vec::new();
         for (label, path, icon) in [
-            ("Documents", "/docs", Icon::Folder),
-            ("Pictures", "/pictures", Icon::Folder),
-            ("Videos", "/videos", Icon::Folder),
-            ("Programs", "/bin", Icon::Folder),
             ("Home", "/home", Icon::Home),
+            ("Documents", "/docs", Icon::Documents),
+            ("Downloads", "/home/Downloads", Icon::Downloads),
+            ("Pictures", "/pictures", Icon::Pictures),
+            ("Videos", "/videos", Icon::Video),
+            ("Programs", "/bin", Icon::Folder),
         ] {
             if fs::is_dir(path) {
                 v.push((String::from(label), String::from(path), icon));
             }
         }
-        // Other disks (e.g. a VHD with your own files attached in VirtualBox).
+        v.push((String::from("MayOS Disk"), String::from("/"), Icon::Drive));
         for m in fs::mounts() {
             if m.point != "/" {
-                let label = if m.label.is_empty() { m.point.trim_start_matches('/').to_string() } else { m.label.clone() };
+                let label = if m.label.trim().is_empty() || m.label.trim() == "NO NAME" { m.point.trim_start_matches('/').to_string() } else { m.label.trim().to_string() };
                 v.push((label, m.point, Icon::Drive));
             }
         }
         v
     }
 
+    /// Index of the first device in `places()`.
+    fn first_device(places: &[(String, String, Icon)]) -> usize {
+        places.iter().position(|p| p.1 == "/").unwrap_or(places.len())
+    }
+
     fn place_rect(&self, i: usize) -> Rect {
-        Rect::new(8, TOOLBAR_H + 34 + i as i32 * 30, SIDEBAR_W - 16, 28)
+        let d = Self::first_device(&self.places());
+        if i < d {
+            Rect::new(8, TOOLBAR_H + 34 + i as i32 * 30, SIDEBAR_W - 16, 28)
+        } else {
+            Rect::new(8, TOOLBAR_H + 34 + d as i32 * 30 + 34 + (i - d) as i32 * 44, SIDEBAR_W - 16, 42)
+        }
     }
 
     fn list_rect(&self) -> Rect {
@@ -493,6 +526,49 @@ impl Explorer {
                 }
             }
             Action::Paste => self.paste(),
+            Action::OpenWithEditor => {
+                if let Some(p) = self.selected_path() {
+                    ctx.open(Box::new(super::editor::Editor::open(&p)));
+                }
+            }
+            Action::OpenWithFirefox => {
+                if let Some(p) = self.selected_path()
+                    && let Err(e) = super::detached::run("/home", &format!("firefox file://{}", p.replace(' ', "%20")))
+                {
+                    self.flash(format!("Firefox: {}", e), true);
+                }
+            }
+            Action::CopyPath => {
+                let p = self.selected_path().unwrap_or_else(|| self.path.clone());
+                self.flash(format!("Copied {}", p), false);
+                *super::editor::CLIPBOARD.lock() = p;
+            }
+            Action::Properties => {
+                let p = self.selected_path().unwrap_or_else(|| self.path.clone());
+                if let Ok(e) = fs::stat(&p) {
+                    let (_, kind) = kind_of(&e, &fs::parent(&p));
+                    let size = if e.is_dir {
+                        let n = fs::read_dir(&p).map(|v| v.len()).unwrap_or(0);
+                        format!("{} item{}", n, if n == 1 { "" } else { "s" })
+                    } else {
+                        format!("{} ({} bytes)", fs::format_size(e.size as u64), e.size)
+                    };
+                    let msg = format!(
+                        "Type: {}\nSize: {}\nLocation: {}\nModified: {}\nCreated: {}",
+                        kind,
+                        size,
+                        fs::parent(&p),
+                        fs::format_time(&e.modified),
+                        fs::format_time(&e.created)
+                    );
+                    let title = if p == "/" { String::from("MayOS Disk") } else { fs::file_name(&p).to_string() };
+                    ctx.open_child(Box::new(Dialog::confirm(&title, &msg, "OK", false, 0, me)));
+                }
+            }
+            Action::Sort(k) => {
+                self.sort = k;
+                self.refresh();
+            }
             Action::Refresh => self.refresh(),
             Action::TerminalHere => {
                 let mut t = Terminal::new();
@@ -578,6 +654,10 @@ impl Explorer {
         let mut items: Vec<Option<(Action, &'static str)>> = Vec::new();
         if on_item {
             items.push(Some((Action::Open, "Open")));
+            if self.selected_path().map(|p| !fs::is_dir(&p)).unwrap_or(false) {
+                items.push(Some((Action::OpenWithEditor, "Open with Text Editor")));
+                items.push(Some((Action::OpenWithFirefox, "Open with Firefox")));
+            }
             items.push(None);
             items.push(Some((Action::Rename, "Rename\u{2026}")));
             items.push(Some((Action::Duplicate, "Duplicate")));
@@ -596,6 +676,14 @@ impl Explorer {
             items.push(Some((Action::Paste, "Paste")));
         }
         items.push(None);
+        if !on_item {
+            items.push(Some((Action::Sort(0), if self.sort == 0 { "\u{2713} Sort by Name" } else { "Sort by Name" })));
+            items.push(Some((Action::Sort(1), if self.sort == 1 { "\u{2713} Sort by Size" } else { "Sort by Size" })));
+            items.push(Some((Action::Sort(2), if self.sort == 2 { "\u{2713} Sort by Date" } else { "Sort by Date" })));
+            items.push(None);
+        }
+        items.push(Some((Action::CopyPath, "Copy Path")));
+        items.push(Some((Action::Properties, "Properties")));
         items.push(Some((Action::TerminalHere, "Open Terminal Here")));
         items.push(Some((Action::Refresh, "Refresh")));
         self.menu = Some(ContextMenu { x, y, items });
@@ -667,31 +755,38 @@ impl Explorer {
         c.fill_rect(side, theme::sidebar_bg());
         c.vline(SIDEBAR_W - 1, TOOLBAR_H, h - TOOLBAR_H, theme::separator());
         c.draw_text(&f.small_bold, 18, TOOLBAR_H + 24, "PLACES", theme::text_dim());
-        for (i, (label, path, icon)) in self.places().iter().enumerate() {
+        let places = self.places();
+        let d = Self::first_device(&places);
+        let mounts = fs::mounts();
+        for (i, (label, path, icon)) in places.iter().enumerate() {
             let r = self.place_rect(i);
+            if i == d {
+                c.draw_text(&f.small_bold, 18, r.y - 10, "DEVICES", theme::text_dim());
+            }
             let current = self.path == *path;
             if current {
                 c.fill_rounded_rect(r, 7, theme::shade(22));
             } else if self.hover == Hover::Place(i) {
                 c.fill_rounded_rect(r, 7, theme::shade(12));
             }
-            super::icons::draw(c, *icon, r.x + 8, r.y + 4, 20);
-            let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
             let font = if current { &f.bold } else { &f.ui };
-            c.draw_text(font, r.x + 36, base, label, theme::text());
-        }
-        // Disk usage.
-        if let Ok(s) = fs::stats() {
-            let y = h - 74;
-            c.draw_text(&f.small_bold, 18, y, "DISK", theme::text_dim());
-            let bar = Rect::new(18, y + 10, SIDEBAR_W - 36, 8);
-            c.fill_rounded_rect(bar, 4, theme::shade(30));
-            let total = s.total_bytes().max(1);
-            let used = total - s.free_bytes();
-            let uw = ((bar.w as u64 * used / total) as i32).max(8);
-            c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 4, theme::accent());
-            let text = format!("{} free", fs::format_size(s.free_bytes()));
-            c.draw_text_clipped(&f.ui, 18, y + 38, &text, SIDEBAR_W - 30, theme::text_dim());
+            if i < d {
+                super::icons::draw(c, *icon, r.x + 8, r.y + 4, 20);
+                let base = r.y + (r.h + f.ui.ascent - f.ui.descent) / 2;
+                c.draw_text_clipped(font, r.x + 36, base, label, r.w - 40, theme::text());
+            } else {
+                super::icons::draw(c, *icon, r.x + 6, r.y + 7, 28);
+                c.draw_text_clipped(font, r.x + 42, r.y + 17, label, r.w - 46, theme::text());
+                if let Some(m) = mounts.iter().find(|m| m.point == *path) {
+                    let bar = Rect::new(r.x + 42, r.y + 27, r.w - 52, 5);
+                    c.fill_rounded_rect(bar, 2, theme::shade(30));
+                    let total = m.stats.total_bytes().max(1);
+                    let used = total - m.stats.free_bytes();
+                    let uw = ((bar.w as u64 * used / total) as i32).max(4);
+                    let col = if used * 10 > total * 9 { theme::DANGER } else { theme::accent() };
+                    c.fill_rounded_rect(Rect::new(bar.x, bar.y, uw, bar.h), 2, col);
+                }
+            }
         }
     }
 
@@ -763,7 +858,7 @@ impl Explorer {
                 }
                 None => {
                     let (icon, _) = kind_of(e, &self.path);
-                    super::icons::draw(c, icon, bx.x + (bx.w - 76) / 2, bx.y + bx.h - 78, 76);
+                    super::icons::draw(c, icon, bx.x + (bx.w - 60) / 2, bx.y + bx.h - 62, 60);
                 }
             }
             // Name, centred (clipped with an ellipsis when too long).
@@ -1112,6 +1207,8 @@ impl App for Explorer {
                     Key::Char('d') if k.ctrl => self.run(Action::Duplicate, ctx),
                     Key::Char('N') if k.ctrl => self.run(Action::NewFolder, ctx),
                     Key::Char('n') if k.ctrl => self.run(Action::NewFile, ctx),
+                    Key::Char('e') if k.ctrl => self.run(Action::OpenWithEditor, ctx),
+                    Key::Enter if k.alt => self.run(Action::Properties, ctx),
                     Key::Char(ch) if !k.ctrl && !k.alt && n > 0 => {
                         // Type-to-select: jump to the next name starting with ch.
                         let lower = ch.to_ascii_lowercase();

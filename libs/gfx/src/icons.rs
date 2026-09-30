@@ -42,12 +42,14 @@ pub enum Icon {
     VolMed,
     VolLow,
     VolMute,
-    SetDisplay,
-    SetTheme,
-    SetSound,
-    SetNetwork,
-    SetMouse,
-    SetTime,
+    SymDisplay,
+    SymTheme,
+    SymSound,
+    SymNetwork,
+    SymMouse,
+    SymTime,
+    SymStorage,
+    SymAbout,
 
 }
 

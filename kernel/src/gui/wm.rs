@@ -2085,15 +2085,11 @@ impl Wm {
                         let active = focused_id == Some(id) && !*minimized;
                         let bg = if active { 44 } else if hovered { 30 } else { 14 };
                         if active {
-                            // An accent edge that follows the rounded bottom.
-                            let old_clip = c.push_clip(Rect::new(ir.x, ir.bottom() - 3, ir.w, 3));
-                            c.fill_rounded_rect(*ir, 7, accent);
-                            c.restore_clip(old_clip);
-                            let old_clip = c.push_clip(Rect::new(ir.x, ir.y, ir.w, ir.h - 3));
-                            c.fill_rounded_rect(*ir, 7, rgba(255, 255, 255, bg));
-                            c.restore_clip(old_clip);
+                            // A short accent pill under the middle, like the pinned apps'.
+                            c.fill_rounded_rect(*ir, 8, rgba(255, 255, 255, bg));
+                            c.fill_rounded_rect(Rect::new(ir.x + ir.w / 2 - 12, ir.bottom() - 4, 24, 3), 1, accent);
                         } else {
-                            c.fill_rounded_rect(*ir, 7, rgba(255, 255, 255, bg));
+                            c.fill_rounded_rect(*ir, 8, rgba(255, 255, 255, bg));
                         }
                         super::icons::draw(&mut c, *icon, ir.x + 8, ir.y + 8, 20);
                         let base = ir.y + (ir.h + f.ui.ascent - f.ui.descent) / 2;

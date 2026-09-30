@@ -25,9 +25,15 @@ CHARS = (
 )
 
 
+SS = 4  # supersampling: glyphs are drawn unhinted at 4x and averaged down
+
+
 def render(font, size, ch):
-    """Return (bearing_x, bearing_top, w, h, coverage bytes) for one glyph."""
-    pad = size * 2
+    """Return (bearing_x, bearing_top, w, h, coverage bytes) for one glyph.
+
+    `font` is the 4x font: outlines unhinted (no snapping, so spacing and
+    x-height stay true to the design), box-filtered down to `size`."""
+    pad = size * 2 * SS
     img = Image.new("L", (pad * 3, pad * 3), 0)
     ox, oy = pad, pad * 2
     ImageDraw.Draw(img).text((ox, oy), ch, font=font, fill=255, anchor="ls")
@@ -35,12 +41,30 @@ def render(font, size, ch):
     if bbox is None:
         return (0, 0, 0, 0, b"")
     l, t, r, b = bbox
-    return (l - ox, oy - t, r - l, b - t, img.crop(bbox).tobytes())
+    # Snap the box to whole output pixels around the origin.
+    l = ox + ((l - ox) // SS) * SS
+    t = oy + ((t - oy) // SS) * SS
+    r = ox + -(-(r - ox) // SS) * SS
+    b = oy + -(-(b - oy) // SS) * SS
+    small = img.crop((l, t, r, b)).resize(((r - l) // SS, (b - t) // SS), Image.BOX)
+    return ((l - ox) // SS, (oy - t) // SS, small.width, small.height, small.tobytes())
 
 
-def build(ttf, size, out):
-    font = ImageFont.truetype(ttf, size)
+def load(ttf, size, weight):
+    font = ImageFont.truetype(ttf, size * SS, layout_engine=ImageFont.Layout.BASIC)
+    if weight:
+        try:
+            axes = font.get_variation_axes()
+            font.set_variation_by_axes([weight if a.get("name", b"") in (b"Weight", "Weight") else a["default"] for a in axes])
+        except Exception:
+            pass
+    return font
+
+
+def build(ttf, size, out, weight=None):
+    font = load(ttf, size, weight)
     ascent, descent = font.getmetrics()
+    ascent, descent = -(-ascent // SS), -(-descent // SS)
     notdef = render(font, size, "\uffff")
     glyphs = []
     bitmaps = bytearray()
@@ -49,7 +73,7 @@ def build(ttf, size, out):
         # Skip characters the font lacks (they would render as .notdef).
         if cp > 0x7F and cp != 0xA0 and render(font, size, ch) == notdef:
             continue
-        advance = font.getlength(ch)
+        advance = font.getlength(ch) / SS
         bx, by, w, h, data = render(font, size, ch)
         glyphs.append((cp, round(advance * 16), bx, by, w, h, len(bitmaps)))
         bitmaps += data
@@ -63,6 +87,6 @@ def build(ttf, size, out):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        sys.exit("usage: mkfont.py <font.ttf> <pixel size> <out.mfnt>")
-    build(sys.argv[1], int(sys.argv[2]), sys.argv[3])
+    if len(sys.argv) not in (4, 5):
+        sys.exit("usage: mkfont.py <font.ttf> <pixel size> <out.mfnt> [weight]")
+    build(sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]) if len(sys.argv) == 5 else None)
