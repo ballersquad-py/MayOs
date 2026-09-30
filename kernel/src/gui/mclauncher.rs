@@ -205,6 +205,24 @@ fn fonts() -> LFonts {
     LFonts { ui: &f.mc_ui, bold: &f.mc_bold, heavy: &f.mc_bold, small_bold: &f.mc_small, large: &f.mc_title, pixel: &f.mc_pixel, pixel_big: &f.mc_pixel_big }
 }
 
+/// Split text into lines no wider than `w`.
+fn wrap(font: &gfx::Font, text: &str, w: i32) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let cand = if line.is_empty() { String::from(word) } else { format!("{} {}", line, word) };
+        if font.measure(&cand) > w && !line.is_empty() {
+            out.push(core::mem::replace(&mut line, String::from(word)));
+        } else {
+            line = cand;
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 /// A square text field (dark, 1 px border, green when editing).
 fn text_field(c: &mut Canvas, r: Rect, text: &str, editing: bool) {
     let f = fonts();
@@ -374,7 +392,12 @@ impl McLauncher {
             l.process = None;
             if !l.failed {
                 l.failed = true;
-                l.status = format!("Sign-in stopped (code {})", code);
+                // The program's own last words say more than an exit code.
+                let last = l.out.lines().rev().map(str::trim).find(|t| !t.is_empty() && !t.starts_with("MAYOS-LOGIN"));
+                l.status = match last {
+                    Some(t) => String::from(t.strip_prefix("Microsoft sign-in: ").unwrap_or(t)),
+                    None => format!("Sign-in stopped (code {})", code),
+                };
             }
             changed = true;
         }
@@ -597,7 +620,10 @@ impl McLauncher {
         c.fill_rect(r, rgb(0x2a, 0x2a, 0x2a));
         c.draw_text_centered(f.large, Rect::new(r.x, r.y + 20, r.w, 36), "Sign in with Microsoft", TEXT);
         if code.is_empty() {
-            c.draw_text_centered(f.ui, Rect::new(r.x + 20, r.y + 110, r.w - 40, 24), &status, if failed { rgb(0xff, 0x8a, 0x80) } else { DIM });
+            let col = if failed { rgb(0xff, 0x8a, 0x80) } else { DIM };
+            for (k, line) in wrap(f.ui, &status, r.w - 48).iter().take(6).enumerate() {
+                c.draw_text_centered(f.ui, Rect::new(r.x + 20, r.y + 76 + k as i32 * 22, r.w - 40, 22), line, col);
+            }
         } else {
             c.draw_text_centered(f.ui, Rect::new(r.x, r.y + 70, r.w, 20), "Firefox opened the sign-in page. If it asks, enter:", DIM);
             let cr = Rect::new(r.x + 60, r.y + 100, r.w - 120, 60);

@@ -366,6 +366,8 @@ pub struct Wm {
     menu_query: String,
     /// First app shown in the menu (scrolled with the wheel).
     menu_scroll: usize,
+    /// Super is held: (down, another key was used with it).
+    super_held: (bool, bool),
     /// Thumbnail of the window whose taskbar button is hovered:
     /// (window, since when hovered, picture, when made).
     preview: Option<(WindowId, u64, Option<Surface>, u64)>,
@@ -457,6 +459,7 @@ impl Wm {
             menu_hover: None,
             menu_query: String::new(),
             menu_scroll: 0,
+            super_held: (false, false),
             preview: None,
             apps_ok: APPS.iter().map(|a| !matches!(a.launch, Launch::Cmd(..))).collect(),
             apps_checked: 0,
@@ -1534,15 +1537,36 @@ impl Wm {
     }
 
     fn key(&mut self, k: KeyEvent) {
-        if k.pressed {
-            if k.key == Key::Super {
-                if self.menu_open {
-                    self.close_menu();
-                } else {
-                    self.open_menu();
+        // Super alone (pressed and released) toggles the menu; Super with
+        // another key is a shortcut: Up maximises, Down minimises.
+        if k.key == Key::Super {
+            if k.pressed {
+                self.super_held = (true, false);
+            } else {
+                let used = self.super_held.1;
+                self.super_held = (false, false);
+                if !used {
+                    if self.menu_open {
+                        self.close_menu();
+                    } else {
+                        self.open_menu();
+                    }
                 }
-                return;
             }
+            return;
+        }
+        if k.pressed && self.super_held.0 {
+            self.super_held.1 = true;
+            if let Some(id) = self.focused {
+                match k.key {
+                    Key::Up => self.toggle_maximize(id),
+                    Key::Down => self.minimize(id),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if k.pressed {
             if self.menu_open {
                 match k.key {
                     Key::Escape => self.close_menu(),

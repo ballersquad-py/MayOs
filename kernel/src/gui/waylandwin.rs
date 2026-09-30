@@ -108,6 +108,13 @@ impl App for WaylandWindow {
             AppEvent::Focus(on) => {
                 self.focused = on;
                 self.win.focus(on);
+                // xdg-shell carries "activated" in configure: programs such as
+                // Xwayland treat themselves as unfocused until they get one
+                // (Minecraft then pauses). Same size, new state.
+                let size = if self.configured != (0, 0) { self.configured } else { self.size };
+                if size != (0, 0) {
+                    self.win.resize(size.0, size.1, on);
+                }
             }
             AppEvent::Resized { w, h } => {
                 self.size = (w, h);

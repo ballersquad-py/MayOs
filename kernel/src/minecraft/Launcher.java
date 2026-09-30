@@ -352,6 +352,10 @@ public class Launcher {
         System.out.println("Memory: " + memory + " (change with --memory 4G or echo 4G > /etc/minecraft-memory)");
         cmd.add("-Xms" + (memory.matches("\\d+[gG]") && Integer.parseInt(memory.replaceAll("\\D", "")) > 1 ? "1G" : "256M"));
         cmd.add("-Xmx" + memory);
+        // Mojang's launcher's garbage collector settings: short pauses, so
+        // no stutter every few seconds.
+        Collections.addAll(cmd, "-XX:+UnlockExperimentalVMOptions", "-XX:+UseG1GC", "-XX:G1NewSizePercent=20",
+                "-XX:G1ReservePercent=20", "-XX:MaxGCPauseMillis=50", "-XX:G1HeapRegionSize=32M");
         // (libglfw-mayos.so: Alpine's GLFW without the window icon call,
         // which fails on Wayland and stops older versions.)
         // Use Alpine's (musl) GLFW, OpenAL and Mesa instead of the glibc
@@ -424,6 +428,8 @@ public class Launcher {
         } else {
             pb.environment().putIfAbsent("LIBGL_ALWAYS_SOFTWARE", "1");
             pb.environment().putIfAbsent("GALLIUM_DRIVER", "llvmpipe");
+            // llvmpipe draws with up to 16 threads by default: use every core.
+            pb.environment().putIfAbsent("LP_NUM_THREADS", String.valueOf(Math.min(Math.max(cpus, 1), 32)));
         }
         if (debug) {
             pb.environment().put("EGL_LOG_LEVEL", "debug");
@@ -1043,7 +1049,13 @@ class Account {
         String id = clientId();
         Map<String, Object> dc = post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
             form(Map.of("client_id", id, "scope", "XboxLive.signin offline_access")), "application/x-www-form-urlencoded");
-        if (dc.get("user_code") == null) throw new IOException("Microsoft sign-in could not start: " + dc);
+        if (dc.get("user_code") == null) {
+            String err = String.valueOf(dc.get("error"));
+            if (err.equals("unauthorized_client") || err.equals("invalid_client"))
+                throw new IOException("Microsoft does not accept the app ID " + id + " (it is not a registered app for personal accounts). "
+                    + "Put an app ID approved for Minecraft in the launcher's Settings.");
+            throw new IOException("Microsoft sign-in could not start: " + dc.getOrDefault("error_description", dc));
+        }
         System.out.println();
         System.out.println("  On your phone or another computer, open:  " + dc.get("verification_uri"));
         System.out.println("  and enter the code:  " + dc.get("user_code"));
