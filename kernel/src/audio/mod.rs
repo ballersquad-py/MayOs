@@ -5,6 +5,7 @@
 //! ahead of the hardware.
 
 pub mod ac97;
+pub mod hda;
 pub mod sounds;
 pub mod wav;
 
@@ -15,6 +16,62 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use ac97::Ac97;
+use hda::Hda;
+
+/// The sound card: AC'97 (virtual machines) or HD Audio (real PCs). Both
+/// play a ring of 32 buffers of 1024 frames.
+pub enum Card {
+    Ac97(Ac97),
+    Hda(Hda),
+}
+
+macro_rules! card {
+    ($self:ident, $d:ident => $e:expr) => {
+        match $self {
+            Card::Ac97($d) => $e,
+            Card::Hda($d) => $e,
+        }
+    };
+}
+
+impl Card {
+    fn buffer(&mut self, i: usize) -> &mut [i16] {
+        card!(self, d => d.buffer(i))
+    }
+    fn current(&self) -> u8 {
+        card!(self, d => d.current())
+    }
+    fn last_valid(&self) -> u8 {
+        card!(self, d => d.last_valid())
+    }
+    fn set_last_valid(&mut self, i: u8) {
+        card!(self, d => d.set_last_valid(i))
+    }
+    fn kick(&mut self) {
+        card!(self, d => d.kick())
+    }
+    fn stop(&mut self) {
+        card!(self, d => d.stop())
+    }
+    fn is_running(&self) -> bool {
+        card!(self, d => d.is_running())
+    }
+    fn set_volume(&mut self, p: u8, mute: bool) {
+        card!(self, d => d.set_volume(p, mute))
+    }
+}
+
+impl From<Ac97> for Card {
+    fn from(d: Ac97) -> Card {
+        Card::Ac97(d)
+    }
+}
+
+impl From<Hda> for Card {
+    fn from(d: Hda) -> Card {
+        Card::Hda(d)
+    }
+}
 
 use crate::sync::{Once, Spin};
 
@@ -25,7 +82,7 @@ struct Voice {
 }
 
 struct Mixer {
-    dev: Ac97,
+    dev: Card,
     voices: Vec<Voice>,
     idle_since: u64,
 }
@@ -121,9 +178,10 @@ pub fn glitch_stats() -> (u64, u64, u64) {
 /// Buffers mixed ahead of the hardware (8 x 21 ms). VirtualBox's AC'97
 /// prefetches well ahead of what it plays; with a short queue it keeps
 /// hitting the end, stopping and restarting, which you hear as dropouts.
-const AHEAD: u8 = 8;
+pub(crate) const AHEAD: u8 = 8;
 
-pub fn init(dev: Ac97, name: &str) {
+pub fn init(dev: impl Into<Card>, name: &str) {
+    let dev = dev.into();
     DEVICE_NAME.set(String::from(name));
     *MIXER.lock() = Some(Mixer { dev, voices: Vec::new(), idle_since: 0 });
     apply_volume();

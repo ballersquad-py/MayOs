@@ -126,6 +126,17 @@ fn init_threaded_devices() {
                 None => kprintln!("audio: AC'97 init failed"),
             }
         }
+        // HD Audio (class 04:03). Controllers without an analog output
+        // (a graphics card's HDMI audio) are skipped.
+        if d.class == 0x04 && d.subclass == 0x03 && !audio::is_present() {
+            match audio::hda::Hda::new(&d) {
+                Some(dev) => {
+                    kprintln!("audio: HD Audio {:04x}:{:04x} at {:02x}:{:02x}.{}", d.vendor, d.device, d.bus, d.slot, d.func);
+                    audio::init(dev, "High Definition Audio");
+                }
+                None => kprintln!("audio: HD Audio {:04x}:{:04x}: no analog output", d.vendor, d.device),
+            }
+        }
     }
 }
 
