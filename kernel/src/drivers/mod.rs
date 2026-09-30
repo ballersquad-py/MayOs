@@ -17,3 +17,4 @@ pub mod nvme;
 pub mod rtl8169;
 pub mod xhci;
 pub mod usbnet;
+pub mod igc;

@@ -11,7 +11,8 @@ use crate::mem::{paging, DmaBuf};
 use net::Mac;
 
 pub const VENDOR: u16 = 0x10ec;
-pub const DEVICE_IDS: &[u16] = &[0x8168, 0x8161, 0x8169, 0x8136];
+/// 8125/8126: the 2.5G/5G chips (a few registers moved).
+pub const DEVICE_IDS: &[u16] = &[0x8168, 0x8161, 0x8169, 0x8136, 0x8125, 0x3000, 0x8126];
 
 const MAR0: usize = 0x08;
 const TNPDS: usize = 0x20;
@@ -46,6 +47,8 @@ pub struct Rtl8169 {
     tx_cur: usize,
     pub mac: Mac,
     pub model: &'static str,
+    /// RTL8125/8126 register layout.
+    r8125: bool,
 }
 
 impl Rtl8169 {
@@ -77,6 +80,8 @@ impl Rtl8169 {
         let model = match pci.device {
             0x8136 => "Realtek RTL8101E/8102E Fast Ethernet",
             0x8169 => "Realtek RTL8169 Gigabit Ethernet",
+            0x8125 | 0x3000 => "Realtek RTL8125 2.5G Ethernet",
+            0x8126 => "Realtek RTL8126 5G Ethernet",
             _ => "Realtek RTL8111/8168 Gigabit Ethernet",
         };
         let mut nic = Rtl8169 {
@@ -89,6 +94,7 @@ impl Rtl8169 {
             tx_cur: 0,
             mac: Mac::ZERO,
             model,
+            r8125: matches!(pci.device, 0x8125 | 0x3000 | 0x8126),
         };
         // Reset.
         nic.w8(CR, 0x10);
@@ -127,8 +133,13 @@ impl Rtl8169 {
         }
 
         nic.w8(CR9346, 0xc0); // unlock config registers
-        nic.w16(IMR, 0); // polled
-        nic.w16(ISR, 0xffff);
+        if nic.r8125 {
+            nic.w32(0x38, 0); // interrupt mask (polled)
+            nic.w32(0x3c, 0xffff_ffff);
+        } else {
+            nic.w16(IMR, 0); // polled
+            nic.w16(ISR, 0xffff);
+        }
         nic.w16(RMS, BUF as u16);
         nic.w8(MTPS, 0x3b);
         nic.w32(TNPDS, nic.tx_ring.phys as u32);
@@ -139,7 +150,12 @@ impl Rtl8169 {
         // Unlimited DMA bursts, normal inter-frame gap.
         nic.w32(TCR, (nic.r32(TCR) & !0x0700) | 0x0300_0700);
         // Our MAC, broadcast and multicast; no RX threshold; unlimited DMA.
-        nic.w32(RCR, (nic.r32(RCR) & !0xffff) | 0xe70e);
+        if nic.r8125 {
+            // Default RX fetch count, unlimited DMA, accept ours/broadcast/multicast.
+            nic.w32(RCR, (8 << 27) | (7 << 8) | 0x0e);
+        } else {
+            nic.w32(RCR, (nic.r32(RCR) & !0xffff) | 0xe70e);
+        }
         nic.w32(MAR0, 0xffff_ffff);
         nic.w32(MAR0 + 4, 0xffff_ffff);
         nic.w8(CR9346, 0x00);
@@ -152,7 +168,9 @@ impl Rtl8169 {
 
     pub fn speed_mbps(&self) -> u32 {
         let s = self.r8(PHYSTATUS);
-        if s & 0x10 != 0 {
+        if self.r8125 && unsafe { read_volatile((self.mmio + PHYSTATUS) as *const u16) } & 0x400 != 0 {
+            2500
+        } else if s & 0x10 != 0 {
             1000
         } else if s & 0x08 != 0 {
             100
@@ -187,7 +205,11 @@ impl Rtl8169 {
         }
         self.tx_cur = (self.tx_cur + 1) % N_TX;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.w8(TPPOLL, 0x40);
+        if self.r8125 {
+            self.w16(0x90, 1); // TxPoll_8125: normal priority queue
+        } else {
+            self.w8(TPPOLL, 0x40);
+        }
         true
     }
 

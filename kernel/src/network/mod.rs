@@ -17,6 +17,7 @@ pub mod httpd;
 pub mod tcp;
 
 use crate::drivers::e1000::E1000;
+use crate::drivers::igc::Igc;
 use crate::drivers::rtl8169::Rtl8169;
 
 /// The network card: any of the supported drivers.
@@ -29,12 +30,19 @@ pub struct Nic {
 enum NicDev {
     E1000(E1000),
     Rtl(Rtl8169),
+    Igc(Igc),
     Usb(alloc::sync::Arc<crate::drivers::usbnet::UsbNet>),
 }
 
 impl From<E1000> for Nic {
     fn from(n: E1000) -> Nic {
         Nic { mac: n.mac, model: n.model, dev: NicDev::E1000(n) }
+    }
+}
+
+impl From<Igc> for Nic {
+    fn from(n: Igc) -> Nic {
+        Nic { mac: n.mac, model: n.model, dev: NicDev::Igc(n) }
     }
 }
 
@@ -49,6 +57,7 @@ impl Nic {
         match &self.dev {
             NicDev::E1000(n) => n.link_up(),
             NicDev::Rtl(n) => n.link_up(),
+            NicDev::Igc(n) => n.link_up(),
             NicDev::Usb(n) => n.link_up(),
         }
     }
@@ -56,6 +65,7 @@ impl Nic {
         match &self.dev {
             NicDev::E1000(n) => n.speed_mbps(),
             NicDev::Rtl(n) => n.speed_mbps(),
+            NicDev::Igc(n) => n.speed_mbps(),
             NicDev::Usb(_) => 480,
         }
     }
@@ -63,6 +73,7 @@ impl Nic {
         match &mut self.dev {
             NicDev::E1000(n) => n.send(f),
             NicDev::Rtl(n) => n.send(f),
+            NicDev::Igc(n) => n.send(f),
             NicDev::Usb(n) => n.send(f),
         }
     }
@@ -70,6 +81,7 @@ impl Nic {
         match &mut self.dev {
             NicDev::E1000(n) => n.recv(),
             NicDev::Rtl(n) => n.recv(),
+            NicDev::Igc(n) => n.recv(),
             NicDev::Usb(n) => n.recv(),
         }
     }

@@ -10,7 +10,19 @@ use super::pci::PciDevice;
 use crate::mem::{paging, DmaBuf};
 use net::Mac;
 
-pub const DEVICE_IDS: &[u16] = &[0x100e, 0x100f, 0x1004, 0x100c, 0x10d3, 0x10ea, 0x1502, 0x153a];
+pub const DEVICE_IDS: &[u16] = &[
+    0x100e, 0x100f, 0x1004, 0x100c, 0x10d3, 0x10ea, 0x1502, 0x1503, 0x153a, 0x153b,
+    // I217/I218/I219 (the "PCH" chips of desktop and laptop boards, 2013+).
+    0x155a, 0x1559, 0x15a0, 0x15a1, 0x15a2, 0x15a3, 0x156f, 0x1570, 0x15b7, 0x15b8, 0x15b9, 0x15bb, 0x15bc, 0x15bd, 0x15be,
+    0x15d6, 0x15d7, 0x15d8, 0x15e3, 0x15df, 0x15e0, 0x15e1, 0x15e2, 0x0d4c, 0x0d4d, 0x0d4e, 0x0d4f, 0x0d53, 0x0d55,
+    0x15f4, 0x15f5, 0x15f9, 0x15fa, 0x15fb, 0x15fc, 0x1a1c, 0x1a1d, 0x1a1e, 0x1a1f, 0x0dc5, 0x0dc6, 0x0dc7, 0x0dc8,
+    0x550a, 0x550b, 0x550c, 0x550d, 0x550e, 0x550f, 0x5510, 0x5511, 0x57a0, 0x57a1,
+];
+
+/// The integrated (PCH) chips: I217, I218, I219.
+fn is_pch(id: u16) -> bool {
+    !matches!(id, 0x100e | 0x100f | 0x1004 | 0x100c | 0x10d3 | 0x10ea)
+}
 
 const CTRL: usize = 0x0000;
 const STATUS: usize = 0x0008;
@@ -76,7 +88,10 @@ impl E1000 {
         }
         let mmio = paging::map_mmio(bar, 128 * 1024) as usize;
         let model = match pci.device {
-            0x10d3 | 0x10ea | 0x1502 | 0x153a => "Intel 82574L-class Gigabit Ethernet",
+            0x10d3 | 0x10ea => "Intel 82574L-class Gigabit Ethernet",
+            0x1502 | 0x1503 => "Intel 82579 Gigabit Ethernet",
+            0x153a | 0x153b | 0x155a | 0x1559 | 0x15a0..=0x15a3 => "Intel I217/I218 Gigabit Ethernet",
+            d if is_pch(d) => "Intel I219 Gigabit Ethernet",
             _ => "Intel PRO/1000 (8254x) Gigabit Ethernet",
         };
         let mut nic = E1000 {
@@ -90,6 +105,22 @@ impl E1000 {
             mac: Mac::ZERO,
             model,
         };
+        if is_pch(pci.device) {
+            // The PHY may be in "ultra low power" after Windows shut down:
+            // ask the management engine to wake it (Linux e1000e does this).
+            const FWSM: usize = 0x5b54;
+            const H2ME: usize = 0x5b50;
+            if nic.r(FWSM) & (1 << 15) != 0 {
+                nic.w(H2ME, (nic.r(H2ME) & !(1 << 11)) | (1 << 12));
+                for _ in 0..30 {
+                    if nic.r(FWSM) & (1 << 10) == 0 {
+                        break;
+                    }
+                    crate::proc::sched::sleep_ms(10);
+                }
+                nic.w(H2ME, nic.r(H2ME) & !(1 << 12));
+            }
+        }
         // Reset and mask all interrupts (we poll).
         nic.w(IMC, 0xffff_ffff);
         nic.w(CTRL, nic.r(CTRL) | (1 << 26));
@@ -99,6 +130,8 @@ impl E1000 {
             }
         }
         nic.w(IMC, 0xffff_ffff);
+        // The PCH chips reload their MAC address and PHY setup after a reset.
+        crate::proc::sched::sleep_ms(20);
         // Set link up, auto speed detection.
         nic.w(CTRL, (nic.r(CTRL) | (1 << 6) | (1 << 5)) & !(1 << 3) & !(1 << 31) & !(1 << 7));
 
@@ -108,7 +141,8 @@ impl E1000 {
         let mut mac = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
         if mac == [0; 6] {
             for i in 0..3 {
-                let v = nic.eeprom_read(i)?;
+                // (No EEPROM on the PCH chips: a made-up local address then.)
+                let v = nic.eeprom_read(i).unwrap_or([0x4d02, 0x7961, pci.device][i as usize]);
                 mac[i as usize * 2] = v as u8;
                 mac[i as usize * 2 + 1] = (v >> 8) as u8;
             }

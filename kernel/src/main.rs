@@ -109,6 +109,15 @@ fn init_threaded_devices() {
                 None => kprintln!("net: e1000 init failed"),
             }
         }
+        if d.vendor == drivers::igc::VENDOR && drivers::igc::DEVICE_IDS.contains(&d.device) && !network::is_present() {
+            match drivers::igc::Igc::new(&d) {
+                Some(nic) => {
+                    kprintln!("net: {} mac {}, link {}", nic.model, nic.mac, if nic.link_up() { "up" } else { "down" });
+                    network::init(nic.into());
+                }
+                None => kprintln!("net: Intel {:04x} init failed", d.device),
+            }
+        }
         if d.vendor == drivers::rtl8169::VENDOR && drivers::rtl8169::DEVICE_IDS.contains(&d.device) && !network::is_present() {
             match drivers::rtl8169::Rtl8169::new(&d) {
                 Some(nic) => {
