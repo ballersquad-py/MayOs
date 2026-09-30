@@ -4,6 +4,7 @@
 //! compositor once IPC and shared memory exist (Phase 2).
 
 pub mod about;
+pub mod taskmgr;
 pub mod app;
 pub mod browser;
 pub mod canvas2d;
@@ -85,6 +86,7 @@ pub fn launch(kind: AppKind) -> Option<Box<dyn App>> {
         AppKind::Editor => Box::new(editor::Editor::new_empty()),
         AppKind::Settings => settings_app::boxed(),
         AppKind::About => Box::new(about::About::new()),
+        AppKind::TaskManager => Box::new(taskmgr::TaskManager::new()),
         AppKind::Browser => Box::new(browser::Browser::new(None)),
         AppKind::Other => return None,
     })

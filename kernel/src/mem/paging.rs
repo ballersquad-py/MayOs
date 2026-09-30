@@ -239,6 +239,28 @@ pub fn destroy_address_space(pml4: u64) {
     pmm::free_frame(pml4);
 }
 
+/// Pages of its own (not borrowed) mapped in the user half: the memory a
+/// process uses, for the task manager.
+pub fn count_user_pages(pml4: u64) -> u64 {
+    let _g = LOCK.lock();
+    fn count(t: u64, level: u32) -> u64 {
+        let mut n = 0;
+        for &e in table(t).iter() {
+            if e & PRESENT == 0 {
+                continue;
+            }
+            if level > 1 {
+                n += count(e & ADDR_MASK, level - 1);
+            } else if e & BORROWED == 0 {
+                n += 1;
+            }
+        }
+        n
+    }
+    let top = table(pml4);
+    (0..256).filter(|&i| top[i] & PRESENT != 0).map(|i| count(top[i] & ADDR_MASK, 3)).sum()
+}
+
 /// Copy the user half of an address space (fork): every present 4 KiB
 /// page gets a private copy, except borrowed pages (shared buffers),
 /// which are mapped again.

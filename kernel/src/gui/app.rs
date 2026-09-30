@@ -145,5 +145,6 @@ pub enum AppKind {
     Settings,
     About,
     Browser,
+    TaskManager,
     Other,
 }

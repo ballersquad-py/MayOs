@@ -226,6 +226,7 @@ const DOCK: &[(AppKind, Icon, &str)] = &[
     (AppKind::Editor, Icon::Editor, "Text Editor"),
     (AppKind::Browser, Icon::Browser, "Browser"),
     (AppKind::Settings, Icon::Settings, "Settings"),
+    (AppKind::TaskManager, Icon::Tasks, "Task Manager"),
     (AppKind::About, Icon::Info, "About MayOS"),
 ];
 
@@ -1250,6 +1251,11 @@ impl Wm {
             }
             if k.ctrl && k.alt && k.key == Key::Char('e') {
                 self.open_kind(AppKind::Explorer);
+                return;
+            }
+            // Task Manager: Ctrl+Shift+Esc (or Ctrl+Alt+Delete).
+            if k.ctrl && ((k.shift && k.key == Key::Escape) || (k.alt && k.key == Key::Delete)) {
+                self.dock_click(AppKind::TaskManager, false);
                 return;
             }
             if k.ctrl && k.alt && k.key == Key::Char('s') {

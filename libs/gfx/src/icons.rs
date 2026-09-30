@@ -20,6 +20,7 @@ pub enum Icon {
     Video,
     Music,
     Browser,
+    Tasks,
 }
 
 pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
@@ -35,6 +36,7 @@ pub fn draw(c: &mut Canvas, icon: Icon, x: i32, y: i32, s: i32) {
         }
         Icon::Program => program(c, x, y, s),
         Icon::Terminal => terminal(c, x, y, s),
+        Icon::Tasks => tasks(c, x, y, s),
         Icon::Explorer => {
             app_tile(c, x, y, s, rgb(0x3d, 0x8b, 0xfd), rgb(0x1f, 0x5f, 0xd6));
             folder(c, x + s / 5, y + s / 5, s * 3 / 5);
@@ -178,6 +180,17 @@ fn program(c: &mut Canvas, x: i32, y: i32, s: i32) {
         c.fill_rect(Rect::new(px + i, py + 2 * (s / 7) - i, t, t), g);
     }
     c.fill_rect(Rect::new(px + s / 5, py + 2 * (s / 7), s / 5, t), g);
+}
+
+fn tasks(c: &mut Canvas, x: i32, y: i32, s: i32) {
+    app_tile(c, x, y, s, rgb(0x2f, 0xb3, 0x7a), rgb(0x1a, 0x7f, 0x55));
+    let g = rgb(0xf2, 0xfb, 0xf6);
+    let w = (s / 9).max(2);
+    let base = y + s * 3 / 4;
+    for (i, hgt) in [3, 6, 4, 8].iter().enumerate() {
+        let hh = s * hgt / 16;
+        c.fill_rect(Rect::new(x + s / 5 + i as i32 * (w + w / 2 + 1), base - hh, w, hh), g);
+    }
 }
 
 fn terminal(c: &mut Canvas, x: i32, y: i32, s: i32) {
