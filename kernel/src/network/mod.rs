@@ -17,6 +17,58 @@ pub mod httpd;
 pub mod tcp;
 
 use crate::drivers::e1000::E1000;
+use crate::drivers::rtl8169::Rtl8169;
+
+/// The network card: any of the supported drivers.
+pub struct Nic {
+    pub mac: Mac,
+    pub model: &'static str,
+    dev: NicDev,
+}
+
+enum NicDev {
+    E1000(E1000),
+    Rtl(Rtl8169),
+}
+
+impl From<E1000> for Nic {
+    fn from(n: E1000) -> Nic {
+        Nic { mac: n.mac, model: n.model, dev: NicDev::E1000(n) }
+    }
+}
+
+impl From<Rtl8169> for Nic {
+    fn from(n: Rtl8169) -> Nic {
+        Nic { mac: n.mac, model: n.model, dev: NicDev::Rtl(n) }
+    }
+}
+
+impl Nic {
+    pub fn link_up(&self) -> bool {
+        match &self.dev {
+            NicDev::E1000(n) => n.link_up(),
+            NicDev::Rtl(n) => n.link_up(),
+        }
+    }
+    pub fn speed_mbps(&self) -> u32 {
+        match &self.dev {
+            NicDev::E1000(n) => n.speed_mbps(),
+            NicDev::Rtl(n) => n.speed_mbps(),
+        }
+    }
+    fn send(&mut self, f: &[u8]) -> bool {
+        match &mut self.dev {
+            NicDev::E1000(n) => n.send(f),
+            NicDev::Rtl(n) => n.send(f),
+        }
+    }
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        match &mut self.dev {
+            NicDev::E1000(n) => n.recv(),
+            NicDev::Rtl(n) => n.recv(),
+        }
+    }
+}
 use crate::proc::sched;
 use crate::sync::Spin;
 use crate::time::uptime_ms;
@@ -54,7 +106,7 @@ struct Pending {
 }
 
 struct Iface {
-    nic: E1000,
+    nic: Nic,
     ip: Ipv4,
     mask: Ipv4,
     gateway: Ipv4,
@@ -86,7 +138,7 @@ pub fn is_present() -> bool {
 }
 
 /// Take ownership of the NIC and start the network thread.
-pub fn init(nic: E1000) {
+pub fn init(nic: Nic) {
     let seed = (crate::arch::cpu::rdtsc() as u32) ^ 0x4d61_794f;
     *IFACE.lock() = Some(Iface {
         nic,

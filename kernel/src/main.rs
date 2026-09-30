@@ -102,9 +102,18 @@ fn init_threaded_devices() {
             match drivers::e1000::E1000::new(&d) {
                 Some(nic) => {
                     kprintln!("net: {} mac {}, link {}", nic.model, nic.mac, if nic.link_up() { "up" } else { "down" });
-                    network::init(nic);
+                    network::init(nic.into());
                 }
                 None => kprintln!("net: e1000 init failed"),
+            }
+        }
+        if d.vendor == drivers::rtl8169::VENDOR && drivers::rtl8169::DEVICE_IDS.contains(&d.device) && !network::is_present() {
+            match drivers::rtl8169::Rtl8169::new(&d) {
+                Some(nic) => {
+                    kprintln!("net: {} mac {}, link {}", nic.model, nic.mac, if nic.link_up() { "up" } else { "down" });
+                    network::init(nic.into());
+                }
+                None => kprintln!("net: Realtek init failed"),
             }
         }
         if d.vendor == audio::ac97::VENDOR_INTEL && audio::ac97::DEVICE_IDS.contains(&d.device) && !audio::is_present() {

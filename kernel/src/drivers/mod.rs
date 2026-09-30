@@ -14,3 +14,4 @@ pub mod ahci;
 pub mod ide;
 pub mod vmmdev;
 pub mod nvme;
+pub mod rtl8169;
