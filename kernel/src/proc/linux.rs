@@ -946,6 +946,9 @@ fn virtual_file(path: &str) -> Option<Desc> {
         "/etc/group" => String::from("root:x:0:\nuser:x:1000:\n"),
         "/etc/hostname" => String::from("mayos\n"),
         "/etc/timezone" => String::from("Etc/UTC\n"),
+        // Chromium/dbus read the machine id (through `cat | head`); without it
+        // that pipeline never finishes.
+        "/etc/machine-id" | "/var/lib/dbus/machine-id" => String::from("7f3a9c2e5b8d4e61a0c3f9b2d6e8a147\n"),
         // UTC as a TZif file: without it, ICU (Chromium) scans every zone.
         "/etc/localtime" => return Some(Desc::Virtual { data: TZIF_UTC.to_vec(), pos: 0 }),
         "/etc/os-release" => String::from("NAME=MayOS\nID=mayos\nPRETTY_NAME=\"MayOS\"\n"),
