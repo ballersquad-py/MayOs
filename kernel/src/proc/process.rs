@@ -275,6 +275,14 @@ fn finish(p: &Arc<Process>, code: i64) {
         }
         first
     };
+    // Always on record which Linux process ended and how, so a silent
+    // "exited with code 1" can be traced back to the process that caused it.
+    if first && p.linux.is_some() {
+        crate::kprintln!("[exit] pid {} ({}) parent {} code {}", p.pid, p.name, p.parent, code);
+        if code != 0 {
+            p.console.write(alloc::format!("[mayos: pid {} ({}) exited with code {}]\n", p.pid, p.name, code).as_bytes());
+        }
+    }
     super::sched::notify(); // wait4, pipe readers
     // Linux parents hear about it through SIGCHLD.
     if first && p.parent != 0
