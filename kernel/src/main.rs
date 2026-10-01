@@ -20,6 +20,7 @@ mod mem;
 mod network;
 mod parallel;
 mod pkg;
+mod lunar;
 mod power;
 mod proc;
 mod selftest;

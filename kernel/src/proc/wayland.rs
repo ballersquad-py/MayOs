@@ -1577,7 +1577,7 @@ impl State {
         let shm = Shm::new();
         shm.write_at(0, KEYMAP);
         shm.write_at(KEYMAP.len() as u64, &[0]);
-        let d: DescRef = Arc::new(Mutex::new(Desc::Memfd { shm, pos: 0 }));
+        let d: DescRef = Arc::new(Mutex::new(Desc::Memfd { shm, pos: 0, ro: false }));
         self.ev(k, 0, vec![A::U(1), A::Fd(d), A::U(KEYMAP.len() as u32 + 1)]);
         if self.version(k) >= 4 {
             self.ev(k, 5, vec![A::I(25), A::I(500)]);

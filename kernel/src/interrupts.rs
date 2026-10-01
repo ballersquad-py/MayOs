@@ -117,6 +117,8 @@ fn exception(frame: &mut TrapFrame) -> u64 {
             17 => (7, 1, frame.rip), // BUS_ADRALN
             _ => (11, 128, 0),
         };
+        // Logged even when the program catches it (crash reporters do).
+        crate::kprintln!("[fault] pid {} tid {} {} -> signal {} at rip={:#x} addr={:#x} err={:#x}", p.pid, sched::current_id(), name, sig, frame.rip, cr2, frame.error);
         cpu::sti();
         let caught = crate::proc::signal::fault(&p, frame, sig, code, addr);
         cpu::cli();

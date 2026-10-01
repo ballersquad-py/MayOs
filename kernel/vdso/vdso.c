@@ -22,8 +22,11 @@ static inline unsigned long uptime_ns(void) {
 
 int __vdso_clock_gettime(int clk, struct ts *ts) {
     unsigned long ns;
-    if (VD->tsc_per_ms == 0)
-        return -38;
+    if (VD->tsc_per_ms == 0 && clk < 2) {
+        long r;
+        __asm__ volatile("syscall" : "=a"(r) : "a"(228), "D"((long)clk), "S"(ts) : "rcx", "r11", "memory");
+        return (int)r;
+    }
     switch (clk) {
     case 0: case 5: case 8: case 11:
         ns = uptime_ns() + VD->boot_unix_us * 1000UL;
@@ -31,8 +34,13 @@ int __vdso_clock_gettime(int clk, struct ts *ts) {
     case 1: case 4: case 6: case 7: case 9:
         ns = uptime_ns();
         break;
-    default:
-        return -38; /* ENOSYS: libc falls back to the system call */
+    default: {
+        /* CPU-time and other clocks: ask the kernel (glibc does not fall
+         * back to the system call when the vDSO fails). */
+        long r;
+        __asm__ volatile("syscall" : "=a"(r) : "a"(228), "D"((long)clk), "S"(ts) : "rcx", "r11", "memory");
+        return (int)r;
+    }
     }
     ts->sec = ns / 1000000000UL;
     ts->nsec = ns % 1000000000UL;

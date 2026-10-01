@@ -95,6 +95,11 @@ impl TcpStream {
         }
     }
 
+    /// Bytes waiting to be read.
+    pub fn available(&self) -> usize {
+        with(|t, _| t.available(self.h)).unwrap_or(0)
+    }
+
     pub fn readable(&self) -> bool {
         with(|t, _| t.readable(self.h)).unwrap_or(true)
     }

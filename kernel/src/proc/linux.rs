@@ -33,6 +33,7 @@ const ECHILD: i64 = 10;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const ENODEV: i64 = 19;
@@ -125,7 +126,8 @@ pub enum Desc {
     /// Unix-domain stream socket: connected, listening, or neither yet.
     Unix { ep: Option<Endpoint>, listener: Option<Arc<Listener>>, bound: Option<String>, nonblock: bool },
     /// memfd_create / shm_open memory.
-    Memfd { shm: Arc<Shm>, pos: u64 },
+    /// Shared memory (memfd, /dev/shm); `ro`: opened read-only.
+    Memfd { shm: Arc<Shm>, pos: u64, ro: bool },
     EventFd { ev: Arc<EventFd>, nonblock: bool },
     Epoll(Arc<Epoll>),
     TimerFd { t: Arc<TimerFd>, nonblock: bool },
@@ -330,8 +332,16 @@ fn base_env(cwd: &str) -> Vec<String> {
 }
 
 /// Load the program's dynamic linker, if it names one: (entry, AT_BASE).
-fn load_interp(pml4: u64, image: &super::elf::LoadedImage) -> Result<(u64, u64), String> {
+/// The real glibc dynamic linker (MayOS's glibc runtime for programs such
+/// as Lunar Client, which need more than Alpine's gcompat shim offers).
+pub const GLIBC_LD: &str = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2";
+
+fn load_interp(pml4: u64, image: &super::elf::LoadedImage, env: &[String]) -> Result<(u64, u64), String> {
     let Some(path) = &image.interp else { return Ok((image.entry, 0)) };
+    // Programs started with MAYOS_GLIBC=1 (and their children, which
+    // inherit it) get real glibc instead of gcompat.
+    let glibc = path == "/lib64/ld-linux-x86-64.so.2" && env.iter().any(|e| e == "MAYOS_GLIBC=1") && fs::exists(GLIBC_LD);
+    let path = if glibc { &String::from(GLIBC_LD) } else { path };
     let data = fs::read_file(&fs::resolve_link(path)).map_err(|e| alloc::format!("dynamic linker {}: {} (copy it from the Linux distribution the program comes from)", path, e))?;
     let li = super::elf::load_at(pml4, &data, INTERP_BASE)?;
     Ok((li.entry, INTERP_BASE))
@@ -346,8 +356,9 @@ pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str,
     if path.contains("minecraft") {
         crate::pkg::minecraft_setup_once();
     }
-    let (entry, at_base) = load_interp(pml4, image)?;
-    let (rsp, stack) = build_stack(pml4, image, at_base, &argv, &default_env(cwd), path)?;
+    let env = default_env(cwd);
+    let (entry, at_base) = load_interp(pml4, image, &env)?;
+    let (rsp, stack) = build_stack(pml4, image, at_base, &argv, &env, path)?;
     let state = LinuxState {
         fds: Spin::new(alloc::vec![
             Some(Arc::new(Mutex::new(Desc::Console))),
@@ -759,8 +770,13 @@ fn sys_mmap(p: &Process, addr: u64, len: u64, prot: u64, flags: u64, fd: i64, of
     const MAP_SHARED: u64 = 1;
     if flags & MAP_ANONYMOUS == 0 && flags & 3 == MAP_SHARED
         && let Some(d) = get_fd(p, fd)
-        && let Desc::Memfd { shm, .. } = &*d.lock()
+        && let Desc::Memfd { shm, ro, .. } = &*d.lock()
     {
+        // A read-only descriptor cannot give a writable shared mapping
+        // (Chromium checks that read-only memory really is).
+        if *ro && prot & 2 != 0 {
+            return -EACCES;
+        }
         // The same pages as every other mapping of this memory.
         let first = off / PAGE_SIZE;
         let mut rights = USER | paging::BORROWED;
@@ -837,6 +853,9 @@ fn sys_brk(p: &Process, addr: u64) -> i64 {
 // -------------------------------------------------------------------------
 
 fn get_fd(p: &Process, fd: i64) -> Option<DescRef> {
+    // A descriptor is a 32-bit int: the upper half of the register may
+    // hold anything (Chromium passes such values to mmap).
+    let fd = fd as i32 as i64;
     let l = linux(p)?;
     if fd < 0 {
         return None;
@@ -882,6 +901,8 @@ fn fs_err(e: fs::FsError) -> i64 {
 
 /// Resolve a path argument (relative to `dirfd` or the working directory).
 fn path_at(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
+    // A descriptor is a 32-bit int: the register's upper half is junk.
+    let dirfd = dirfd as i32 as i64;
     let s = usermem::read_cstr(p.pml4(), ptr, 4096).ok_or(-EFAULT)?;
     let base = if s.starts_with('/') || dirfd == -100 {
         linux(p).map(|l| l.cwd.lock().clone()).unwrap_or_else(|| String::from("/"))
@@ -896,6 +917,9 @@ fn path_at(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
     };
     Ok(fs::normalize(&base, &s))
 }
+
+/// A TZif v2 file for UTC (no transitions, one type "UTC", offset 0).
+const TZIF_UTC: &[u8] = &[84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 85, 84, 67, 0, 84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 85, 84, 67, 0, 10, 85, 84, 67, 48, 10];
 
 fn virtual_file(path: &str) -> Option<Desc> {
     let text = match path {
@@ -921,6 +945,9 @@ fn virtual_file(path: &str) -> Option<Desc> {
         "/etc/passwd" => String::from("root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home:/bin/sh\n"),
         "/etc/group" => String::from("root:x:0:\nuser:x:1000:\n"),
         "/etc/hostname" => String::from("mayos\n"),
+        "/etc/timezone" => String::from("Etc/UTC\n"),
+        // UTC as a TZif file: without it, ICU (Chromium) scans every zone.
+        "/etc/localtime" => return Some(Desc::Virtual { data: TZIF_UTC.to_vec(), pos: 0 }),
         "/etc/os-release" => String::from("NAME=MayOS\nID=mayos\nPRETTY_NAME=\"MayOS\"\n"),
         "/proc/cpuinfo" => (0..crate::smp::online()).map(|c| alloc::format!("processor\t: {}\nvendor_id\t: GenuineIntel\nmodel name\t: MayOS virtual CPU\nflags\t\t: {}\n\n", c, crate::arch::cpu::cpu_flags())).collect(),
         "/proc/meminfo" => {
@@ -998,7 +1025,7 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
     }
     if let Some(name) = path.strip_prefix("/dev/shm/") {
         return match unix::shm_open(name, flags & O_CREAT != 0, flags & O_EXCL != 0, flags & O_TRUNC != 0) {
-            Ok(shm) => add_fd(p, Desc::Memfd { shm, pos: 0 }),
+            Ok(shm) => add_fd(p, Desc::Memfd { shm, pos: 0, ro: flags & 3 == 0 }),
             Err(e) => e,
         };
     }
@@ -1227,7 +1254,7 @@ fn read_desc(p: &Process, d: &DescRef, buf: &mut [u8]) -> i64 {
             }
         }
         Desc::Unix { .. } => -ENOTCONN,
-        Desc::Memfd { shm, pos } => {
+        Desc::Memfd { shm, pos, .. } => {
             let n = shm.read_at(*pos, buf);
             *pos += n as u64;
             n as i64
@@ -1335,7 +1362,7 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
         Desc::Input { .. } => data.len() as i64,
         Desc::Unix { ep: Some(ep), nonblock, .. } => unix_send_flags(ep, *nonblock, data, Vec::new(), 0),
         Desc::Unix { .. } => -ENOTCONN,
-        Desc::Memfd { shm, pos } => {
+        Desc::Memfd { shm, pos, .. } => {
             let n = shm.write_at(*pos, data);
             *pos += n as u64;
             n as i64
@@ -1373,12 +1400,25 @@ fn write_desc(p: &Process, d: &DescRef, data: &[u8]) -> i64 {
 
 fn sys_read(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
-    let mut buf = vec![0u8; (len as usize).min(4 * 1024 * 1024)];
-    let n = read_desc(p, &d, &mut buf);
-    if n > 0 && !usermem::write_bytes(p.pml4(), ptr, &buf[..n as usize]) {
-        return -EFAULT;
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let mut buf = vec![0u8; (len as usize).min(CHUNK)];
+    // Regular files read in full (Linux only stops short at the end).
+    let regular = matches!(&*d.lock(), Desc::File { .. });
+    let mut done: u64 = 0;
+    loop {
+        let want = ((len - done) as usize).min(CHUNK);
+        let n = read_desc(p, &d, &mut buf[..want]);
+        if n < 0 {
+            return if done == 0 { n } else { done as i64 };
+        }
+        if n > 0 && !usermem::write_bytes(p.pml4(), ptr + done, &buf[..n as usize]) {
+            return if done == 0 { -EFAULT } else { done as i64 };
+        }
+        done += n as u64;
+        if !regular || n == 0 || (n as usize) < want || done >= len {
+            return done as i64;
+        }
     }
-    n
 }
 
 fn sys_write(p: &Process, fd: i64, ptr: u64, len: u64) -> i64 {
@@ -1454,12 +1494,30 @@ fn sys_readv(p: &Process, fd: i64, iov: u64, cnt: u64) -> i64 {
 
 fn sys_pread(p: &Process, fd: i64, ptr: u64, len: u64, off: u64) -> i64 {
     let Some(d) = get_fd(p, fd) else { return -EBADF };
-    let mut buf = vec![0u8; (len as usize).min(4 * 1024 * 1024)];
-    let n = read_at(&mut d.lock(), off, &mut buf);
-    if n > 0 && !usermem::write_bytes(p.pml4(), ptr, &buf[..n as usize]) {
-        return -EFAULT;
+    // The whole request, 4 MiB at a time: programs such as Electron read a
+    // file out of an archive with one pread and take a short count as the
+    // end (a script cut off there fails to parse).
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let mut buf = vec![0u8; (len as usize).min(CHUNK)];
+    let mut done: u64 = 0;
+    while done < len {
+        let want = ((len - done) as usize).min(CHUNK);
+        let n = read_at(&mut d.lock(), off + done, &mut buf[..want]);
+        if n < 0 {
+            return if done == 0 { n } else { done as i64 };
+        }
+        if n == 0 {
+            break;
+        }
+        if !usermem::write_bytes(p.pml4(), ptr + done, &buf[..n as usize]) {
+            return if done == 0 { -EFAULT } else { done as i64 };
+        }
+        done += n as u64;
+        if (n as usize) < want {
+            break;
+        }
     }
-    n
+    done as i64
 }
 
 fn sys_lseek(p: &Process, fd: i64, off: i64, whence: u64) -> i64 {
@@ -1467,7 +1525,7 @@ fn sys_lseek(p: &Process, fd: i64, off: i64, whence: u64) -> i64 {
     let mut g = d.lock();
     let (pos, size): (&mut u64, u64) = match &mut *g {
         Desc::File { pos, size, .. } => (pos, *size),
-        Desc::Memfd { shm, pos } => {
+        Desc::Memfd { shm, pos, .. } => {
             let size = shm.size();
             (pos, size)
         }
@@ -1508,6 +1566,10 @@ fn sys_lseek(p: &Process, fd: i64, off: i64, whence: u64) -> i64 {
 }
 
 fn sys_close(p: &Process, fd: i64) -> i64 {
+    let fd = fd as i32 as i64;
+    if fd < 0 {
+        return -EBADF;
+    }
     let Some(l) = linux(p) else { return -EBADF };
     l.cloexec.lock().remove(&(fd as usize));
     let mut fds = l.fds.lock();
@@ -1521,6 +1583,7 @@ fn sys_close(p: &Process, fd: i64) -> i64 {
 }
 
 fn sys_dup(p: &Process, fd: i64, to: Option<i64>, min: usize) -> i64 {
+    let (fd, to) = (fd as i32 as i64, to.map(|t| t as i32 as i64));
     let Some(d) = get_fd(p, fd) else { return -EBADF };
     match to {
         Some(t) if t >= 0 => {
@@ -1564,6 +1627,29 @@ fn unix_time(t: &fs::Timestamp) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     days * 86400 + t.hour as i64 * 3600 + t.minute as i64 * 60 + t.second as i64
+}
+
+/// stat, with the process's own /proc directories. Chromium's sandbox
+/// counts threads from the link count of /proc/self/task (2 + threads).
+fn stat_any(p: &Process, path: &str) -> Result<[u8; 144], i64> {
+    let sp = proc_self(p, path);
+    let sp = sp.trim_end_matches('/');
+    let dir = |nlink: u64, ino: u64| {
+        let mut b = stat_buf(0o40555, 0, 0, ino);
+        b[16..24].copy_from_slice(&nlink.to_le_bytes());
+        Ok(b)
+    };
+    match sp {
+        "/proc" | "/proc/self" | "/proc/self/fd" | "/proc/self/fdinfo" | "/proc/self/net" => return dir(2, 0x5000 + sp.len() as u64),
+        "/proc/self/task" => return dir(2 + sched::process_thread_ids(p.pid).len() as u64, 0x5100),
+        _ => {}
+    }
+    if let Some(t) = sp.strip_prefix("/proc/self/task/") {
+        if let Ok(tid) = t.parse::<u64>() {
+            return if sched::process_thread_ids(p.pid).contains(&tid) { dir(2, 0x6000 + tid) } else { Err(-ENOENT) };
+        }
+    }
+    stat_path(path)
 }
 
 fn stat_buf(mode: u32, size: u64, mtime: i64, ino: u64) -> [u8; 144] {
@@ -1635,7 +1721,10 @@ fn stat_path(path: &str) -> Result<[u8; 144], i64> {
     }
     let e = fs::stat(path).map_err(fs_err)?;
     let ino = path.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211));
-    let mode = if e.is_dir { 0o40755 } else { 0o100644 | if fs::extension(&e.name).is_none() && path.starts_with("/bin") { 0o111 } else { 0 } };
+    let mut mode = if e.is_dir { 0o40755 } else { 0o100644 | if fs::extension(&e.name).is_none() && path.starts_with("/bin") { 0o111 } else { 0 } };
+    if let Some(m) = MODES.lock().get(path) {
+        mode = (mode & !0o7777) | m;
+    }
     Ok(stat_buf(mode, if e.is_dir { 4096 } else { e.size as u64 }, unix_time(&e.modified), ino))
 }
 
@@ -1773,6 +1862,17 @@ fn rename_replacing(from: &str, to: &str, noreplace: bool) -> i64 {
         }
     }
     fs::rename(from, to).map(|_| 0).unwrap_or_else(fs_err)
+}
+
+/// Permissions set with mkdir/chmod, for stat (FAT keeps none).
+static MODES: Spin<alloc::collections::BTreeMap<String, u32>> = Spin::new(alloc::collections::BTreeMap::new());
+
+fn set_mode(path: &str, mode: u32) {
+    let mut m = MODES.lock();
+    if m.len() > 4096 {
+        m.clear();
+    }
+    m.insert(String::from(path), mode);
 }
 
 /// Path of a `sockaddr_un` (abstract names start with '@').
@@ -2850,7 +2950,7 @@ pub fn prof_report_n(reset: bool, top: usize) -> String {
 }
 
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
-    let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10]);
+    let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10, f.r8]);
     sched::set_syscall(nr, f.rdi, f.rsi);
     let t0 = crate::time::uptime_us();
     let mut exited = syscall_inner(p, f);
@@ -2875,7 +2975,7 @@ pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             // Small writes: show the text (pipes between processes).
             path = usermem::read_bytes(p.pml4(), args[1], args[2]).map(|b| String::from_utf8_lossy(&b).replace('\n', "|")).unwrap_or_default();
         }
-        crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}) = {} {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], f.rax as i64, path);
+        crate::kprintln!("[{}.{}] {} sys {} ({:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {} {}", p.pid, sched::current_id(), crate::time::uptime_ms(), nr, args[0], args[1], args[2], args[3], args[4], f.rax as i64, path);
     }
     exited
 }
@@ -2888,7 +2988,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         1 => sys_write(p, a0 as i64, a1, a2),
         2 => sys_openat(p, -100, a0, a1),
         3 => sys_close(p, a0 as i64),
-        4 | 6 => match path_at(p, -100, a0).and_then(|path| stat_path(&path)) {
+        4 | 6 => match path_at(p, -100, a0).and_then(|path| stat_any(p, &path)) {
             Ok(b) => if usermem::write_bytes(pml4, a1, &b) { 0 } else { -EFAULT },
             Err(e) => e,
         },
@@ -2933,7 +3033,9 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             0x5401 => match get_fd(p, a0 as i64).map(|d| matches!(&*d.lock(), Desc::Console)) {
                 // TCGETS: only the console is a terminal.
                 Some(true) => {
-                    usermem::write_bytes(pml4, a2, &[0u8; 60]);
+                    // struct termios as the kernel writes it: 36 bytes (glibc keeps
+                    // exactly that on the stack; more would overrun it).
+                    usermem::write_bytes(pml4, a2, &[0u8; 36]);
                     0
                 }
                 _ => -ENOTTY,
@@ -2945,6 +3047,9 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                         Desc::Unix { ep: Some(ep), .. } => ep.rx.lock().len(),
                         Desc::PipeRead(pp) => pp.buf.lock().len(),
                         Desc::Console => p.console.has_input() as usize,
+                        // glibc's DNS lookup sizes its buffer from this.
+                        Desc::Udp { port, .. } => crate::network::udp_next_len(*port),
+                        Desc::Tcp { stream: Some(s), .. } => s.available(),
                         _ => 0,
                     },
                     None => usize::MAX,
@@ -3054,7 +3159,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         60 => thread_exit(p, a0 as i64),
         319 => {
             // memfd_create(name, flags)
-            let fd = add_fd(p, Desc::Memfd { shm: Shm::new(), pos: 0 });
+            let fd = add_fd(p, Desc::Memfd { shm: Shm::new(), pos: 0, ro: false });
             set_cloexec(p, fd, a1 & 1 != 0);
             fd
         }
@@ -3135,7 +3240,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                     Some(d) => {
                         let g = d.lock();
                         let mode = match &*g {
-                            Desc::File { writable: false, .. } | Desc::PipeRead(_) | Desc::Dir { .. } | Desc::Virtual { .. } => 0,
+                            Desc::File { writable: false, .. } | Desc::PipeRead(_) | Desc::Dir { .. } | Desc::Virtual { .. } | Desc::Memfd { ro: true, .. } => 0,
                             Desc::PipeWrite(_) => 1,
                             _ => 2,
                         };
@@ -3228,9 +3333,28 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             }
         }
         83 | 258 => {
-            let path = if f.rax == 83 { path_at(p, -100, a0) } else { path_at(p, a0 as i64, a1) };
+            let (path, mode) = if f.rax == 83 { (path_at(p, -100, a0), a1) } else { (path_at(p, a0 as i64, a1), a2) };
             match path {
-                Ok(path) => fs::create_dir(&path).map(|_| 0).unwrap_or_else(fs_err),
+                Ok(path) => fs::create_dir(&path)
+                    .map(|_| {
+                        set_mode(&path, mode as u32 & 0o7777 & !0o022);
+                        0
+                    })
+                    .unwrap_or_else(fs_err),
+                Err(e) => e,
+            }
+        }
+        90 | 268 => {
+            // chmod / fchmodat: FAT has no permissions; remember them so
+            // stat reports what the program set (Chromium checks that its
+            // private directories really are 0700).
+            let (path, mode) = if f.rax == 90 { (path_at(p, -100, a0), a1) } else { (path_at(p, a0 as i64, a1), a2) };
+            match path {
+                Ok(path) if fs::exists(&path) => {
+                    set_mode(&path, mode as u32 & 0o7777);
+                    0
+                }
+                Ok(_) => -ENOENT,
                 Err(e) => e,
             }
         }
@@ -3276,11 +3400,14 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 7 => 1024,
                 _ => u64::MAX,
             };
-            if old != 0 {
-                usermem::write_u64(pml4, old, lim);
-                usermem::write_u64(pml4, old + 8, lim);
+            if res >= 16 {
+                -EINVAL
+            } else if old != 0 && !(usermem::write_u64(pml4, old, lim) && usermem::write_u64(pml4, old + 8, lim)) {
+                // A bad pointer fails (Chromium's sandbox checks it does).
+                -EFAULT
+            } else {
+                0
             }
-            0
         }
         99 => {
             let (free, total) = pmm::stats();
@@ -3352,8 +3479,21 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             sched::current_id() as i64
         }
         228 => {
-            // clock_gettime
-            let us = if a0 == 0 || a0 == 5 || a0 == 8 { unix_us() } else { crate::time::uptime_us() };
+            // clock_gettime. CPU-time clocks (process, thread, and the
+            // negative per-thread ids glibc makes with pthread_getcpuclockid)
+            // report CPU time, not time since boot.
+            let clk = a0 as i32;
+            let us = match clk {
+                0 | 5 | 8 | 11 => unix_us(),
+                2 => sched::process_cpu_ms(p.pid) * 1000,
+                3 => sched::current_cpu_ms() * 1000,
+                c if c < 0 => {
+                    // Linux encodes a thread's clock as ~tid << 3 | 6 (2: process, 6: thread).
+                    let id = (!(c >> 3)) as u64;
+                    if c & 7 == 6 { sched::thread_cpu_ms(id).unwrap_or(0) * 1000 } else { sched::process_cpu_ms(id) * 1000 }
+                }
+                _ => crate::time::uptime_us(),
+            };
             if write_timespec(p, a1, us) { 0 } else { -EFAULT }
         }
         229 => {
@@ -3387,7 +3527,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let r = if a2 & AT_EMPTY_PATH != 0 && usermem::read_cstr(pml4, a1, 2).map(|s| s.is_empty()).unwrap_or(false) {
                 stat_fd(p, a0 as i32 as i64)
             } else {
-                path_at(p, a0 as i32 as i64, a1).and_then(|path| stat_path(&path))
+                path_at(p, a0 as i32 as i64, a1).and_then(|path| stat_any(p, &path))
             };
             match r {
                 Ok(st) => {
@@ -3442,7 +3582,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
             let r = if a3 & AT_EMPTY_PATH != 0 && usermem::read_cstr(pml4, a1, 2).map(|s| s.is_empty()).unwrap_or(false) {
                 stat_fd(p, a0 as i32 as i64)
             } else {
-                path_at(p, a0 as i32 as i64, a1).and_then(|path| stat_path(&path))
+                path_at(p, a0 as i32 as i64, a1).and_then(|path| stat_any(p, &path))
             };
             match r {
                 Ok(b) => if usermem::write_bytes(pml4, a2, &b) { 0 } else { -EFAULT },
@@ -3606,7 +3746,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
                 Err(e) => e,
             }
         }
-        90 | 91 | 92 | 93 | 94 | 260 | 268 | 132 | 235 | 280 | 261 => 0, // chmod, chown, utime families
+        91 | 92 | 93 | 94 | 260 | 132 | 235 | 280 | 261 => 0, // fchmod, chown, utime families
         95 => 0o022, // umask: the old mask
         98 => {
             // getrusage: CPU time of the process's threads
@@ -3630,11 +3770,29 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         111 | 112 | 121 | 124 => p.pid as i64, // getpgrp, setsid, getpgid, getsid
         115 => 0, // getgroups: none extra
         125 => {
-            // capget: no capabilities
-            if a1 != 0 {
-                usermem::write_bytes(pml4, a1, &[0u8; 24]);
+            // capget: no capabilities. The data size depends on the version
+            // in the header (v1: one 12-byte set, v2/v3: two); writing too
+            // much overruns the caller's stack (Chromium aborts).
+            let ver = usermem::read_u64(pml4, a0).unwrap_or(0) as u32;
+            match ver {
+                0x1998_0330 => {
+                    if a1 != 0 {
+                        usermem::write_bytes(pml4, a1, &[0u8; 12]);
+                    }
+                    0
+                }
+                0x2007_1026 | 0x2008_0522 => {
+                    if a1 != 0 {
+                        usermem::write_bytes(pml4, a1, &[0u8; 24]);
+                    }
+                    0
+                }
+                _ => {
+                    // Unknown: say which version we speak.
+                    usermem::write_u32(pml4, a0, 0x2008_0522);
+                    if a1 == 0 { 0 } else { -EINVAL }
+                }
             }
-            0
         }
         140 => 20, // getpriority: nice 0
         141 => 0,
@@ -3976,6 +4134,11 @@ fn read_strv(pml4: u64, mut ptr: u64) -> Result<Vec<String>, i64> {
 fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp: u64, envp: u64) -> Result<(), i64> {
     let l = linux(p).ok_or(-ENOSYS)?;
     let mut path = path_at(p, dirfd, pathp)?;
+    // Programs re-run themselves through /proc/self/exe (Chromium starts
+    // its renderer and GPU processes this way).
+    if proc_self(p, &path) == "/proc/self/exe" {
+        path = l.exe.lock().clone();
+    }
     if path.contains("firefox") {
         crate::pkg::firefox_setup_once();
     }
@@ -3983,6 +4146,11 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
         crate::pkg::minecraft_setup_once();
     }
     let mut argv = read_strv(p.pml4(), argvp)?;
+    if TRACE.load(Ordering::Relaxed) {
+        let mut a = argv.join(" ");
+        a.truncate(300);
+        crate::kprintln!("[exec] pid {} {} : {}", p.pid, path, a);
+    }
     let env = read_strv(p.pml4(), envp)?;
     let mut data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;
     // Scripts: "#!interpreter [one argument]".
@@ -4016,7 +4184,7 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     let pml4 = paging::new_address_space().ok_or(-ENOMEM)?;
     let prepared = (|| -> Result<(u64, u64, u64, Region), String> {
         let image = super::elf::load(pml4, &data)?;
-        let (entry, at_base) = load_interp(pml4, &image)?;
+        let (entry, at_base) = load_interp(pml4, &image, &env)?;
         let (rsp, stack) = build_stack(pml4, &image, at_base, &argv, &env, &path)?;
         Ok((entry, rsp, image.brk, stack))
     })();

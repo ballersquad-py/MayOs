@@ -648,6 +648,11 @@ pub(crate) fn udp_send(src_port: u16, dst: Ipv4, dst_port: u16, data: &[u8]) {
     }
 }
 
+/// Size of the next datagram waiting on `port` (0: none), for FIONREAD.
+pub(crate) fn udp_next_len(port: u16) -> usize {
+    IFACE.lock().as_ref().and_then(|i| i.udp.get(&port)).and_then(|q| q.front()).map(|m| m.2.len()).unwrap_or(0)
+}
+
 pub(crate) fn udp_recv(port: u16, timeout_ms: u64) -> Option<(Ipv4, u16, Vec<u8>)> {
     let deadline = uptime_ms() + timeout_ms;
     loop {

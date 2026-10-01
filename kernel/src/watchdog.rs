@@ -38,12 +38,18 @@ fn dump(ms: u64) {
         let name = crate::proc::linux::thread_name(t.id).unwrap_or_default();
         let _ = writeln!(r, "{:>5} pid {:>4?} {:?} cpu {}ms {} {} {}", t.id, t.pid, t.state, t.cpu_ms, t.name, name, what);
     }
+    let threads_end = r.len();
     let log = crate::log::contents();
     let mut from = log.len().saturating_sub(30000);
     while !log.is_char_boundary(from) {
         from += 1;
     }
     let _ = writeln!(r, "\n== kernel log (end)\n{}", &log[from..]);
+    // The thread list on the serial port first: writing the file needs
+    // the disk, which may be what is stuck.
+    for line in r[..threads_end].lines().take(400) {
+        crate::kprintln!("hang: {}", line);
+    }
     crate::kprintln!("watchdog: desktop frozen for {} ms, writing /hang.txt", ms);
     let _ = crate::fs::write_file("/hang.txt", r.as_bytes());
     crate::kprintln!("watchdog: /hang.txt written");

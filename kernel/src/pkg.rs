@@ -45,13 +45,14 @@ struct Index {
     provides: BTreeMap<String, String>,
 }
 
-fn say(c: &Console, s: &str) {
+pub(crate) fn say(c: &Console, s: &str) {
     c.write(s.as_bytes());
 }
 
 pub fn job(args: &str, c: &Console, cancel: &AtomicBool) -> i64 {
     let words: Vec<&str> = args.split_whitespace().collect();
     let r = match words.first().copied() {
+        Some("install" | "add") if words.contains(&"lunar-client") || words.contains(&"lunar") => crate::lunar::install(c, cancel),
         Some("install" | "add") if words.len() > 1 => install(&words[1..], c, cancel),
         Some("update") => load_index(c, true).map(|i| {
             say(c, &format!("{} packages available\n", i.pkgs.len()));
@@ -159,7 +160,7 @@ pref("browser.startup.preXulSkeletonUI", false);
     let _ = fs::write_file(&format!("{}/mayos.js", pdir), prefs.as_bytes());
 }
 
-fn download(url: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn download(url: &str) -> Result<Vec<u8>, String> {
     let u = web::url::Url::parse(url).ok_or("bad url")?;
     // Big packages (Firefox is ~90 MB): allow up to 1 GB, and retry a
     // download that was cut off.
@@ -493,7 +494,7 @@ fn parent_of(path: &str) -> String {
     }
 }
 
-fn mkdirs(path: &str) -> Result<(), fs::FsError> {
+pub(crate) fn mkdirs(path: &str) -> Result<(), fs::FsError> {
     if path == "/" || fs::is_dir(path) {
         return Ok(());
     }

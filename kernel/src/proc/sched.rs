@@ -331,6 +331,17 @@ pub fn process_cpu_ms(pid: u64) -> u64 {
     s.threads.iter().filter(|t| t.process.as_ref().is_some_and(|p| p.pid == pid)).map(|t| t.cpu_ms).sum()
 }
 
+/// CPU time used by one thread.
+pub fn thread_cpu_ms(id: u64) -> Option<u64> {
+    let s = SCHED.lock();
+    s.threads.iter().find(|t| t.id == id).map(|t| t.cpu_ms)
+}
+
+/// CPU time used by the running thread.
+pub fn current_cpu_ms() -> u64 {
+    thread_cpu_ms(current_id()).unwrap_or(0)
+}
+
 /// Thread ids of a process.
 pub fn process_thread_ids(pid: u64) -> Vec<u64> {
     let s = SCHED.lock();

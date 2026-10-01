@@ -313,6 +313,11 @@ impl Stack {
         Ok(n)
     }
 
+    /// Bytes received and not yet read (FIONREAD).
+    pub fn available(&self, h: Handle) -> usize {
+        self.socks.get(&h).map(|s| s.recv_buf.len()).unwrap_or(0)
+    }
+
     /// Whether `recv` would return right away (data, end of stream, error).
     pub fn readable(&self, h: Handle) -> bool {
         match self.socks.get(&h) {
