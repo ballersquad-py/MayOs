@@ -350,6 +350,14 @@ fn load_interp(pml4: u64, image: &super::elf::LoadedImage, env: &[String]) -> Re
 pub fn setup(pml4: u64, image: &super::elf::LoadedImage, path: &str, args: &str, cwd: &str) -> Result<(LinuxState, u64, u64), String> {
     let mut argv: Vec<String> = alloc::vec![String::from(path)];
     argv.extend(split_args(args));
+    // /bin holds MayOS's own programs (cat, ls, ...), which don't speak
+    // the Linux ABI: a Linux shell running `cat` must get the Linux one.
+    if let Some(name) = path.strip_prefix("/bin/") {
+        let linux_tool = alloc::format!("/usr/bin/{}", name);
+        if fs::exists(&linux_tool) {
+            path = linux_tool;
+        }
+    }
     if path.contains("firefox") {
         crate::pkg::firefox_setup_once();
     }
