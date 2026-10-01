@@ -44,6 +44,17 @@ const DEBS: &[&str] = &[
     "libxinerama1", "libxkbcommon0", "libxrandr2", "libxrender1", "libzstd1", "libxxf86vm1",
 ];
 
+/// OpenGL for the Minecraft that Lunar starts (its Java is a glibc one):
+/// Mesa with the software and VMware SVGA drivers, through libglvnd.
+/// `libgallium` stands for Mesa's version-named libgallium-<version>.
+const GL_DEBS: &[&str] = &[
+    "libglvnd0", "libegl1", "libgl1", "libglx0", "libopengl0", "libegl-mesa0", "libglx-mesa0", "libgl1-mesa-dri",
+    "libglapi-mesa", "libgallium", "libllvm19", "libllvm17", "libdrm-amdgpu1", "libdrm-intel1", "libdrm-radeon1",
+    "libdrm-nouveau2", "libelf1t64", "libsensors5", "libxcb-dri2-0", "libxcb-dri3-0", "libxcb-present0",
+    "libxcb-sync1", "libxcb-xfixes0", "libxcb-randr0", "libxcb-glx0", "libxshmfence1", "libedit2", "libxml2",
+    "libicu74", "libstdc++6", "libz3-4", "libpciaccess0", "libwayland-server0", "libvulkan1", "mesa-vulkan-drivers",
+];
+
 const SCRIPT: &[u8] = br#"#!/bin/sh
 # Lunar Client's own launcher on MayOS's glibc runtime. MAYOS_GLIBC=1 is
 # inherited by everything it starts, including the Java it downloads.
@@ -131,9 +142,10 @@ fn ubuntu_index(c: &Console) -> Result<BTreeMap<String, String>, String> {
             if let Some(v) = line.strip_prefix("Package: ") {
                 name = v.trim();
             } else if let Some(v) = line.strip_prefix("Filename: ")
-                && DEBS.contains(&name)
+                && (DEBS.contains(&name) || GL_DEBS.contains(&name) || name.starts_with("libgallium-"))
             {
-                map.insert(name.to_string(), v.trim().to_string());
+                let key = if name.starts_with("libgallium-") { "libgallium" } else { name };
+                map.insert(key.to_string(), v.trim().to_string());
             }
         }
     }
@@ -143,33 +155,67 @@ fn ubuntu_index(c: &Console) -> Result<BTreeMap<String, String>, String> {
 fn runtime(c: &Console, cancel: &AtomicBool) -> Result<(), String> {
     let idx = ubuntu_index(c)?;
     mkdirs(LIB_DIR).map_err(|e| e.to_string())?;
-    for (k, name) in DEBS.iter().enumerate() {
+    let all: Vec<&str> = DEBS.iter().chain(GL_DEBS.iter()).copied().collect();
+    for (k, name) in all.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(String::from("cancelled"));
         }
         let Some(path) = idx.get(*name) else {
+            if GL_DEBS.contains(name) {
+                continue; // optional (names differ between Mesa releases)
+            }
             return Err(format!("Ubuntu has no package {}", name));
         };
-        say(c, &format!("[{}/{}] {}\n", k + 1, DEBS.len(), name));
+        say(c, &format!("[{}/{}] {}\n", k + 1, all.len(), name));
         let deb = download(&format!("{}/{}", UBUNTU, path))?;
         let tar = deb_data(&deb)?;
         let mut files: BTreeMap<String, &[u8]> = BTreeMap::new();
         let mut links: Vec<(String, String)> = Vec::new();
         tar_entries(&tar, |e| {
             let n = e.name.trim_start_matches("./");
+            // libglvnd finds Mesa (and the Vulkan loader its drivers) here.
+            if (n.starts_with("usr/share/glvnd/") || n.starts_with("usr/share/vulkan/icd.d/") || n.starts_with("usr/share/drirc.d/"))
+                && n.ends_with(".json") || n.ends_with(".conf") && n.starts_with("usr/share/drirc.d/")
+            {
+                if matches!(e.kind, b'0' | 0) {
+                    let full = format!("/{}", n);
+                    if let Some(dir) = full.rsplit_once('/').map(|d| d.0) {
+                        let _ = mkdirs(dir);
+                    }
+                    let _ = fs::write_file(&full, e.data);
+                }
+                return;
+            }
             let Some(rest) = n.strip_prefix("usr/lib/x86_64-linux-gnu/").or_else(|| n.strip_prefix("lib/x86_64-linux-gnu/")) else { return };
-            // Libraries only (not their plugins' subfolders).
-            if rest.contains('/') || !rest.contains(".so") {
+            // Libraries, plus Mesa's driver folders (dri/, gbm/).
+            let sub_ok = rest.split('/').count() == 2 && (rest.starts_with("dri/") || rest.starts_with("gbm/"));
+            if (rest.contains('/') && !sub_ok) || !rest.contains(".so") {
                 return;
             }
             match e.kind {
                 b'0' | 0 => {
                     files.insert(rest.to_string(), e.data);
                 }
-                b'2' => links.push((rest.to_string(), e.link.rsplit('/').next().unwrap_or("").to_string())),
+                b'2' => {
+                    // Symlink: target relative to the link's own folder.
+                    let dir = rest.rsplit_once('/').map(|d| format!("{}/", d.0)).unwrap_or_default();
+                    links.push((rest.to_string(), format!("{}{}", dir, e.link.rsplit('/').next().unwrap_or(""))));
+                }
+                b'1' => {
+                    // Hard link (Mesa's drivers): target is a full path.
+                    let t = e.link.trim_start_matches("./");
+                    if let Some(t) = t.strip_prefix("usr/lib/x86_64-linux-gnu/").or_else(|| t.strip_prefix("lib/x86_64-linux-gnu/")) {
+                        links.push((rest.to_string(), t.to_string()));
+                    }
+                }
                 _ => {}
             }
         });
+        for n in files.keys() {
+            if let Some((dir, _)) = n.split_once('/') {
+                let _ = mkdirs(&format!("{}/{}", LIB_DIR, dir));
+            }
+        }
         for (n, data) in &files {
             fs::write_file(&format!("{}/{}", LIB_DIR, n), data).map_err(|e| format!("{}: {}", n, e))?;
         }
