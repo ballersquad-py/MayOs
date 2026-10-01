@@ -280,7 +280,12 @@ extern "C" fn save_log(_: usize) {
         let text = log::contents();
         if text.len() != last {
             last = text.len();
-            let _ = fs::write_file(&path, text.as_bytes());
+            // The last 256 KiB: the log can be megabytes with tracing on.
+            let mut from = text.len().saturating_sub(256 * 1024);
+            while !text.is_char_boundary(from) {
+                from += 1;
+            }
+            let _ = fs::write_file(&path, text[from..].as_bytes());
         }
         proc::sched::sleep_ms(3000);
     }

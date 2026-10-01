@@ -6,7 +6,7 @@ use core::fmt::{self, Write};
 
 use crate::sync::Spin;
 
-const CAP: usize = 64 * 1024;
+const CAP: usize = 8 * 1024 * 1024;
 
 struct Ring {
     buf: [u8; CAP],

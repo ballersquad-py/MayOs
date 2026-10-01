@@ -650,6 +650,14 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
             }
         }
         "dmesg" => match args.first() {
+            // `dmesg save /trace.txt`: the whole kernel log into a file.
+            Some(&"save") => {
+                let f = abs(args.get(1).copied().unwrap_or("/kernel-log.txt"));
+                match crate::fs::write_file(&f, crate::log::contents().as_bytes()) {
+                    Ok(_) => { let _ = writeln!(out, "Kernel log saved to {}", f); }
+                    Err(e) => err(out, format!("dmesg: {}", e)),
+                }
+            }
             // `dmesg usb`: only the lines that mention "usb".
             Some(word) => {
                 for line in crate::log::contents().lines().filter(|l| l.contains(&**word)) {
