@@ -4219,6 +4219,18 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
         crate::kprintln!("[exec] pid {} {} : {}", p.pid, path, a);
     }
     let env = read_strv(p.pml4(), envp)?;
+    // Lunar's Java goes through a wrapper that gives old (X11-only)
+    // Minecraft versions their own Xwayland (see lunar.rs).
+    if path.ends_with("/bin/java")
+        && env.iter().any(|e| e == "MAYOS_GLIBC=1")
+        && !env.iter().any(|e| e == "MAYOS_JAVA_WRAPPED=1")
+        && fs::exists(crate::lunar::JAVA_WRAPPER_PATH)
+    {
+        let mut new_argv = alloc::vec![String::from("/bin/sh"), String::from(crate::lunar::JAVA_WRAPPER_PATH), path.clone()];
+        new_argv.extend(argv.into_iter().skip(1));
+        argv = new_argv;
+        path = String::from("/bin/sh");
+    }
     let mut data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;
     // A MayOS-native program (e.g. /bin/cat) can't take Linux arguments:
     // run busybox's version of the tool instead, or report it missing so

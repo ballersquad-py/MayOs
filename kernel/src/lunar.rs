@@ -47,19 +47,6 @@ const DEBS: &[&str] = &[
 const SCRIPT: &[u8] = br#"#!/bin/sh
 # Lunar Client's own launcher on MayOS's glibc runtime. MAYOS_GLIBC=1 is
 # inherited by everything it starts, including the Java it downloads.
-# Minecraft 1.8.9 (LWJGL 2) only speaks X11: run it through rootless Xwayland:
-# each X11 window is shown as a normal MayOS window. Electron itself stays on Wayland (--ozone-platform=wayland).
-if command -v Xwayland >/dev/null 2>&1; then
-  mkdir -p /tmp/.X11-unix
-  d=7
-  while [ -e /tmp/.X11-unix/X$d ]; do d=$((d+1)); done
-  Xwayland :$d -rootless -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
-  export DISPLAY=:$d
-  # DISPLAY is for the game only: keep the launcher's GTK on Wayland.
-  export GDK_BACKEND=wayland
-else
-  echo "lunar-client: Xwayland is missing, Minecraft 1.8.9 won't open. Run: pkg install minecraft"
-fi
 export MAYOS_GLIBC=1
 cd /opt/lunar
 # Chromium's single-instance lock is a symlink, which FAT can't hold: a
@@ -75,6 +62,42 @@ fi
 exec /opt/lunar/lunarclient --no-sandbox --ozone-platform=wayland --disable-gpu "$@"
 "#;
 
+/// Started (by proc::linux's execve) in place of every Java that Lunar
+/// launches. Minecraft 1.12.2 and older use LWJGL 2, which only speaks X11:
+/// those get a rootless Xwayland of their own, so only the game window goes
+/// through X11. Newer versions run straight on Wayland.
+const JAVA_WRAPPER: &[u8] = br#"#!/bin/sh
+java="$1"; shift
+export MAYOS_JAVA_WRAPPED=1
+old=0; prev=""
+for a in "$@"; do
+  if [ "$prev" = "--version" ]; then
+    case "$a" in 1.[0-9]|1.[0-9].*|1.1[0-2]|1.1[0-2].*) old=1 ;; esac
+  fi
+  prev="$a"
+done
+if [ $old = 1 ] && command -v Xwayland >/dev/null 2>&1; then
+  mkdir -p /tmp/.X11-unix
+  d=7
+  while [ -e /tmp/.X11-unix/X$d ]; do d=$((d+1)); done
+  env -u MAYOS_GLIBC Xwayland :$d -rootless -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
+  xpid=$!
+  sleep 1
+  export DISPLAY=:$d
+  "$java" "$@"
+  r=$?
+  kill $xpid 2>/dev/null
+  exit $r
+fi
+if [ $old = 1 ]; then
+  echo "lunar-client: this Minecraft version needs Xwayland. Run: pkg install minecraft"
+fi
+unset DISPLAY
+exec "$java" "$@"
+"#;
+
+pub const JAVA_WRAPPER_PATH: &str = "/usr/lib/mayos/lunar-java";
+
 const DESKTOP: &[u8] = b"[Desktop Entry]\nType=Application\nName=Lunar Client\nExec=lunar-client\nIcon=/opt/lunar/lunarclient.png\nTerminal=false\n";
 
 pub fn install(c: &Console, cancel: &AtomicBool) -> Result<(), String> {
@@ -85,6 +108,8 @@ pub fn install(c: &Console, cancel: &AtomicBool) -> Result<(), String> {
     }
     launcher(c)?;
     let _ = fs::write_file("/usr/bin/lunar-client", SCRIPT);
+    let _ = mkdirs("/usr/lib/mayos");
+    let _ = fs::write_file(JAVA_WRAPPER_PATH, JAVA_WRAPPER);
     let _ = mkdirs("/usr/share/applications");
     let _ = fs::write_file("/usr/share/applications/lunarclient.desktop", DESKTOP);
     say(c, "Done. Start it from the menu (Lunar Client) or with: lunar-client\n");
