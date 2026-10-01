@@ -55,6 +55,8 @@ if command -v Xwayland >/dev/null 2>&1; then
   while [ -e /tmp/.X11-unix/X$d ]; do d=$((d+1)); done
   Xwayland :$d -rootless -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
   export DISPLAY=:$d
+  # DISPLAY is for the game only: keep the launcher's GTK on Wayland.
+  export GDK_BACKEND=wayland
 else
   echo "lunar-client: Xwayland is missing, Minecraft 1.8.9 won't open. Run: pkg install minecraft"
 fi
