@@ -570,6 +570,14 @@ impl State {
         self.versions.remove(&id);
         self.pointers.retain(|&p| p != id);
         self.keyboards.retain(|&k| k != id);
+        // Never send enter/leave for a surface the client already destroyed
+        // (a closed login popup): libwayland treats that as a fatal error.
+        if self.pointer_on.is_some_and(|p| p.0 == id) {
+            self.pointer_on = None;
+        }
+        if self.keyboard_on == Some(id) {
+            self.keyboard_on = None;
+        }
         self.ev(1, 1, vec![A::U(id)]);
     }
 
@@ -1619,6 +1627,9 @@ impl State {
         let ks: Vec<u32> = self.keyboards.clone();
         let serial = self.next_serial();
         if on {
+            if self.surface(surface).is_none() {
+                return; // its window is gone
+            }
             if self.keyboard_on == Some(surface) {
                 return;
             }
