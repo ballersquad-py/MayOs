@@ -47,13 +47,13 @@ const DEBS: &[&str] = &[
 const SCRIPT: &[u8] = br#"#!/bin/sh
 # Lunar Client's own launcher on MayOS's glibc runtime. MAYOS_GLIBC=1 is
 # inherited by everything it starts, including the Java it downloads.
-# Minecraft 1.8.9 (LWJGL 2) only speaks X11: give it a rootful Xwayland
-# window. Electron itself stays on Wayland (--ozone-platform=wayland).
+# Minecraft 1.8.9 (LWJGL 2) only speaks X11: run it through rootless Xwayland:
+# each X11 window is shown as a normal MayOS window. Electron itself stays on Wayland (--ozone-platform=wayland).
 if command -v Xwayland >/dev/null 2>&1; then
   mkdir -p /tmp/.X11-unix
   d=7
   while [ -e /tmp/.X11-unix/X$d ]; do d=$((d+1)); done
-  Xwayland :$d -geometry 1280x720 -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
+  Xwayland :$d -rootless -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
   export DISPLAY=:$d
 else
   echo "lunar-client: Xwayland is missing, Minecraft 1.8.9 won't open. Run: pkg install minecraft"

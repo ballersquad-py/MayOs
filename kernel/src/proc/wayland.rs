@@ -386,6 +386,10 @@ struct State {
     keyboard_on: Option<u32>,
     mods: u32,
     logged: Vec<u32>,
+    /// Surfaces given to wl_pointer.set_cursor (never windows).
+    cursor_surfaces: Vec<u32>,
+    /// The client is Xwayland (rootless): None until checked.
+    xwayland: Option<bool>,
 }
 
 // --- wire format ---------------------------------------------------------
@@ -747,7 +751,7 @@ impl State {
                 self.destroy(id);
             }
         } else if is!(Obj::Surface(_)) {
-            self.surface_request(id, op, a);
+            self.surface_request(c, id, op, a);
         } else if is!(Obj::Region(_)) {
             match op {
                 0 => self.destroy(id),
@@ -783,6 +787,13 @@ impl State {
             }
         } else if is!(Obj::Pointer) || is!(Obj::Keyboard) || is!(Obj::Touch) || is!(Obj::Output) {
             // set_cursor (pointer 0) is ignored: MayOS draws its cursor.
+            if is!(Obj::Pointer) && op == 0 {
+                let _serial = a.u();
+                let cs = a.u();
+                if cs != 0 && !self.cursor_surfaces.contains(&cs) {
+                    self.cursor_surfaces.push(cs);
+                }
+            }
             let release = if is!(Obj::Pointer) { op == 1 } else { op == 0 };
             if release {
                 self.destroy(id);
@@ -1064,7 +1075,7 @@ impl State {
         let _ = c;
     }
 
-    fn surface_request(&mut self, id: u32, op: u16, a: &mut Args) {
+    fn surface_request(&mut self, c: &Client, id: u32, op: u16, a: &mut Args) {
         match op {
             0 => {
                 self.end_toplevel(id);
@@ -1111,7 +1122,10 @@ impl State {
                     s.opaque = opaque;
                 }
             }
-            6 => self.commit(id),
+            6 => {
+                self.xwayland_window(c, id);
+                self.commit(id);
+            }
             _ => {} // transform, scale
         }
     }
@@ -1292,6 +1306,31 @@ impl State {
         });
         if let Some(s) = self.surface(surface) {
             s.role = Role::Toplevel(w);
+        }
+    }
+
+    /// Rootless Xwayland gives every mapped X11 window a plain wl_surface
+    /// with no shell role (there is no X window manager): each one becomes
+    /// a MayOS window, the way Wayland desktops show X11 programs.
+    fn xwayland_window(&mut self, c: &Client, id: u32) {
+        if self.xwayland.is_none() {
+            let exe = super::process::find(self.pid)
+                .and_then(|p| super::linux::linux(&p).map(|l| l.exe.lock().clone()))
+                .unwrap_or_default();
+            self.xwayland = Some(exe.rsplit('/').next().is_some_and(|n| n.starts_with("Xwayland")));
+        }
+        if self.xwayland != Some(true) || self.cursor_surfaces.contains(&id) {
+            return;
+        }
+        let Some(s) = self.surface(id) else { return };
+        if !matches!(s.role, Role::None) {
+            return;
+        }
+        let Some(Some(bid)) = s.pending else { return };
+        // Cursor images are small; real windows are not.
+        let big = matches!(self.objs.get(&bid), Some(Obj::Buffer(b)) if b.w > 64 || b.h > 64);
+        if big {
+            self.make_toplevel(c, id, 0);
         }
     }
 

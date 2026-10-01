@@ -523,7 +523,7 @@ fn split_args(s: &str) -> Vec<String> {
 // Memory
 // -------------------------------------------------------------------------
 
-fn linux(p: &Process) -> Option<&LinuxState> {
+pub(super) fn linux(p: &Process) -> Option<&LinuxState> {
     p.linux.as_deref()
 }
 
