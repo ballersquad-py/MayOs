@@ -2320,6 +2320,29 @@ fn sys_recvmsg(p: &Process, fd: i64, ptr: u64, flags: u64) -> i64 {
                 used = ((len + 7) & !7) as u64;
             }
         }
+        // SCM_CREDENTIALS: the sender's pid, uid and gid.
+        let (passcred, sender) = {
+            let q = rx.lock();
+            (q.passcred, q.last_sender)
+        };
+        if passcred && ctl != 0 && !data.is_empty() {
+            if ctllen >= used + 32 {
+                let mut c = Vec::with_capacity(32);
+                c.extend_from_slice(&28u64.to_le_bytes());
+                c.extend_from_slice(&1i32.to_le_bytes());
+                c.extend_from_slice(&2i32.to_le_bytes());
+                for v in [if sender == 0 { p.pid as u32 } else { sender as u32 }, 1000, 1000] {
+                    c.extend_from_slice(&v.to_le_bytes());
+                }
+                c.extend_from_slice(&[0u8; 4]);
+                if !usermem::write_bytes(p.pml4(), ctl + used, &c) {
+                    return -EFAULT;
+                }
+                used += 32;
+            } else {
+                msg_flags |= 8;
+            }
+        }
         usermem::write_u64(p.pml4(), ptr + 40, used);
         usermem::write_u32(p.pml4(), ptr + 48, msg_flags);
         return off as i64;
@@ -3138,7 +3161,17 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         50 => sys_listen(p, a0 as i64),
         51 => sys_sockname(p, a0 as i64, a1, a2, false),
         52 => sys_sockname(p, a0 as i64, a1, a2, true),
-        54 => 0, // setsockopt
+        54 => {
+            // setsockopt: only SO_PASSCRED does anything (Chromium's zygote
+            // learns its children's pids from SCM_CREDENTIALS).
+            if a1 == 1 && a2 == 16
+                && let Some(d) = get_fd(p, a0 as i64)
+                && let Desc::Unix { ep: Some(ep), .. } = &*d.lock()
+            {
+                ep.rx.lock().passcred = usermem::read_bytes(pml4, a3, 4).is_some_and(|v| v != [0, 0, 0, 0]);
+            }
+            0
+        }
         55 if a1 == 1 && a2 == 17 => {
             // SO_PEERCRED: the peer is one of our processes, same user.
             let cred: Vec<u8> = [p.pid as u32, 1000, 1000].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -4534,6 +4567,10 @@ fn readlink(p: &Process, dirfd: i64, ptr: u64) -> Result<String, i64> {
     let raw = proc_self(p, &raw);
     if raw == "/proc/self/exe" {
         return Ok(linux(p).map(|l| l.exe.lock().clone()).unwrap_or_default());
+    }
+    if raw == "/etc/localtime" && !fs::exists("/etc/localtime") {
+        // A symlink into zoneinfo on Linux; ICU reads the zone name from it.
+        return Ok(String::from("/usr/share/zoneinfo/Etc/UTC"));
     }
     if raw == "/proc/self/cwd" {
         return Ok(linux(p).map(|l| l.cwd.lock().clone()).unwrap_or_default());

@@ -49,7 +49,7 @@ const SCRIPT: &[u8] = br#"#!/bin/sh
 # inherited by everything it starts, including the Java it downloads.
 export MAYOS_GLIBC=1
 cd /opt/lunar
-exec /opt/lunar/lunarclient --no-sandbox --no-zygote --ozone-platform=wayland --disable-gpu "$@"
+exec /opt/lunar/lunarclient --no-sandbox --in-process-gpu --ozone-platform=wayland --disable-gpu "$@"
 "#;
 
 const DESKTOP: &[u8] = b"[Desktop Entry]\nType=Application\nName=Lunar Client\nExec=lunar-client\nIcon=/opt/lunar/lunarclient.png\nTerminal=false\n";
@@ -358,7 +358,10 @@ impl<'a> Sq<'a> {
                         self.extract_dir(ii, &path, count, depth + 1)?;
                     }
                     2 | 9 => {
-                        let data = self.file_data(ii, u16_at(b, ii) == 9)?;
+                        let mut data = self.file_data(ii, u16_at(b, ii) == 9)?;
+                        if path.ends_with("/app.asar") {
+                            show_windows(&mut data);
+                        }
                         fs::write_file(&path, &data).map_err(|e| format!("{}: {}", path, e))?;
                         *count += 1;
                     }
@@ -378,4 +381,26 @@ fn squashfs_extract(img: &[u8], to: &str) -> Result<usize, String> {
     let mut n = 0;
     sq.extract_dir(ri, to, &mut n, 0)?;
     Ok(n)
+}
+
+/// Lunar creates its windows hidden and shows them on "ready-to-show",
+/// which needs an offscreen paint that never completes under MayOS's
+/// compositor. Create the launcher and sign-in windows visible instead
+/// (same-length byte patch, so the asar index stays valid).
+fn show_windows(data: &mut [u8]) {
+    const PATS: [&[u8]; 2] = [
+        b"autoHideMenuBar:!0,show:!1",
+        b"fullscreenable:process.platform===`darwin`,show:!1",
+    ];
+    for pat in PATS {
+        let mut i = 0;
+        while i + pat.len() <= data.len() {
+            if &data[i..i + pat.len()] == pat {
+                data[i + pat.len() - 1] = b'0';
+                i += pat.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
 }

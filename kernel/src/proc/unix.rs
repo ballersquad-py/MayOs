@@ -30,6 +30,12 @@ pub struct Queue {
     head: u64,
     /// The writing side has gone.
     pub closed: bool,
+    /// Which process wrote the bytes from stream position `.0` on.
+    senders: VecDeque<(u64, u64)>,
+    /// Sender of the bytes the last `pop` returned (SCM_CREDENTIALS).
+    pub last_sender: u64,
+    /// The reader asked for credentials (SO_PASSCRED).
+    pub passcred: bool,
 }
 
 /// Most a queue holds before writers must wait (like a socket buffer).
@@ -37,6 +43,11 @@ const QUEUE_LIMIT: usize = 4 << 20;
 
 impl Queue {
     pub fn push(&mut self, bytes: &[u8], fds: Vec<DescRef>) {
+        let pid = crate::proc::sched::current_process().map(|p| p.pid).unwrap_or(0);
+        if self.senders.back().map(|s| s.1) != Some(pid) {
+            let at = self.head + self.data.len() as u64;
+            self.senders.push_back((at, pid));
+        }
         if !fds.is_empty() {
             let at = self.head + self.data.len() as u64;
             self.fds.push_back((at, fds));
@@ -66,6 +77,12 @@ impl Queue {
     /// Take up to `max` bytes and the descriptors that came with them.
     pub fn pop(&mut self, max: usize) -> (Vec<u8>, Vec<DescRef>) {
         let n = max.min(self.data.len());
+        // Who wrote the first byte taken; forget senders now fully read.
+        let start = self.head;
+        self.last_sender = self.senders.iter().rev().find(|s| s.0 <= start).map(|s| s.1).unwrap_or(0);
+        while self.senders.len() > 1 && self.senders[1].0 <= start + n as u64 {
+            self.senders.pop_front();
+        }
         let bytes: Vec<u8> = self.data.drain(..n).collect();
         self.head += n as u64;
         let mut fds = Vec::new();
