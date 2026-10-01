@@ -4211,6 +4211,25 @@ fn sys_execve(p: &Arc<Process>, f: &mut TrapFrame, dirfd: i64, pathp: u64, argvp
     }
     let env = read_strv(p.pml4(), envp)?;
     let mut data = fs::read_file(&fs::resolve_link(&path)).map_err(fs_err)?;
+    // A MayOS-native program (e.g. /bin/cat) can't take Linux arguments:
+    // run busybox's version of the tool instead, or report it missing so
+    // the shell falls back.
+    if super::elf::is_native(&data) {
+        let name = path.rsplit('/').next().unwrap_or("").to_string();
+        if !fs::exists("/bin/busybox") || name.is_empty() {
+            return Err(-ENOENT);
+        }
+        path = String::from("/bin/busybox");
+        if argv.is_empty() {
+            argv.push(name);
+        } else {
+            argv[0] = name;
+        }
+        data = fs::read_file(&path).map_err(fs_err)?;
+        if super::elf::is_native(&data) {
+            return Err(-ENOENT);
+        }
+    }
     // Scripts: "#!interpreter [one argument]".
     for _ in 0..4 {
         if !data.starts_with(b"#!") {
