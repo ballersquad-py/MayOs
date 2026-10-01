@@ -49,6 +49,9 @@ const SCRIPT: &[u8] = br#"#!/bin/sh
 # inherited by everything it starts, including the Java it downloads.
 export MAYOS_GLIBC=1
 cd /opt/lunar
+# Chromium's single-instance lock is a symlink, which FAT can't hold: a
+# leftover copy from an earlier run makes the next start wait forever.
+rm -f "$HOME"/.config/lunarclient/Singleton*
 exec /opt/lunar/lunarclient --no-sandbox --ozone-platform=wayland --disable-gpu "$@"
 "#;
 
