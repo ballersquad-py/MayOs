@@ -52,6 +52,13 @@ cd /opt/lunar
 # Chromium's single-instance lock is a symlink, which FAT can't hold: a
 # leftover copy from an earlier run makes the next start wait forever.
 rm -f "$HOME"/.config/lunarclient/Singleton*
+# Chromium reads the machine id through `cat ... | head`; without the
+# file that pipeline never finishes and Lunar waits forever.
+if [ ! -s /etc/machine-id ]; then
+  mkdir -p /var/lib/dbus
+  printf '7f3a9c2e5b8d4e61a0c3f9b2d6e8a147\n' > /etc/machine-id
+  printf '7f3a9c2e5b8d4e61a0c3f9b2d6e8a147\n' > /var/lib/dbus/machine-id
+fi
 exec /opt/lunar/lunarclient --no-sandbox --ozone-platform=wayland --disable-gpu "$@"
 "#;
 
