@@ -4665,6 +4665,13 @@ fn proc_self(p: &Process, path: &str) -> String {
     if let Some(rest) = path.strip_prefix("/proc/thread-self/") {
         return alloc::format!("/proc/self/{}", rest);
     }
+    // Chromium sets its children's OOM scores; those writes are ignored, so
+    // any process's file can stand in for them.
+    if let Some((pid, file)) = path.strip_prefix("/proc/").and_then(|r| r.split_once('/')) {
+        if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && matches!(file, "oom_score_adj" | "oom_adj") {
+            return alloc::format!("/proc/self/{}", file);
+        }
+    }
     String::from(path)
 }
 
