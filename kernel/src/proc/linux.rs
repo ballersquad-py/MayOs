@@ -1029,6 +1029,12 @@ fn openat_inner(p: &Process, path: String, flags: u64) -> i64 {
             Err(e) => e,
         };
     }
+    // Chromium's sandbox opens /proc itself and works relative to it.
+    if matches!(proc_self(p, &path).as_str(), "/proc" | "/proc/self") {
+        let names: &[&str] = if path == "/proc" { &["self", "thread-self"] } else { &["fd", "task", "fdinfo"] };
+        let entries = names.iter().map(|n| (String::from(*n), true)).collect();
+        return add_fd(p, Desc::Dir { path: path.clone(), entries, pos: 0 });
+    }
     if matches!(proc_self(p, &path).as_str(), "/proc/self/fd" | "/proc/self/task") {
         let entries: Vec<(String, bool)> = if proc_self(p, &path).ends_with("fd") {
             let fds: Vec<String> = linux(p).map(|l| l.fds.lock().iter().enumerate().filter(|(_, d)| d.is_some()).map(|(i, _)| alloc::format!("{}", i)).collect()).unwrap_or_default();
