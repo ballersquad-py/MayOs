@@ -1658,6 +1658,9 @@ fn stat_any(p: &Process, path: &str) -> Result<[u8; 144], i64> {
             return if sched::process_thread_ids(p.pid).contains(&tid) { dir(2, 0x6000 + tid) } else { Err(-ENOENT) };
         }
     }
+    if sp.starts_with("/proc/") && proc_file(p, sp).is_some() {
+        return Ok(stat_buf(0o100644, 0, 0, 0x7000 + sp.len() as u64));
+    }
     stat_path(path)
 }
 
@@ -3108,7 +3111,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         21 => match path_at(p, -100, a0) {
             // Device nodes (GPU, sound, framebuffer) exist as stat sees them:
             // Java's Files.exists uses access() and missed /dev/dri.
-            Ok(path) => if fs::exists(&path) || virtual_file(&path).is_some() || stat_path(&path).is_ok() { 0 } else { -ENOENT },
+            Ok(path) => if fs::exists(&path) || virtual_file(&path).is_some() || proc_file(p, &path).is_some() || stat_path(&path).is_ok() { 0 } else { -ENOENT },
             Err(e) => e,
         },
         22 => sys_pipe(p, a0),
@@ -3635,7 +3638,7 @@ fn syscall_inner(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
         269 | 439 => match path_at(p, a0 as i32 as i64, a1) {
             // Device nodes (GPU, sound, framebuffer) exist as stat sees them:
             // Java's Files.exists uses access() and missed /dev/dri.
-            Ok(path) => if fs::exists(&path) || virtual_file(&path).is_some() || stat_path(&path).is_ok() { 0 } else { -ENOENT },
+            Ok(path) => if fs::exists(&path) || virtual_file(&path).is_some() || proc_file(p, &path).is_some() || stat_path(&path).is_ok() { 0 } else { -ENOENT },
             Err(e) => e,
         },
         271 => {
