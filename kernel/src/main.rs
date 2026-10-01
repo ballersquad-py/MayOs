@@ -99,6 +99,15 @@ extern "C" fn kmain() -> ! {
     proc::sched::spawn_kernel("watchdog", watchdog::run, 0);
     proc::sched::spawn_kernel("desktop", gui::desktop_main, 0);
     proc::sched::start();
+    // Linux programs (Chromium, dbus) need a machine id on disk.
+    for (dir, file) in [("/etc", "/etc/machine-id"), ("/var/lib/dbus", "/var/lib/dbus/machine-id")] {
+        if !fs::exists(file) {
+            let _ = fs::create_dir("/var");
+            let _ = fs::create_dir("/var/lib");
+            let _ = fs::create_dir(dir);
+            let _ = fs::write_file(file, b"7f3a9c2e5b8d4e61a0c3f9b2d6e8a147\n");
+        }
+    }
     kprintln!("boot complete in {} ms", time::uptime_ms());
     loop {
         cpu::sti_hlt();
