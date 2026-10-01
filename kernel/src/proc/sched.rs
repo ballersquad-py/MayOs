@@ -48,6 +48,8 @@ pub struct Thread {
     /// Linux system call in progress (number, first two arguments), for
     /// the `threads` command; NO_EVENT when none.
     pub syscall: [u64; 3],
+    /// Trap frame of the system call in progress (on the kernel stack).
+    pub uframe: u64,
     /// Executing on some CPU (set until that CPU is off its stack).
     on_cpu: AtomicBool,
     /// A CPU's idle thread (runs only there, when nothing else can).
@@ -137,6 +139,7 @@ pub fn init() {
         wait_seen: NO_EVENT,
         wait_flag: 0,
         syscall: [NO_EVENT, 0, 0],
+        uframe: 0,
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -167,6 +170,7 @@ pub fn init_ap(cpu: usize) {
         wait_seen: NO_EVENT,
         wait_flag: 0,
         syscall: [NO_EVENT, 0, 0],
+        uframe: 0,
         on_cpu: AtomicBool::new(true),
         idle: true,
         fpu: Box::new(cpu::fpu_initial()),
@@ -228,6 +232,7 @@ fn add_thread_with(name: &str, frame_for: impl FnOnce(u64) -> idt::TrapFrame, pr
         wait_seen: NO_EVENT,
         wait_flag: 0,
         syscall: [NO_EVENT, 0, 0],
+        uframe: 0,
         on_cpu: AtomicBool::new(false),
         idle: false,
         fpu: Box::new(fpu),
@@ -292,6 +297,12 @@ pub fn fs_base() -> u64 {
 pub fn set_syscall(nr: u64, a0: u64, a1: u64) {
     if let Some(t) = me() {
         t.syscall = [nr, a0, a1];
+    }
+}
+
+pub fn set_uframe(f: u64) {
+    if let Some(t) = me() {
+        t.uframe = f;
     }
 }
 
@@ -709,6 +720,7 @@ pub struct ThreadInfo {
     pub pid: Option<u64>,
     pub cpu_ms: u64,
     pub syscall: [u64; 3],
+    pub uframe: u64,
 }
 
 pub fn list() -> Vec<ThreadInfo> {
@@ -722,6 +734,7 @@ pub fn list() -> Vec<ThreadInfo> {
             pid: t.process.as_ref().map(|p| p.pid),
             cpu_ms: t.cpu_ms,
             syscall: t.syscall,
+            uframe: t.uframe,
         })
         .collect()
 }

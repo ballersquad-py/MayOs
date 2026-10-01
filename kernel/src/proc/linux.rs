@@ -2975,6 +2975,7 @@ pub fn prof_report_n(reset: bool, top: usize) -> String {
 pub fn syscall(p: &Arc<Process>, f: &mut TrapFrame) -> bool {
     let (nr, args) = (f.rax, [f.rdi, f.rsi, f.rdx, f.r10, f.r8]);
     sched::set_syscall(nr, f.rdi, f.rsi);
+    sched::set_uframe(f as *const TrapFrame as u64);
     let t0 = crate::time::uptime_us();
     let mut exited = syscall_inner(p, f);
     let dt = crate::time::uptime_us().saturating_sub(t0);
@@ -4124,7 +4125,14 @@ fn sys_fork(p: &Arc<Process>, f: &TrapFrame, flags: u64, newsp: u64, ptid: u64, 
     }
     let fs = if flags & CLONE_SETTLS != 0 { tls } else { sched::fs_base() };
     if flags & CLONE_CHILD_SETTID != 0 {
-        usermem::write_u32(pml4, ctid, child.pid as u32);
+        // Into the child's copy: usermem writes through the current
+        // (parent's) address space, which would overwrite the parent's
+        // cached tid and break its locks (glibc's rwlock owner check).
+        if let Some((phys, _)) = paging::translate(pml4, ctid & !0xfff) {
+            if ctid & 0xfff <= 0xffc {
+                unsafe { *((crate::mem::phys_to_virt(phys) + (ctid & 0xfff)) as *mut u32) = child.pid as u32 };
+            }
+        }
     }
     if flags & CLONE_PARENT_SETTID != 0 {
         usermem::write_u32(p.pml4(), ptid, child.pid as u32);
@@ -4859,4 +4867,65 @@ pub fn describe_addr(p: &Process, addr: u64) -> String {
     }).unwrap_or_default();
     let base = r.start - r.foff;
     alloc::format!("{}+{:#x}", name, addr - base)
+}
+
+/// Shell `threads stack <tid>`: where a thread blocked in a system call
+/// came from: its user rip and the code addresses on its stack, as
+/// file+offset.
+pub fn stack_report(tid: u64) -> String {
+    let Some(t) = sched::list().into_iter().find(|t| t.id == tid) else { return String::from("no such thread\n") };
+    if t.uframe == 0 || t.syscall[0] == sched::NO_SYSCALL {
+        return String::from("thread is not in a system call\n");
+    }
+    let Some(p) = t.pid.and_then(crate::proc::process::find) else { return String::from("no process\n") };
+    let Some(l) = linux(&p) else { return String::from("not a Linux process\n") };
+    // The frame stays put while the thread sleeps in the call.
+    let f = unsafe { &*(t.uframe as *const TrapFrame) };
+    let regs = l.regions.lock().clone();
+    let files = l.mapped.lock().clone();
+    let name = |v: u64| -> Option<String> {
+        // The main program (PIE base 0x555555550000) is not in `regions`.
+        if (0x5555_5555_0000..0x5555_6555_0000).contains(&v) {
+            return Some(alloc::format!("exe+{:#x}", v - 0x5555_5555_0000));
+        }
+        let r = regs.iter().find(|r| r.exec && v >= r.start && v < r.end)?;
+        if r.file == 0 {
+            return None;
+        }
+        let file = match files.get((r.file as usize).checked_sub(1)?) {
+            Some(d) => match &*d.lock() {
+                Desc::File { path, .. } => path.rsplit('/').next().unwrap_or("").into(),
+                _ => String::from("?"),
+            },
+            None => String::from("?"),
+        };
+        Some(alloc::format!("{}+{:#x}", file, r.foff + (v - r.start)))
+    };
+    let mut out = alloc::format!("rip {:#x} {}  rsp {:#x}\n", f.rip, name(f.rip).unwrap_or_default(), f.rsp);
+    // The words around a futex being waited on.
+    if t.syscall[0] == 202 {
+        out.push_str("  futex area:");
+        for k in 0..16u64 {
+            let a = (t.syscall[1] & !3) - 0x20 + k * 4;
+            let w = crate::mem::paging::translate(p.pml4(), a & !0xfff)
+                .map(|(phys, _)| unsafe { *((crate::mem::phys_to_virt(phys) + (a & 0xfff)) as *const u32) });
+            out.push_str(&alloc::format!(" {:x}", w.unwrap_or(0xdead)));
+        }
+        out.push('\n');
+    }
+    let mut n = 0;
+    for i in 0..16384u64 {
+        // Through the page tables: this runs in another address space.
+        let a = f.rsp + i * 8;
+        let Some((phys, _)) = crate::mem::paging::translate(p.pml4(), a & !0xfff) else { break };
+        let v = unsafe { *((crate::mem::phys_to_virt(phys) + (a & 0xfff)) as *const u64) };
+        if let Some(s) = name(v) {
+            out.push_str(&alloc::format!("  [rsp+{:#x}] {}\n", i * 8, s));
+            n += 1;
+            if n >= 40 {
+                break;
+            }
+        }
+    }
+    out
 }

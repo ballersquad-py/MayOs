@@ -551,6 +551,13 @@ fn builtin(term: &mut Terminal, cmd: &str, args: &[&str], out: &mut String, ctx:
         }
         "threads" => {
             // What every thread of a Linux program is doing right now.
+            if args.first() == Some(&"stack") {
+                let tid = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(0);
+                let r = crate::proc::linux::stack_report(tid);
+                crate::kprintln!("stack {}:\n{}", tid, r);
+                let _ = write!(out, "{}", r);
+                return true;
+            }
             let filter = args.first().copied().unwrap_or("");
             let _ = writeln!(out, "{}  TID   PID  STATE      CPU(ms)  NAME            IN{}", C_HEAD, C_OFF);
             // Busiest first; the top 25 fit on one screen.

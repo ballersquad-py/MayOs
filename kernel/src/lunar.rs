@@ -49,7 +49,7 @@ const SCRIPT: &[u8] = br#"#!/bin/sh
 # inherited by everything it starts, including the Java it downloads.
 export MAYOS_GLIBC=1
 cd /opt/lunar
-exec /opt/lunar/lunarclient --no-sandbox --in-process-gpu --ozone-platform=wayland --disable-gpu "$@"
+exec /opt/lunar/lunarclient --no-sandbox --ozone-platform=wayland --disable-gpu "$@"
 "#;
 
 const DESKTOP: &[u8] = b"[Desktop Entry]\nType=Application\nName=Lunar Client\nExec=lunar-client\nIcon=/opt/lunar/lunarclient.png\nTerminal=false\n";
