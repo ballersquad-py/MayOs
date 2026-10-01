@@ -41,12 +41,23 @@ const DEBS: &[&str] = &[
     "libtasn1-6", "libthai0", "libtinfo6", "libudev1", "libunistring5", "libwayland-client0", "libwayland-cursor0",
     "libwayland-egl1", "libx11-6", "libx11-xcb1", "libxau6", "libxcb-render0", "libxcb-shm0", "libxcb1",
     "libxcomposite1", "libxcursor1", "libxdamage1", "libxdmcp6", "libxext6", "libxfixes3", "libxi6",
-    "libxinerama1", "libxkbcommon0", "libxrandr2", "libxrender1", "libzstd1",
+    "libxinerama1", "libxkbcommon0", "libxrandr2", "libxrender1", "libzstd1", "libxxf86vm1",
 ];
 
 const SCRIPT: &[u8] = br#"#!/bin/sh
 # Lunar Client's own launcher on MayOS's glibc runtime. MAYOS_GLIBC=1 is
 # inherited by everything it starts, including the Java it downloads.
+# Minecraft 1.8.9 (LWJGL 2) only speaks X11: give it a rootful Xwayland
+# window. Electron itself stays on Wayland (--ozone-platform=wayland).
+if command -v Xwayland >/dev/null 2>&1; then
+  mkdir -p /tmp/.X11-unix
+  d=7
+  while [ -e /tmp/.X11-unix/X$d ]; do d=$((d+1)); done
+  Xwayland :$d -geometry 1280x720 -shm -ac -noreset -nolisten tcp >/dev/null 2>&1 &
+  export DISPLAY=:$d
+else
+  echo "lunar-client: Xwayland is missing, Minecraft 1.8.9 won't open. Run: pkg install minecraft"
+fi
 export MAYOS_GLIBC=1
 cd /opt/lunar
 # Chromium's single-instance lock is a symlink, which FAT can't hold: a
