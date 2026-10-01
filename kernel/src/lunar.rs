@@ -24,7 +24,7 @@ const UBUNTU: &str = "http://archive.ubuntu.com/ubuntu";
 const SUITES: &[&str] = &["noble", "noble-updates", "noble-security"];
 const LIB_DIR: &str = "/usr/lib/x86_64-linux-gnu";
 const LUNAR_DIR: &str = "/opt/lunar";
-const LUNAR_CDN: &str = "https://launcherupdates.lunarclientcdn.com";
+const LUNAR_DOWNLOAD: &str = "https://api.lunarclientprod.com/site/download?os=linux";
 
 /// Ubuntu packages holding every library Lunar's launcher loads (worked
 /// out by running it on Ubuntu 24.04 and reading /proc/<pid>/maps).
@@ -185,15 +185,10 @@ fn zstd(data: &[u8]) -> Result<Vec<u8>, String> {
 // --- the launcher -----------------------------------------------------------
 
 fn launcher(c: &Console) -> Result<(), String> {
-    say(c, "Asking Lunar for the newest launcher...\n");
-    let yml = download(&format!("{}/latest-linux.yml", LUNAR_CDN))?;
-    let yml = String::from_utf8_lossy(&yml).into_owned();
-    let file = yml
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("path:").map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string()))
-        .ok_or("Lunar's update file has no download")?;
-    say(c, &format!("Downloading {} (about 130 MB)...\n", file));
-    let img = download(&format!("{}/{}", LUNAR_CDN, file.replace(' ', "%20")))?;
+    // The website's download link (it redirects to the newest build; the
+    // updater's latest-linux.yml lags behind).
+    say(c, "Downloading Lunar Client's launcher from lunarclient.com (about 130 MB)...\n");
+    let img = download(LUNAR_DOWNLOAD)?;
     say(c, "Unpacking...\n");
     let _ = fs::remove_all(LUNAR_DIR);
     mkdirs(LUNAR_DIR).map_err(|e| e.to_string())?;

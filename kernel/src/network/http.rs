@@ -48,7 +48,9 @@ pub fn get_limit(url: &Url, max: usize) -> Result<Response, String> {
         if matches!(r.status, 301 | 302 | 303 | 307 | 308)
             && let Some(loc) = r.header("location")
         {
-            url = url.join(loc).ok_or_else(|| format!("bad redirect to {}", loc))?;
+            // Servers send raw spaces in Location (Lunar's file names).
+            let loc = loc.replace(' ', "%20");
+            url = url.join(&loc).ok_or_else(|| format!("bad redirect to {}", loc))?;
             continue;
         }
         return Ok(r);
